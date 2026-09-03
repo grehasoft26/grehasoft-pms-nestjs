@@ -1,0 +1,1188 @@
+// ==============================================================================
+// AUTHORITATIVE PRISMA SCHEMA FOR MYSQL (GREHASOFT PMS/CRM MIGRATION)
+// 100% COMPLETE FORENSIC MATCH - 49 DJANGO MODELS -> 49 PRISMA MODELS -> 49 MYSQL TABLES
+// ==============================================================================
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ------------------------------------------------------------------------------
+// ENUMS
+// ------------------------------------------------------------------------------
+
+enum UserStatus {
+  active
+  inactive
+}
+
+enum ClientStatus {
+  active
+  inactive
+}
+
+enum ProjectStatus {
+  not_started
+  in_progress
+  on_hold
+  completed
+  blocked
+}
+
+enum MilestoneStatus {
+  not_started
+  in_progress
+  blocked
+  completed
+}
+
+enum LeadStatus {
+  new
+  contacted
+  qualified
+  converted
+  lost
+}
+
+enum FollowupType {
+  call
+  whatsapp
+  meeting
+  email
+}
+
+enum FollowupStatus {
+  done
+  pending
+}
+
+enum TaskPriority {
+  low
+  medium
+  high
+}
+
+enum TaskStatus {
+  todo
+  in_progress
+  done
+  blocked
+}
+
+enum ReviewerRole {
+  PM
+  ADMIN
+}
+
+enum ReviewStatus {
+  approved
+  rework
+}
+
+enum PackagePlan {
+  basic
+  standard
+  premium
+  custom
+}
+
+enum WebsiteStatus {
+  active
+  inactive
+}
+
+enum KeywordPriority {
+  low
+  medium
+  high
+}
+
+enum SEOLogStatus {
+  draft
+  submitted
+  approved
+  rejected
+}
+
+enum SEOTaskReviewStatus {
+  pending
+  approved
+  rejected
+}
+
+enum SEOTaskPriority {
+  low
+  medium
+  high
+}
+
+enum SEOTaskStatus {
+  pending
+  in_progress
+  ready_for_review
+  completed
+  on_hold
+  overdue
+}
+
+enum SEOReminderPriority {
+  low
+  medium
+  high
+}
+
+enum SEOReminderStatus {
+  pending
+  completed
+}
+
+enum PaymentMode {
+  cash
+  bank
+  upi
+  card
+}
+
+enum ProposalStatus {
+  draft
+  sent
+  accepted
+  rejected
+}
+
+enum ReminderType {
+  general
+  invoice
+  payment
+  proposal
+  followup
+}
+
+enum HRDocType {
+  offer_letter
+  appraisal_letter
+  experience_certificate
+  salary_certificate
+}
+
+enum NotificationModule {
+  reminder
+  domain
+  invoice
+}
+
+enum NotificationType {
+  REMINDER_DUE
+  REMINDER_OVERDUE
+  DOMAIN_EXPIRING
+  DOMAIN_EXPIRED
+  INVOICE_DUE
+}
+
+enum TrackingActivityType {
+  active
+  idle
+  offline
+}
+
+// ------------------------------------------------------------------------------
+// MODELS / TABLES (49 TABLES MATCHING ALL 49 DJANGO MODELS)
+// ------------------------------------------------------------------------------
+
+model Role {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique @db.VarChar(50)
+  description String?   @db.Text
+  permissions Json
+  created_at  DateTime  @default(now()) @db.DateTime(3)
+  updated_at  DateTime  @updatedAt @db.DateTime(3)
+  deleted_at  DateTime? @db.DateTime(3)
+
+  users User[]
+
+  @@map("roles")
+}
+
+model Department {
+  id          Int       @id @default(autoincrement())
+  name        String    @db.VarChar(100)
+  parent_id   Int?
+  created_at  DateTime  @default(now()) @db.DateTime(3)
+  updated_at  DateTime  @updatedAt @db.DateTime(3)
+  deleted_at  DateTime? @db.DateTime(3)
+
+  parent          Department?  @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: SetNull)
+  sub_departments Department[] @relation("DepartmentParent")
+
+  users     User[]
+  employees Employee[]
+  projects  Project[]
+
+  @@map("departments")
+}
+
+model User {
+  id             Int        @id @default(autoincrement())
+  username       String     @unique @db.VarChar(150)
+  email          String     @unique @db.VarChar(150)
+  password       String     @db.VarChar(128)
+  name           String     @db.VarChar(100)
+  address        String?    @db.Text
+  role_id        Int?
+  department_id  Int?
+  position       String?    @db.VarChar(100)
+  joining_date   DateTime?  @db.Date
+  salary_monthly Decimal?   @db.Decimal(10, 2)
+  status         UserStatus @default(active)
+  client_id      Int?
+  profile_photo  String?    @db.VarChar(255)
+  last_login     DateTime?  @db.DateTime(3)
+  is_superuser   Boolean    @default(false)
+  is_active      Boolean    @default(true)
+  created_at     DateTime   @default(now()) @db.DateTime(3)
+  updated_at     DateTime   @updatedAt @db.DateTime(3)
+  deleted_at     DateTime?  @db.DateTime(3)
+
+  role       Role?       @relation(fields: [role_id], references: [id], onDelete: Restrict)
+  department Department? @relation(fields: [department_id], references: [id], onDelete: SetNull)
+  client     Client?     @relation("ClientPortalUsers", fields: [client_id], references: [id], onDelete: SetNull)
+
+  portal_user_audits PortalUserAudit[] @relation("PortalUserAudits")
+  performed_audits   PortalUserAudit[] @relation("PerformedAudits")
+
+  managed_projects Project[] @relation("ManagedProjects")
+  created_projects Project[] @relation("CreatedProjects")
+
+  project_members       ProjectMember[]
+  project_activity_logs ProjectActivityLog[]
+
+  lead_assignments LeadAssignment[]
+  created_followups LeadFollowup[]
+
+  created_tasks              Task[]             @relation("CreatedTasks")
+  task_assignments_employee  TaskAssignment[]   @relation("TaskAssignmentsEmployee")
+  task_assignments_assigner  TaskAssignment[]   @relation("TaskAssignmentsAssigner")
+  task_progress_updates      TaskProgress[]
+  uploaded_task_files        TaskFile[]
+  task_reviews               TaskReview[]
+  task_comments              TaskComment[]
+
+  global_activity_logs GlobalActivityLog[]
+
+  assigned_seo_websites SEOWebsite[] @relation("AssignedSEOWebsites")
+  assigned_by_seo_websites SEOWebsite[] @relation("AssignedBySEOWebsites")
+
+  executive_seo_logs SEODailyWorkLog[] @relation("ExecutiveSEOLogs")
+  created_seo_logs   SEODailyWorkLog[] @relation("CreatedSEOLogs")
+  updated_seo_logs   SEODailyWorkLog[] @relation("UpdatedSEOLogs")
+  approved_seo_logs  SEODailyWorkLog[] @relation("ApprovedSEOLogs")
+  rejected_seo_logs  SEODailyWorkLog[] @relation("RejectedSEOLogs")
+
+  seo_monthly_targets SEOMonthlyTarget[]
+
+  assigned_seo_tasks SEOTask[] @relation("AssignedSEOTasks")
+  created_seo_tasks  SEOTask[] @relation("CreatedSEOTasks")
+
+  assigned_seo_reminders SEOReminder[] @relation("AssignedSEOReminders")
+  created_seo_reminders  SEOReminder[] @relation("CreatedSEOReminders")
+
+  seo_task_timelines SEOTaskTimeline[]
+
+  employee_profile Employee?
+  created_hr_docs  HRDocument[]
+
+  tracking_profile TrackingUserProfile?
+  work_sessions    WorkSession[]
+  app_activities   AppActivity[]
+  screenshots      Screenshot[]
+  tracking_activity_logs TrackingActivityLog[]
+
+  reminders            Reminder[]
+  client_notifications ClientNotification[]
+
+  @@map("users")
+}
+
+model Client {
+  id           Int          @id @default(autoincrement())
+  name         String       @db.VarChar(150)
+  email        String       @db.VarChar(150)
+  phone        String       @db.VarChar(20)
+  company_name String       @db.VarChar(200)
+  gst_no       String?      @db.VarChar(50)
+  address      String       @db.Text
+  status       ClientStatus @default(active)
+  created_at   DateTime     @default(now()) @db.DateTime(3)
+  updated_at   DateTime     @updatedAt @db.DateTime(3)
+  deleted_at   DateTime?    @db.DateTime(3)
+
+  portal_users User[]            @relation("ClientPortalUsers")
+  audits       PortalUserAudit[]
+  projects     Project[]
+  leads        Lead[]
+  seo_websites SEOWebsite[]
+  invoices     Invoice[]
+  proposals    Proposal[]
+
+  @@map("clients")
+}
+
+model PortalUserAudit {
+  id              Int      @id @default(autoincrement())
+  portal_user_id  Int?
+  client_id       Int
+  action          String   @db.VarChar(50)
+  performed_by_id Int?
+  timestamp       DateTime @default(now()) @db.DateTime(3)
+  remarks         String?  @db.Text
+
+  portal_user  User?   @relation("PortalUserAudits", fields: [portal_user_id], references: [id], onDelete: SetNull)
+  client       Client  @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  performed_by User?   @relation("PerformedAudits", fields: [performed_by_id], references: [id], onDelete: SetNull)
+
+  @@map("portal_user_audit")
+}
+
+model Project {
+  id                  Int           @id @default(autoincrement())
+  name                String        @db.VarChar(200)
+  client_id           Int
+  department_id       Int?
+  project_manager_id  Int?
+  created_by_id       Int
+  start_date          DateTime      @db.Date
+  end_date            DateTime      @db.Date
+  status              ProjectStatus @default(not_started)
+  progress_percentage Int           @default(0)
+  created_at          DateTime      @default(now()) @db.DateTime(3)
+  updated_at          DateTime      @updatedAt @db.DateTime(3)
+  deleted_at          DateTime?     @db.DateTime(3)
+
+  client          Client      @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  department      Department? @relation(fields: [department_id], references: [id], onDelete: SetNull)
+  project_manager User?       @relation("ManagedProjects", fields: [project_manager_id], references: [id], onDelete: SetNull)
+  created_by      User        @relation("CreatedProjects", fields: [created_by_id], references: [id], onDelete: Restrict)
+
+  milestones Milestone[]
+  members    ProjectMember[]
+  activities ProjectActivityLog[]
+  tasks      Task[]
+
+  converted_leads Lead[]
+  proposals       Proposal[]
+  domains         Domain[]
+  credentials     WebsiteCredential[]
+
+  global_activities GlobalActivityLog[]
+
+  @@index([status])
+  @@index([client_id])
+  @@map("projects")
+}
+
+model Milestone {
+  id         Int             @id @default(autoincrement())
+  project_id Int
+  title      String          @db.VarChar(255)
+  due_date   DateTime        @db.Date
+  status     MilestoneStatus @default(not_started)
+  progress   Int             @default(0)
+  created_at DateTime        @default(now()) @db.DateTime(3)
+
+  project Project @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  tasks   Task[]
+
+  @@map("milestones")
+}
+
+model ProjectMember {
+  id              Int    @id @default(autoincrement())
+  project_id      Int
+  user_id         Int
+  role_in_project String @db.VarChar(100)
+
+  project Project @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([project_id, user_id])
+  @@map("project_members")
+}
+
+model ProjectActivityLog {
+  id         Int      @id @default(autoincrement())
+  project_id Int
+  user_id    Int
+  action     String   @db.Text
+  created_at DateTime @default(now()) @db.DateTime(3)
+
+  project Project @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("project_activity_logs")
+}
+
+model Lead {
+  id                   Int        @id @default(autoincrement())
+  name                 String     @db.VarChar(150)
+  email                String     @db.VarChar(150)
+  phone                String     @db.VarChar(20)
+  source               String     @db.VarChar(100)
+  status               LeadStatus @default(new)
+  client_id            Int?
+  converted_project_id Int?
+  enquiry_from         String?    @db.VarChar(50)
+  how_contacted        String?    @db.VarChar(50)
+  contacted_person     String?    @db.VarChar(150)
+  reference_person     String?    @db.VarChar(150)
+  company_name         String?    @db.VarChar(200)
+  service_required     Json
+  client_requirements  String?    @db.Text
+  details_given        String?    @db.Text
+  competitor_websites  String?    @db.Text
+  documents_given      Json
+  login_credentials    Json
+  created_at           DateTime   @default(now()) @db.DateTime(3)
+  updated_at           DateTime   @updatedAt @db.DateTime(3)
+  deleted_at           DateTime?  @db.DateTime(3)
+
+  client            Client?  @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  converted_project Project? @relation(fields: [converted_project_id], references: [id], onDelete: SetNull)
+
+  assignments LeadAssignment[]
+  followups   LeadFollowup[]
+  proposals   Proposal[]
+
+  @@index([status, created_at])
+  @@map("leads")
+}
+
+model LeadAssignment {
+  id            Int      @id @default(autoincrement())
+  lead_id       Int
+  sales_exec_id Int
+  assigned_at   DateTime @default(now()) @db.DateTime(3)
+
+  lead       Lead @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  sales_exec User @relation(fields: [sales_exec_id], references: [id], onDelete: Cascade)
+
+  @@map("lead_assignments")
+}
+
+model LeadFollowup {
+  id            Int            @id @default(autoincrement())
+  lead_id       Int
+  followup_type FollowupType
+  notes         String         @db.Text
+  next_followup DateTime       @db.Date
+  status        FollowupStatus @default(pending)
+  created_by_id Int
+  created_at    DateTime       @default(now()) @db.DateTime(3)
+
+  lead       Lead @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  created_by User @relation(fields: [created_by_id], references: [id], onDelete: Restrict)
+
+  @@map("lead_followups")
+}
+
+model TaskType {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique @db.VarChar(100)
+  description String?   @db.Text
+  created_at  DateTime  @default(now()) @db.DateTime(3)
+  updated_at  DateTime  @updatedAt @db.DateTime(3)
+  deleted_at  DateTime? @db.DateTime(3)
+
+  tasks Task[]
+
+  @@map("task_types")
+}
+
+model Task {
+  id            Int          @id @default(autoincrement())
+  project_id    Int
+  title         String       @db.VarChar(200)
+  description   String       @db.Text
+  milestone_id  Int?
+  task_type_id  Int
+  priority      TaskPriority
+  status        TaskStatus   @default(todo)
+  board_order   Int          @default(0)
+  due_date      DateTime     @db.Date
+  created_by_id Int
+  created_at    DateTime     @default(now()) @db.DateTime(3)
+  updated_at    DateTime     @updatedAt @db.DateTime(3)
+  deleted_at    DateTime?    @db.DateTime(3)
+
+  project    Project    @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  milestone  Milestone? @relation(fields: [milestone_id], references: [id], onDelete: SetNull)
+  task_type  TaskType   @relation(fields: [task_type_id], references: [id], onDelete: Restrict)
+  created_by User       @relation("CreatedTasks", fields: [created_by_id], references: [id], onDelete: Restrict)
+
+  assignments       TaskAssignment[]
+  progress_history  TaskProgress[]
+  files             TaskFile[]
+  comments          TaskComment[]
+  global_activities GlobalActivityLog[]
+
+  @@index([project_id, status])
+  @@index([due_date])
+  @@map("tasks")
+}
+
+model TaskAssignment {
+  id             Int       @id @default(autoincrement())
+  task_id        Int
+  employee_id    Int
+  assigned_by_id Int
+  assigned_at    DateTime  @default(now()) @db.DateTime(3)
+  unassigned_at  DateTime? @db.DateTime(3)
+  created_at     DateTime  @default(now()) @db.DateTime(3)
+  updated_at     DateTime  @updatedAt @db.DateTime(3)
+  deleted_at     DateTime? @db.DateTime(3)
+
+  task        Task @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  employee    User @relation("TaskAssignmentsEmployee", fields: [employee_id], references: [id], onDelete: Cascade)
+  assigned_by User @relation("TaskAssignmentsAssigner", fields: [assigned_by_id], references: [id], onDelete: Restrict)
+
+  @@unique([task_id, employee_id])
+  @@map("task_assignments")
+}
+
+model TaskProgress {
+  id                  Int      @id @default(autoincrement())
+  task_id             Int
+  progress_percentage Int
+  updated_by_id       Int
+  updated_at          DateTime @default(now()) @db.DateTime(3)
+
+  task       Task @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  updated_by User @relation(fields: [updated_by_id], references: [id], onDelete: Cascade)
+
+  @@map("task_progress")
+}
+
+model TaskFile {
+  id             Int       @id @default(autoincrement())
+  task_id        Int
+  uploaded_by_id Int
+  file           String?   @db.VarChar(255)
+  file_path      String    @db.VarChar(255)
+  file_type      String    @db.VarChar(50)
+  revision_no    Int       @default(1)
+  uploaded_at    DateTime  @default(now()) @db.DateTime(3)
+  created_at     DateTime  @default(now()) @db.DateTime(3)
+  updated_at     DateTime  @updatedAt @db.DateTime(3)
+  deleted_at     DateTime? @db.DateTime(3)
+
+  task        Task         @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  uploaded_by User         @relation(fields: [uploaded_by_id], references: [id], onDelete: Cascade)
+  reviews     TaskReview[]
+
+  @@map("task_files")
+}
+
+model TaskReview {
+  id               Int          @id @default(autoincrement())
+  task_file_id     Int
+  reviewer_id      Int
+  reviewed_by_role ReviewerRole
+  review_version   Int
+  comments         String       @db.Text
+  status           ReviewStatus
+  reviewed_at      DateTime     @default(now()) @db.DateTime(3)
+
+  task_file TaskFile @relation(fields: [task_file_id], references: [id], onDelete: Cascade)
+  reviewer  User     @relation(fields: [reviewer_id], references: [id], onDelete: Cascade)
+
+  @@map("task_reviews")
+}
+
+model TaskComment {
+  id         Int       @id @default(autoincrement())
+  task_id    Int
+  user_id    Int
+  comment    String    @db.Text
+  created_at DateTime  @default(now()) @db.DateTime(3)
+  updated_at DateTime  @updatedAt @db.DateTime(3)
+  deleted_at DateTime? @db.DateTime(3)
+
+  task Task @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("task_comments")
+}
+
+model GlobalActivityLog {
+  id         Int      @id @default(autoincrement())
+  user_id    Int
+  project_id Int?
+  task_id    Int?
+  action     String   @db.VarChar(255)
+  created_at DateTime @default(now()) @db.DateTime(3)
+
+  user    User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [project_id], references: [id], onDelete: SetNull)
+  task    Task?    @relation(fields: [task_id], references: [id], onDelete: SetNull)
+
+  @@index([project_id, created_at])
+  @@map("global_activity_logs")
+}
+
+model SEOActivityType {
+  id            Int      @id @default(autoincrement())
+  name          String   @unique @db.VarChar(100)
+  description   String?  @db.Text
+  is_active     Boolean  @default(true)
+  display_order Int      @default(0)
+  created_at    DateTime @default(now()) @db.DateTime(3)
+  updated_at    DateTime @updatedAt @db.DateTime(3)
+
+  log_items       SEODailyWorkLogItem[]
+  monthly_targets SEOMonthlyTarget[]
+  seo_tasks       SEOTask[]
+
+  @@map("seo_activity_type")
+}
+
+model SEOWebsite {
+  id                       Int           @id @default(autoincrement())
+  client_id                Int
+  website_name             String        @db.VarChar(255)
+  domain_url               String        @db.VarChar(255)
+  start_date               DateTime?     @db.Date
+  package_plan             PackagePlan   @default(basic)
+  google_search_console_id String?       @db.VarChar(255)
+  google_analytics_id      String?       @db.VarChar(255)
+  sitemap_url              String?       @db.VarChar(255)
+  target_country           String?       @db.VarChar(100)
+  assigned_executive_id    Int?
+  assigned_by_id           Int?
+  assigned_date            DateTime?     @db.DateTime(3)
+  status                   WebsiteStatus @default(active)
+  notes                    String?       @db.Text
+  created_at               DateTime      @default(now()) @db.DateTime(3)
+  updated_at               DateTime      @updatedAt @db.DateTime(3)
+
+  client             Client  @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  assigned_executive User?   @relation("AssignedSEOWebsites", fields: [assigned_executive_id], references: [id], onDelete: SetNull)
+  assigned_by        User?   @relation("AssignedBySEOWebsites", fields: [assigned_by_id], references: [id], onDelete: SetNull)
+
+  target_keywords SEOKeyword[]
+  daily_logs      SEODailyWorkLog[]
+  seo_targets     SEOMonthlyTarget[]
+  seo_tasks       SEOTask[]
+  seo_reminders   SEOReminder[]
+  seo_credentials SEOCredential[]
+
+  @@map("seo_website")
+}
+
+model SEOKeyword {
+  id               Int             @id @default(autoincrement())
+  website_id       Int
+  keyword          String          @db.VarChar(255)
+  search_volume    Int             @default(0)
+  difficulty_score Float           @default(0.0)
+  priority         KeywordPriority @default(medium)
+  target_rank      Int?
+  current_rank     Int?
+  notes            String?         @db.Text
+  created_at       DateTime        @default(now()) @db.DateTime(3)
+  updated_at       DateTime        @updatedAt @db.DateTime(3)
+
+  website SEOWebsite @relation(fields: [website_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_keyword")
+}
+
+model SEODailyWorkLog {
+  id                 Int          @id @default(autoincrement())
+  website_id         Int
+  log_date           DateTime     @db.Date
+  executive_id       Int
+  proof_file         String?      @db.VarChar(255)
+  remarks            String?      @db.Text
+  total_count        Int          @default(0)
+  status             SEOLogStatus @default(draft)
+  remarks_by_manager String?      @db.Text
+  seo_task_id        Int?
+  created_by_id      Int
+  updated_by_id      Int?
+  approved_by_id     Int?
+  approved_date      DateTime?    @db.DateTime(3)
+  rejected_by_id     Int?
+  rejected_date      DateTime?    @db.DateTime(3)
+  created_at         DateTime     @default(now()) @db.DateTime(3)
+  updated_at         DateTime     @updatedAt @db.DateTime(3)
+
+  website     SEOWebsite @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  executive   User       @relation("ExecutiveSEOLogs", fields: [executive_id], references: [id], onDelete: Cascade)
+  seo_task    SEOTask?   @relation(fields: [seo_task_id], references: [id], onDelete: SetNull)
+  created_by  User       @relation("CreatedSEOLogs", fields: [created_by_id], references: [id], onDelete: Cascade)
+  updated_by  User?      @relation("UpdatedSEOLogs", fields: [updated_by_id], references: [id], onDelete: SetNull)
+  approved_by User?      @relation("ApprovedSEOLogs", fields: [approved_by_id], references: [id], onDelete: SetNull)
+  rejected_by User?      @relation("RejectedSEOLogs", fields: [rejected_by_id], references: [id], onDelete: SetNull)
+
+  proof_files SEODailyWorkProof[]
+  items       SEODailyWorkLogItem[]
+
+  @@unique([executive_id, website_id, log_date])
+  @@map("seo_daily_work_log")
+}
+
+model SEODailyWorkProof {
+  id          Int      @id @default(autoincrement())
+  work_log_id Int
+  proof_file  String   @db.VarChar(255)
+  uploaded_at DateTime @default(now()) @db.DateTime(3)
+
+  work_log SEODailyWorkLog @relation(fields: [work_log_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_daily_work_proof")
+}
+
+model SEODailyWorkLogItem {
+  id                 Int     @id @default(autoincrement())
+  work_log_id        Int
+  activity_type_id   Int
+  count              Int     @default(1)
+  keyword            String? @db.VarChar(255)
+  submission_url     String? @db.Text
+  domain_authority   Int?
+  spam_score         Int?
+  time_spent_minutes Int?
+  username           String? @db.VarChar(255)
+  password           String? @db.Text
+
+  work_log      SEODailyWorkLog @relation(fields: [work_log_id], references: [id], onDelete: Cascade)
+  activity_type SEOActivityType @relation(fields: [activity_type_id], references: [id], onDelete: Restrict)
+
+  @@map("seo_daily_work_log_item")
+}
+
+model SEOMonthlyTarget {
+  id               Int      @id @default(autoincrement())
+  executive_id     Int
+  website_id       Int?
+  month            String   @db.VarChar(7)
+  activity_type_id Int
+  target_count     Int      @default(0)
+  created_at       DateTime @default(now()) @db.DateTime(3)
+  updated_at       DateTime @updatedAt @db.DateTime(3)
+
+  executive     User            @relation(fields: [executive_id], references: [id], onDelete: Cascade)
+  website       SEOWebsite?     @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  activity_type SEOActivityType @relation(fields: [activity_type_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_monthly_target")
+}
+
+model SEOTask {
+  id                    Int                  @id @default(autoincrement())
+  title                 String               @db.VarChar(255)
+  description           String               @db.Text
+  review_status         SEOTaskReviewStatus?
+  manager_remarks       String?              @db.Text
+  website_id            Int
+  assigned_executive_id Int
+  due_date              DateTime             @db.Date
+  priority              SEOTaskPriority      @default(medium)
+  status                SEOTaskStatus        @default(pending)
+  activity_type_id      Int?
+  created_by_id         Int
+  created_at            DateTime             @default(now()) @db.DateTime(3)
+  updated_at            DateTime             @updatedAt @db.DateTime(3)
+
+  website            SEOWebsite       @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  assigned_executive User             @relation("AssignedSEOTasks", fields: [assigned_executive_id], references: [id], onDelete: Cascade)
+  activity_type      SEOActivityType? @relation(fields: [activity_type_id], references: [id], onDelete: SetNull)
+  created_by         User             @relation("CreatedSEOTasks", fields: [created_by_id], references: [id], onDelete: Cascade)
+
+  daily_logs SEODailyWorkLog[]
+  timeline   SEOTaskTimeline[]
+
+  @@map("seo_task")
+}
+
+model SEOReminder {
+  id                    Int                 @id @default(autoincrement())
+  title                 String              @db.VarChar(255)
+  description           String?             @db.Text
+  website_id            Int
+  assigned_executive_id Int
+  due_date              DateTime            @db.Date
+  priority              SEOReminderPriority @default(medium)
+  status                SEOReminderStatus   @default(pending)
+  created_by_id         Int
+  created_at            DateTime            @default(now()) @db.DateTime(3)
+  updated_at            DateTime            @updatedAt @db.DateTime(3)
+
+  website            SEOWebsite @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  assigned_executive User       @relation("AssignedSEOReminders", fields: [assigned_executive_id], references: [id], onDelete: Cascade)
+  created_by         User       @relation("CreatedSEOReminders", fields: [created_by_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_reminder")
+}
+
+model SEOCredential {
+  id         Int      @id @default(autoincrement())
+  website_id Int
+  platform   String   @db.VarChar(100)
+  username   String   @db.VarChar(255)
+  password   String   @db.Text
+  notes      String?  @db.Text
+  created_at DateTime @default(now()) @db.DateTime(3)
+  updated_at DateTime @updatedAt @db.DateTime(3)
+
+  website SEOWebsite @relation(fields: [website_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_credential")
+}
+
+model SEOTaskTimeline {
+  id         Int      @id @default(autoincrement())
+  task_id    Int
+  event_time DateTime @default(now()) @db.DateTime(3)
+  user_id    Int?
+  user_name  String?  @db.VarChar(255)
+  action     String   @db.VarChar(100)
+  remarks    String?  @db.Text
+
+  task SEOTask @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  user User?    @relation(fields: [user_id], references: [id], onDelete: SetNull)
+
+  @@map("seo_task_timeline")
+}
+
+model Invoice {
+  id             Int      @id @default(autoincrement())
+  invoice_number String   @unique @db.VarChar(50)
+  client_id      Int
+  issue_date     DateTime @db.Date
+  due_date       DateTime @db.Date
+  advance        Decimal  @default(0.00) @db.Decimal(10, 2)
+  subtotal       Decimal  @db.Decimal(10, 2)
+  tax            Decimal  @db.Decimal(10, 2)
+  total          Decimal  @db.Decimal(10, 2)
+  notes          String?  @db.Text
+  created_at     DateTime @default(now()) @db.DateTime(3)
+
+  client   Client           @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  items    InvoiceItem[]
+  payments InvoicePayment[]
+
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id          Int     @id @default(autoincrement())
+  invoice_id  Int
+  description String  @db.VarChar(255)
+  quantity    Int
+  rate        Decimal @db.Decimal(10, 2)
+  amount      Decimal @db.Decimal(10, 2)
+
+  invoice Invoice @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
+
+  @@map("invoice_items")
+}
+
+model InvoicePayment {
+  id           Int         @id @default(autoincrement())
+  invoice_id   Int
+  amount       Decimal     @db.Decimal(10, 2)
+  payment_date DateTime    @db.Date
+  payment_mode PaymentMode
+  notes        String?     @db.Text
+  created_at   DateTime    @default(now()) @db.DateTime(3)
+
+  invoice Invoice @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
+
+  @@map("invoice_payments")
+}
+
+model Proposal {
+  id               Int            @id @default(autoincrement())
+  lead_id          Int
+  title            String         @db.VarChar(255)
+  description      String?        @db.Text
+  project_overview String?        @db.Text
+  client_id        Int?
+  project_id       Int?
+  subtotal         Decimal        @db.Decimal(12, 2)
+  discount         Decimal        @default(0.00) @db.Decimal(12, 2)
+  amount           Decimal        @db.Decimal(12, 2)
+  status           ProposalStatus @default(draft)
+  last_sent_at     DateTime?      @db.DateTime(3)
+  is_converted     Boolean        @default(false)
+  builder_config   Json?
+  created_at       DateTime       @default(now()) @db.DateTime(3)
+
+  lead    Lead     @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  client  Client?  @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [project_id], references: [id], onDelete: SetNull)
+
+  items ProposalItem[]
+
+  @@map("proposals")
+}
+
+model ProposalItem {
+  id          Int     @id @default(autoincrement())
+  proposal_id Int
+  service     String  @db.VarChar(255)
+  description String? @db.Text
+  cost        Decimal @db.Decimal(10, 2)
+
+  proposal Proposal @relation(fields: [proposal_id], references: [id], onDelete: Cascade)
+
+  @@map("proposal_items")
+}
+
+model Reminder {
+  id                  Int          @id @default(autoincrement())
+  user_id             Int
+  title               String       @db.VarChar(255)
+  description         String?      @db.Text
+  due_date            DateTime     @db.Date
+  type                ReminderType @default(general)
+  is_completed        Boolean      @default(false)
+  email_sent_created  Boolean      @default(false)
+  email_sent_reminder Boolean      @default(false)
+  created_at          DateTime     @default(now()) @db.DateTime(3)
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("reminders")
+}
+
+model Server {
+  id         Int      @id @default(autoincrement())
+  name       String   @db.VarChar(255)
+  provider   String?  @db.VarChar(255)
+  owner      String?  @db.VarChar(255)
+  server_ip  String?  @db.VarChar(100)
+  ip_address String?  @db.VarChar(100)
+  notes      String?  @db.Text
+  created_at DateTime @default(now()) @db.DateTime(3)
+
+  domains Domain[]
+
+  @@map("servers")
+}
+
+model Domain {
+  id            Int       @id @default(autoincrement())
+  project_id    Int
+  domain_name   String    @db.VarChar(255)
+  provider      String?   @db.VarChar(255)
+  purchase_date DateTime? @db.Date
+  expiry_date   DateTime? @db.Date
+  renewal_cost  Decimal?  @db.Decimal(10, 2)
+  server_id     Int?
+  notes         String?   @db.Text
+  created_at    DateTime  @default(now()) @db.DateTime(3)
+
+  project Project @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  server  Server? @relation(fields: [server_id], references: [id], onDelete: SetNull)
+
+  credentials WebsiteCredential[]
+
+  @@map("domains")
+}
+
+model WebsiteCredential {
+  id                      Int      @id @default(autoincrement())
+  project_id              Int
+  domain_id               Int
+  admin_url               String?  @db.VarChar(255)
+  admin_username          String?  @db.VarChar(255)
+  admin_password          String?  @db.Text
+  cpanel_url              String?  @db.VarChar(255)
+  cpanel_username         String?  @db.VarChar(255)
+  cpanel_password         String?  @db.Text
+  ftp_host                String?  @db.VarChar(255)
+  ftp_username            String?  @db.VarChar(255)
+  ftp_password            String?  @db.Text
+  contact_form_email      String?  @db.VarChar(255)
+  client_email            String?  @db.VarChar(255)
+  client_email_password   String?  @db.Text
+  business_email          String?  @db.VarChar(255)
+  business_email_password String?  @db.Text
+  business_email_type     String?  @db.VarChar(50)
+  notes                   String?  @db.Text
+  created_at              DateTime @default(now()) @db.DateTime(3)
+
+  project Project @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  domain  Domain  @relation(fields: [domain_id], references: [id], onDelete: Cascade)
+
+  @@map("website_credentials")
+}
+
+model Employee {
+  id             Int      @id @default(autoincrement())
+  user_id        Int      @unique
+  address        String?  @db.Text
+  position       String   @db.VarChar(120)
+  joining_date   DateTime @db.Date
+  salary_monthly Decimal  @db.Decimal(12, 2)
+  department_id  Int?
+  created_at     DateTime @default(now()) @db.DateTime(3)
+
+  user       User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [department_id], references: [id], onDelete: SetNull)
+
+  documents HRDocument[]
+
+  @@map("employees")
+}
+
+model HRDocument {
+  id            Int       @id @default(autoincrement())
+  employee_id   Int
+  doc_type      HRDocType
+  issued_on     DateTime  @default(now()) @db.DateTime(3)
+  payload       Json
+  created_by_id Int
+  pdf_file      String?   @db.VarChar(255)
+  created_at    DateTime  @default(now()) @db.DateTime(3)
+
+  employee   Employee @relation(fields: [employee_id], references: [id], onDelete: Cascade)
+  created_by User     @relation(fields: [created_by_id], references: [id], onDelete: Restrict)
+
+  @@map("hr_documents")
+}
+
+model TrackingUserProfile {
+  id                  Int      @id @default(autoincrement())
+  user_id             Int      @unique
+  is_tracking_enabled Boolean  @default(false)
+  screenshots_enabled Boolean  @default(true)
+  created_at          DateTime @default(now()) @db.DateTime(3)
+  updated_at          DateTime @updatedAt @db.DateTime(3)
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("tracking_user_profile")
+}
+
+model WorkSession {
+  id                  Int       @id @default(autoincrement())
+  user_id             Int
+  login_time          DateTime  @default(now()) @db.DateTime(3)
+  last_ping           DateTime  @default(now()) @db.DateTime(3)
+  logout_time         DateTime? @db.DateTime(3)
+  is_active_session   Boolean   @default(true)
+  device_id           String    @default("default") @db.VarChar(255)
+  installation_uuid   String?   @db.VarChar(255)
+  tracker_id          String?   @db.VarChar(255)
+  machine_fingerprint String?   @db.VarChar(255)
+  total_duration      BigInt?
+  last_desktop_ping   DateTime? @db.DateTime(3)
+  is_desktop_idle     Boolean   @default(false)
+  mouse_moves         Int       @default(0)
+  key_presses         Int       @default(0)
+  clicks              Int       @default(0)
+  productive_seconds  Int       @default(0)
+  idle_seconds        Int       @default(0)
+  tracked_seconds     Int       @default(0)
+  break_count         Int       @default(0)
+  activity_percentage Float     @default(0.0)
+  created_at          DateTime  @default(now()) @db.DateTime(3)
+  updated_at          DateTime  @updatedAt @db.DateTime(3)
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  app_activities AppActivity[]
+  screenshots    Screenshot[]
+  activity_logs  TrackingActivityLog[]
+
+  @@index([user_id, is_active_session])
+  @@index([last_ping])
+  @@index([login_time])
+  @@map("tracking_work_session")
+}
+
+model TrackingActivityLog {
+  id            Int                  @id @default(autoincrement())
+  user_id       Int
+  session_id    Int
+  activity_type TrackingActivityType
+  timestamp     DateTime             @default(now()) @db.DateTime(3)
+
+  user    User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  session WorkSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, timestamp])
+  @@index([session_id, timestamp])
+  @@map("tracking_activity_log")
+}
+
+model AppActivity {
+  id                  Int      @id @default(autoincrement())
+  user_id             Int
+  session_id          Int
+  app_name            String   @db.VarChar(255)
+  window_title        String?  @db.VarChar(500)
+  duration_seconds    Int      @default(0)
+  mouse_moves         Int      @default(0)
+  key_presses         Int      @default(0)
+  clicks              Int      @default(0)
+  productive_seconds  Int      @default(0)
+  productive_duration Int      @default(0)
+  timestamp           DateTime @default(now()) @db.DateTime(3)
+  is_productive       Boolean  @default(true)
+
+  user    User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  session WorkSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, timestamp])
+  @@index([app_name])
+  @@map("tracking_app_activity")
+}
+
+model Screenshot {
+  id         Int      @id @default(autoincrement())
+  user_id    Int
+  session_id Int
+  image      String   @db.VarChar(255)
+  timestamp  DateTime @default(now()) @db.DateTime(3)
+  is_idle    Boolean  @default(false)
+
+  user    User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  session WorkSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, timestamp])
+  @@map("tracking_screenshot")
+}
+
+model Notification {
+  id         Int                @id @default(autoincrement())
+  title      String             @db.VarChar(255)
+  message    String             @db.Text
+  module     NotificationModule
+  type       NotificationType
+  email_sent Boolean            @default(false)
+  created_at DateTime           @default(now()) @db.DateTime(3)
+
+  @@map("notifications")
+}
+
+model ClientNotification {
+  id                Int      @id @default(autoincrement())
+  user_id           Int
+  title             String   @db.VarChar(255)
+  message           String   @db.Text
+  notification_type String   @db.VarChar(100)
+  read              Boolean  @default(false)
+  created_at        DateTime @default(now()) @db.DateTime(3)
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("client_notifications")
+}
