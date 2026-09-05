@@ -659,19 +659,37 @@ export class TrackingService {
       let currentApp: string | null = null;
       let currentWindow: string | null = null;
 
-      let productiveSeconds = 0;
-      let idleSeconds = 0;
-      let mouseMoves = 0;
-      let keyPresses = 0;
-      let clicks = 0;
+      let sessionProductiveSec = 0;
+      let sessionIdleSec = 0;
 
       if (displaySession) {
         lastPing = displaySession.last_ping ? displaySession.last_ping.toISOString() : null;
-        productiveSeconds = displaySession.productive_seconds || 0;
-        idleSeconds = displaySession.idle_seconds || 0;
-        mouseMoves = displaySession.mouse_moves || 0;
-        keyPresses = displaySession.key_presses || 0;
-        clicks = displaySession.clicks || 0;
+        sessionProductiveSec = displaySession.productive_seconds || 0;
+        sessionIdleSec = displaySession.idle_seconds || 0;
+      }
+
+      const todaySessions = await this.prisma.workSession.findMany({
+        where: {
+          user_id: u.id,
+          OR: [
+            { login_time: { gte: todayStart } },
+            { is_active_session: true },
+          ],
+        },
+      });
+
+      let dailyProductiveSeconds = 0;
+      let dailyIdleSeconds = 0;
+      let dailyMouseMoves = 0;
+      let dailyKeyPresses = 0;
+      let dailyClicks = 0;
+
+      for (const s of todaySessions) {
+        dailyProductiveSeconds += s.productive_seconds || 0;
+        dailyIdleSeconds += s.idle_seconds || 0;
+        dailyMouseMoves += s.mouse_moves || 0;
+        dailyKeyPresses += s.key_presses || 0;
+        dailyClicks += s.clicks || 0;
       }
 
       if (isLive && activeSession) {
@@ -688,8 +706,8 @@ export class TrackingService {
         }
       }
 
-      const trackedSeconds = productiveSeconds + idleSeconds;
-      const activityPct = trackedSeconds > 0 ? Math.min(100.0, (productiveSeconds / trackedSeconds) * 100.0) : 0.0;
+      const dailyTrackedSeconds = dailyProductiveSeconds + dailyIdleSeconds;
+      const activityPct = dailyTrackedSeconds > 0 ? Math.min(100.0, (dailyProductiveSeconds / dailyTrackedSeconds) * 100.0) : 0.0;
 
       const formatDurationSec = (sec: number) => {
         const s = Math.max(0, Math.floor(sec));
@@ -713,26 +731,26 @@ export class TrackingService {
         login_time: loginTime,
         first_login_time: firstSession ? firstSession.login_time.toISOString() : null,
         last_ping: lastPing,
-        total_work_time: formatDurationSec(productiveSeconds),
-        idle_time: formatDurationSec(idleSeconds),
+        total_work_time: formatDurationSec(dailyProductiveSeconds),
+        idle_time: formatDurationSec(dailyIdleSeconds),
         activity_percentage: Number(activityPct.toFixed(2)),
-        productive_time: formatDurationSec(productiveSeconds),
-        non_productive_time: formatDurationSec(idleSeconds),
-        total_tracked_time: formatDurationSec(trackedSeconds),
-        desktop_work_time: formatDurationSec(trackedSeconds),
+        productive_time: formatDurationSec(dailyProductiveSeconds),
+        non_productive_time: formatDurationSec(dailyIdleSeconds),
+        total_tracked_time: formatDurationSec(dailyTrackedSeconds),
+        desktop_work_time: formatDurationSec(dailyTrackedSeconds),
         portal_active_time: '00:00:00',
         break_time: '00:00:00',
         unaccounted_time: '00:00:00',
-        total_engagement_time: formatDurationSec(trackedSeconds),
+        total_engagement_time: formatDurationSec(dailyTrackedSeconds),
         session_id: activeSession ? activeSession.id : null,
         session_type: 'desktop',
         current_app: currentApp,
         current_window: currentWindow,
-        mouse_moves: mouseMoves,
-        key_presses: keyPresses,
-        clicks: clicks,
-        productive_seconds: productiveSeconds,
-        idle_seconds: idleSeconds,
+        mouse_moves: dailyMouseMoves,
+        key_presses: dailyKeyPresses,
+        clicks: dailyClicks,
+        productive_seconds: sessionProductiveSec,
+        idle_seconds: sessionIdleSec,
       };
 
       if (targetUserId && activeSession) {
@@ -803,69 +821,776 @@ export class TrackingService {
   // -------------------------------------------------------------
   // 5. REPORTS & ANALYTICS
   // -------------------------------------------------------------
+  detectBreaksAndGaps(sessionsList: any[], activitiesList: any[]) {
+    const breaks: any[] = [];
+    const sortedSessions = [...sessionsList].sort((a, b) => new Date(a.login_time).getTime() - new Date(b.login_time).getTime());
+
+    for (let i = 0; i < sortedSessions.length - 1; i++) {
+      const s1 = sortedSessions[i];
+      const s2 = sortedSessions[i + 1];
+      const d1 = new Date(s1.login_time).toDateString();
+      const d2 = new Date(s2.login_time).toDateString();
+
+      if (d1 === d2) {
+        const logout = s1.logout_time || s1.last_ping;
+        const login = s2.login_time;
+        if (logout && new Date(login).getTime() > new Date(logout).getTime()) {
+          const gap = Math.floor((new Date(login).getTime() - new Date(logout).getTime()) / 1000);
+          if (gap >= 60) {
+            breaks.push({
+              start: new Date(logout),
+              end: new Date(login),
+              duration: gap,
+              type: 'offline',
+              description: 'Away from keyboard / Offline',
+            });
+          }
+        }
+      }
+    }
+
+    for (const session of sortedSessions) {
+      const sessionActs = activitiesList
+        .filter((act) => act.session_id === session.id)
+        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      if (sessionActs.length >= 2) {
+        for (let j = 0; j < sessionActs.length - 1; j++) {
+          const act1 = sessionActs[j];
+          const act2 = sessionActs[j + 1];
+          const act1End = new Date(new Date(act1.timestamp).getTime() + (act1.duration_seconds || 10) * 1000);
+          const act2Start = new Date(act2.timestamp);
+
+          if (act2Start.getTime() > act1End.getTime()) {
+            const gap = Math.floor((act2Start.getTime() - act1End.getTime()) / 1000);
+            if (gap >= 180) {
+              breaks.push({
+                start: act1End,
+                end: act2Start,
+                duration: gap,
+                type: 'idle',
+                description: 'Idle session',
+              });
+            }
+          }
+        }
+      }
+    }
+
+    breaks.sort((a, b) => a.start.getTime() - b.start.getTime());
+    const totalBreakSec = breaks.reduce((acc, b) => acc + b.duration, 0);
+
+    return {
+      breaksList: breaks,
+      breakCount: breaks.length,
+      totalBreakSeconds: totalBreakSec,
+    };
+  }
+
   async getDailyReport(params: any) {
+    const toLocalDateStr = (d: Date | string) => {
+      const dt = new Date(d);
+      const year = dt.getFullYear();
+      const month = String(dt.getMonth() + 1).padStart(2, '0');
+      const day = String(dt.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    };
+
+    let startDateStr = params?.start_date;
+    let endDateStr = params?.end_date;
+
+    if (params?.date && !startDateStr && !endDateStr) {
+      startDateStr = params.date;
+      endDateStr = params.date;
+    }
+
+    const todayStr = toLocalDateStr(new Date());
+    if (!startDateStr) startDateStr = todayStr;
+    if (!endDateStr) endDateStr = startDateStr;
+
+    const startDate = new Date(startDateStr.includes('T') ? startDateStr : `${startDateStr}T00:00:00`);
+    const endDate = new Date(endDateStr.includes('T') ? endDateStr : `${endDateStr}T23:59:59.999`);
+
+    const userWhere: any = {};
+    if (params?.department_id) {
+      userWhere.department_id = Number(params.department_id);
+    }
+    if (params?.user_id) {
+      userWhere.id = Number(params.user_id);
+    }
+    if (params?.search) {
+      const search = String(params.search).trim();
+      userWhere.OR = [
+        { name: { contains: search } },
+        { username: { contains: search } },
+        { email: { contains: search } },
+      ];
+    }
+
     const users = await this.prisma.user.findMany({
-      select: { id: true, name: true, username: true, email: true },
+      where: userWhere,
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        position: true,
+        department: { select: { id: true, name: true } },
+      },
     });
 
-    const dateStr = params.date || new Date().toISOString().split('T')[0];
+    const userIds = users.map((u) => u.id);
 
-    return users.map((u) => ({
-      user_id: u.id,
-      username: u.username,
-      full_name: u.name || u.username,
-      email: u.email,
-      date: dateStr,
-      total_work_time: '08:00:00',
-      productive_time: '07:15:00',
-      idle_time: '00:45:00',
-      activity_percentage: 90.6,
-      status: 'Completed',
-    }));
+    const sessions = await this.prisma.workSession.findMany({
+      where: {
+        user_id: { in: userIds },
+        login_time: { gte: startDate, lte: endDate },
+      },
+      orderBy: { login_time: 'asc' },
+    });
+
+    const activities = await this.prisma.appActivity.findMany({
+      where: {
+        user_id: { in: userIds },
+        timestamp: { gte: startDate, lte: endDate },
+      },
+      orderBy: { timestamp: 'asc' },
+    });
+
+    const formatDurationSec = (sec: number) => {
+      const s = Math.max(0, Math.floor(sec));
+      const h = String(Math.floor(s / 3600)).padStart(2, '0');
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const sc = String(s % 60).padStart(2, '0');
+      return `${h}:${m}:${sc}`;
+    };
+
+    const reportRows: any[] = [];
+    const now = new Date();
+
+    const currDate = new Date(startDate);
+    while (currDate <= endDate) {
+      const dateIso = toLocalDateStr(currDate);
+
+      for (const u of users) {
+        const daySessions = sessions.filter((s) => s.user_id === u.id && toLocalDateStr(s.login_time) === dateIso);
+        const dayActivities = activities.filter((a) => a.user_id === u.id && toLocalDateStr(a.timestamp) === dateIso);
+
+        if (daySessions.length === 0) continue;
+
+        const firstLogin = daySessions.reduce((min, s) => (s.login_time < min ? s.login_time : min), daySessions[0].login_time);
+        const lastActive = daySessions.reduce((max, s) => {
+          const t = s.logout_time || s.last_ping || s.login_time;
+          return t > max ? t : max;
+        }, daySessions[0].login_time);
+
+        let productiveSec = 0;
+        let idleSec = 0;
+        let portalActiveSec = 0;
+
+        for (const s of daySessions) {
+          const sEnd = s.logout_time || s.last_ping || now;
+          const sElapsed = Math.max(0, Math.floor((new Date(sEnd).getTime() - new Date(s.login_time).getTime()) / 1000));
+          if (s.device_id === 'default') {
+            portalActiveSec += sElapsed;
+          } else {
+            let sProd = Math.max(0, s.productive_seconds || 0);
+            let sIdle = Math.max(0, s.idle_seconds || 0);
+            if (sProd + sIdle > sElapsed) {
+              if (sProd > sElapsed) {
+                sProd = sElapsed;
+                sIdle = 0;
+              } else {
+                sIdle = sElapsed - sProd;
+              }
+            }
+            productiveSec += sProd;
+            idleSec += sIdle;
+          }
+        }
+
+        const breakAnalysis = this.detectBreaksAndGaps(daySessions, dayActivities);
+        const offlineBreakSec = breakAnalysis.breaksList.filter((b) => b.type === 'offline').reduce((acc, b) => acc + b.duration, 0);
+        const idleBreakSec = breakAnalysis.breaksList.filter((b) => b.type === 'idle').reduce((acc, b) => acc + b.duration, 0);
+
+        const reconciledIdleSec = idleSec;
+        const reconciledBreakSec = offlineBreakSec + idleBreakSec;
+
+        const spannedDuration = Math.max(0, Math.floor((new Date(lastActive).getTime() - new Date(firstLogin).getTime()) / 1000));
+        const desktopWorkSec = productiveSec + reconciledIdleSec;
+        const totalEngagementSec = desktopWorkSec + portalActiveSec;
+
+        const sumAccounted = productiveSec + reconciledIdleSec + portalActiveSec + reconciledBreakSec;
+        const unaccountedSec = Math.max(0, spannedDuration - sumAccounted);
+
+        const activityPct = desktopWorkSec > 0 ? Math.min(100.0, (productiveSec / desktopWorkSec) * 100.0) : 0.0;
+
+        const fullName = u.name || u.username;
+        const empCode = `GS-26-${String(u.id).padStart(3, '0')}`;
+        const deptName = u.department?.name || 'General';
+
+        const latestSession = daySessions[daySessions.length - 1];
+        let status = 'Offline';
+        if (dateIso === todayStr && latestSession.is_active_session) {
+          const lastPingTime = latestSession.last_desktop_ping || latestSession.last_ping;
+          if (lastPingTime) {
+            const secSincePing = Math.floor((now.getTime() - new Date(lastPingTime).getTime()) / 1000);
+            if (secSincePing <= 300) {
+              status = latestSession.is_desktop_idle || secSincePing > 120 ? 'Idle' : 'Active';
+            }
+          }
+        }
+
+        reportRows.push({
+          employee_name: fullName,
+          employee_code: empCode,
+          department: deptName,
+          date: dateIso,
+          productive_time: formatDurationSec(productiveSec),
+          idle_time: formatDurationSec(reconciledIdleSec),
+          desktop_work_time: formatDurationSec(desktopWorkSec),
+          portal_active_time: formatDurationSec(portalActiveSec),
+          break_time: formatDurationSec(reconciledBreakSec),
+          unaccounted_time: formatDurationSec(unaccountedSec),
+          total_engagement_time: formatDurationSec(totalEngagementSec),
+          workday_span: formatDurationSec(spannedDuration),
+          activity_percentage: Number(activityPct.toFixed(2)),
+          status,
+
+          user_id: u.id,
+          username: u.username,
+          full_name: fullName,
+          email: u.email,
+          first_login: firstLogin ? new Date(firstLogin).toISOString() : null,
+          last_active: lastActive ? new Date(lastActive).toISOString() : null,
+          total_tracked_time: formatDurationSec(desktopWorkSec),
+          break_count: breakAnalysis.breakCount,
+
+          raw_tracked_seconds: desktopWorkSec,
+          raw_productive_seconds: productiveSec,
+          raw_idle_seconds: reconciledIdleSec,
+          raw_desktop_work_seconds: desktopWorkSec,
+          raw_portal_active_seconds: portalActiveSec,
+          raw_break_seconds: reconciledBreakSec,
+          raw_unaccounted_seconds: unaccountedSec,
+          raw_total_engagement_seconds: totalEngagementSec,
+          raw_workday_span: spannedDuration,
+        });
+      }
+
+      currDate.setDate(currDate.getDate() + 1);
+    }
+
+    return reportRows;
   }
 
   async getWeeklyReport(params: any) {
+    const rows = await this.getDailyReport(params);
+
+    const formatDurationSec = (sec: number) => {
+      const s = Math.max(0, Math.floor(sec));
+      const h = String(Math.floor(s / 3600)).padStart(2, '0');
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const sc = String(s % 60).padStart(2, '0');
+      return `${h}:${m}:${sc}`;
+    };
+
+    if (!rows || rows.length === 0) {
+      return {
+        total_weekly_hours: '00:00:00',
+        average_activity_percentage: 0.0,
+        most_productive_day: '-',
+        total_idle_time: '00:00:00',
+        attendance_days: 0,
+        app_usage_summary: [],
+        daily_productivity_trend: [],
+        weekly_work_hours: [],
+      };
+    }
+
+    const totalTrackedSec = rows.reduce((acc: number, r: any) => acc + (r.raw_tracked_seconds || 0), 0);
+    const totalProductiveSec = rows.reduce((acc: number, r: any) => acc + (r.raw_productive_seconds || 0), 0);
+    const totalIdleSec = rows.reduce((acc: number, r: any) => acc + (r.raw_idle_seconds || 0), 0);
+
+    const avgActivity = totalTrackedSec > 0 ? (totalProductiveSec / totalTrackedSec) * 100.0 : 0.0;
+    const attendanceDays = new Set(rows.map((r: any) => `${r.user_id}_${r.date}`)).size;
+
+    const dayProductivity: Record<string, number> = {};
+    for (const r of rows) {
+      dayProductivity[r.date] = (dayProductivity[r.date] || 0) + r.raw_productive_seconds;
+    }
+
+    let mostProductiveDay = '-';
+    const dates = Object.keys(dayProductivity);
+    if (dates.length > 0) {
+      const topDate = dates.reduce((a, b) => (dayProductivity[a] > dayProductivity[b] ? a : b));
+      const dObj = new Date(topDate);
+      const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      mostProductiveDay = `${dayNames[dObj.getDay()]} (${monthNames[dObj.getMonth()]} ${String(dObj.getDate()).padStart(2, '0')})`;
+    }
+
+    const userIds = Array.from(new Set(rows.map((r: any) => r.user_id)));
+    const activities = await this.prisma.appActivity.findMany({
+      where: { user_id: { in: userIds } },
+      orderBy: { timestamp: 'desc' },
+      take: 200,
+    });
+
+    const appGroup: Record<string, { duration: number; productive: number }> = {};
+    for (const act of activities) {
+      if (!appGroup[act.app_name]) appGroup[act.app_name] = { duration: 0, productive: 0 };
+      appGroup[act.app_name].duration += act.duration_seconds || 0;
+      appGroup[act.app_name].productive += act.productive_seconds || 0;
+    }
+
+    const appUsageSummary = Object.keys(appGroup)
+      .map((name) => {
+        const cat = this.classifyAppActivity(name, '');
+        return {
+          app_name: name,
+          duration_seconds: appGroup[name].duration,
+          duration_formatted: formatDurationSec(appGroup[name].duration),
+          is_productive: cat === 'productive',
+          category: cat.replace('_', ' ').replace(/\b\w/g, (l) => l.toUpperCase()),
+        };
+      })
+      .sort((a, b) => b.duration_seconds - a.duration_seconds)
+      .slice(0, 10);
+
+    const dailyProductivityTrend: any[] = [];
+    const dateMap: Record<string, { prod: number; idle: number }> = {};
+    for (const r of rows) {
+      if (!dateMap[r.date]) dateMap[r.date] = { prod: 0, idle: 0 };
+      dateMap[r.date].prod += r.raw_productive_seconds;
+      dateMap[r.date].idle += r.raw_idle_seconds;
+    }
+
+    for (const dStr of Object.keys(dateMap).sort()) {
+      const dObj = new Date(dStr);
+      const dayShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dObj.getDay()];
+      const monthShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][dObj.getMonth()];
+      dailyProductivityTrend.push({
+        date: `${dayShort}, ${monthShort} ${String(dObj.getDate()).padStart(2, '0')}`,
+        productive_hours: Number((dateMap[dStr].prod / 3600.0).toFixed(2)),
+        idle_hours: Number((dateMap[dStr].idle / 3600.0).toFixed(2)),
+      });
+    }
+
+    const userHoursMap: Record<string, number> = {};
+    for (const r of rows) {
+      userHoursMap[r.full_name] = (userHoursMap[r.full_name] || 0) + r.raw_tracked_seconds;
+    }
+
+    const weeklyWorkHours = Object.keys(userHoursMap).map((name) => ({
+      employee: name,
+      hours: Number((userHoursMap[name] / 3600.0).toFixed(2)),
+    }));
+
     return {
-      summary: {
-        total_hours: 40.0,
-        average_daily_hours: 8.0,
-        productive_percentage: 92.5,
-      },
-      weekly_data: [
-        { day: 'Monday', hours: 8.0, productive_hours: 7.5 },
-        { day: 'Tuesday', hours: 8.0, productive_hours: 7.4 },
-        { day: 'Wednesday', hours: 8.0, productive_hours: 7.6 },
-        { day: 'Thursday', hours: 8.0, productive_hours: 7.2 },
-        { day: 'Friday', hours: 8.0, productive_hours: 7.3 },
-      ],
+      total_weekly_hours: formatDurationSec(totalTrackedSec),
+      average_activity_percentage: Number(Math.min(100.0, avgActivity).toFixed(2)),
+      most_productive_day: mostProductiveDay,
+      total_idle_time: formatDurationSec(totalIdleSec),
+      attendance_days: attendanceDays,
+      app_usage_summary: appUsageSummary,
+      daily_productivity_trend: dailyProductivityTrend,
+      weekly_work_hours: weeklyWorkHours,
     };
   }
 
   async getMonthlyReport(params: any) {
+    const now = new Date();
+    const year = Number(params?.year || now.getFullYear());
+    const month = Number(params?.month || now.getMonth() + 1);
+
+    const startDateStr = `${year}-${String(month).padStart(2, '0')}-01`;
+    const lastDay = new Date(year, month, 0).getDate();
+    const endDateStr = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+
+    const rows = await this.getDailyReport({ ...params, start_date: startDateStr, end_date: endDateStr });
+
+    const formatDurationSec = (sec: number) => {
+      const s = Math.max(0, Math.floor(sec));
+      const h = String(Math.floor(s / 3600)).padStart(2, '0');
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const sc = String(s % 60).padStart(2, '0');
+      return `${h}:${m}:${sc}`;
+    };
+
+    if (!rows || rows.length === 0) {
+      return {
+        total_monthly_work_hours: '00:00:00',
+        total_productive_hours: '00:00:00',
+        total_idle_hours: '00:00:00',
+        attendance_summary: {
+          total_sessions: 0,
+          avg_sessions_per_day: 0.0,
+          unique_days_worked: 0,
+          active_employees_count: 0,
+        },
+        employee_ranking: [],
+        productivity_trends: [],
+      };
+    }
+
+    const totalTrackedSec = rows.reduce((acc: number, r: any) => acc + (r.raw_tracked_seconds || 0), 0);
+    const totalProductiveSec = rows.reduce((acc: number, r: any) => acc + (r.raw_productive_seconds || 0), 0);
+    const totalIdleSec = rows.reduce((acc: number, r: any) => acc + (r.raw_idle_seconds || 0), 0);
+
+    const uniqueDays = new Set(rows.map((r: any) => r.date)).size;
+    const uniqueEmployees = new Set(rows.map((r: any) => r.user_id)).size;
+
+    const empStats: Record<number, any> = {};
+    for (const r of rows) {
+      const uid = r.user_id;
+      if (!empStats[uid]) {
+        empStats[uid] = {
+          user_id: uid,
+          full_name: r.full_name,
+          employee_code: r.employee_code,
+          department: r.department,
+          productive_sec: 0,
+          idle_sec: 0,
+          tracked_sec: 0,
+        };
+      }
+      empStats[uid].productive_sec += r.raw_productive_seconds;
+      empStats[uid].idle_sec += r.raw_idle_seconds;
+      empStats[uid].tracked_sec += r.raw_tracked_seconds;
+    }
+
+    const employeeRanking = Object.values(empStats)
+      .map((stats: any) => {
+        const pct = stats.tracked_sec > 0 ? (stats.productive_sec / stats.tracked_sec) * 100.0 : 0.0;
+        return {
+          user_id: stats.user_id,
+          full_name: stats.full_name,
+          employee_code: stats.employee_code,
+          department: stats.department,
+          productive_hours: Number((stats.productive_sec / 3600.0).toFixed(2)),
+          tracked_hours: Number((stats.tracked_sec / 3600.0).toFixed(2)),
+          activity_percentage: Number(Math.min(100.0, pct).toFixed(2)),
+        };
+      })
+      .sort((a: any, b: any) => b.productive_hours - a.productive_hours);
+
+    const trendsGrouped: Record<string, { date: string; productive_hours: number; idle_hours: number }> = {};
+    for (const r of rows) {
+      if (!trendsGrouped[r.date]) {
+        const dObj = new Date(r.date);
+        const monthShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][dObj.getMonth()];
+        trendsGrouped[r.date] = {
+          date: `${monthShort} ${String(dObj.getDate()).padStart(2, '0')}`,
+          productive_hours: 0,
+          idle_hours: 0,
+        };
+      }
+      trendsGrouped[r.date].productive_hours += Number((r.raw_productive_seconds / 3600.0).toFixed(2));
+      trendsGrouped[r.date].idle_hours += Number((r.raw_idle_seconds / 3600.0).toFixed(2));
+    }
+
     return {
-      year: params.year || new Date().getFullYear(),
-      month: params.month || new Date().getMonth() + 1,
-      total_hours: 160.0,
-      active_employees: 10,
-      rankings: [],
+      total_monthly_work_hours: formatDurationSec(totalTrackedSec),
+      total_productive_hours: formatDurationSec(totalProductiveSec),
+      total_idle_hours: formatDurationSec(totalIdleSec),
+      attendance_summary: {
+        total_sessions: rows.length,
+        avg_sessions_per_day: Number((rows.length / Math.max(1, uniqueDays)).toFixed(1)),
+        unique_days_worked: uniqueDays,
+        active_employees_count: uniqueEmployees,
+      },
+      employee_ranking: employeeRanking,
+      productivity_trends: Object.values(trendsGrouped),
     };
   }
 
   async getEmployeeAnalytics(params: any) {
-    const userId = Number(params.user_id);
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const userId = Number(params?.user_id);
+    if (!userId) throw new BadRequestException('user_id query parameter is required.');
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: { department: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const endDateStr = params?.end_date || todayStr;
+    const endDateObj = new Date(endDateStr);
+    endDateObj.setHours(23, 59, 59, 999);
+
+    const startDateObj = params?.start_date ? new Date(params.start_date) : new Date(endDateObj.getTime() - 6 * 86400000);
+    startDateObj.setHours(0, 0, 0, 0);
+
+    const startDateStr = startDateObj.toISOString().split('T')[0];
+
+    const rows = await this.getDailyReport({ user_id: userId, start_date: startDateStr, end_date: endDateStr });
+    const userRows = rows.filter((r: any) => r.user_id === userId);
+
+    const activities = await this.prisma.appActivity.findMany({
+      where: {
+        user_id: userId,
+        timestamp: { gte: startDateObj, lte: endDateObj },
+      },
+      orderBy: { timestamp: 'desc' },
+    });
+
+    const sessions = await this.prisma.workSession.findMany({
+      where: {
+        user_id: userId,
+        login_time: { gte: startDateObj, lte: endDateObj },
+      },
+      orderBy: { login_time: 'asc' },
+    });
+
+    const formatDurationSec = (sec: number) => {
+      const s = Math.max(0, Math.floor(sec));
+      const h = String(Math.floor(s / 3600)).padStart(2, '0');
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const sc = String(s % 60).padStart(2, '0');
+      return `${h}:${m}:${sc}`;
+    };
+
+    const appStats: Record<string, any> = {};
+    let totalAppSec = 0;
+    for (const act of activities) {
+      const cat = this.classifyAppActivity(act.app_name, act.window_title || '');
+      if (!appStats[act.app_name]) {
+        appStats[act.app_name] = {
+          app_name: act.app_name,
+          duration_seconds: 0,
+          productive_seconds: 0,
+          mouse_moves: 0,
+          key_presses: 0,
+          category: cat,
+          is_productive: cat === 'productive',
+        };
+      }
+      appStats[act.app_name].duration_seconds += act.duration_seconds || 0;
+      appStats[act.app_name].productive_seconds += act.productive_seconds || 0;
+      appStats[act.app_name].mouse_moves += act.mouse_moves || 0;
+      appStats[act.app_name].key_presses += act.key_presses || 0;
+      totalAppSec += act.duration_seconds || 0;
+    }
+
+    const formattedApps = Object.values(appStats)
+      .map((st: any) => ({
+        app_name: st.app_name,
+        total_time: formatDurationSec(st.duration_seconds),
+        productive_time: formatDurationSec(st.productive_seconds),
+        mouse_moves: st.mouse_moves,
+        key_presses: st.key_presses,
+        category: st.category.replace('_', ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
+        is_productive: st.is_productive,
+        percentage_of_total: Number((totalAppSec > 0 ? (st.duration_seconds / totalAppSec) * 100 : 0).toFixed(2)),
+      }))
+      .sort((a, b) => b.percentage_of_total - a.percentage_of_total);
+
+    const breakAnalysis = this.detectBreaksAndGaps(sessions, activities);
+    const formattedBreaks = breakAnalysis.breaksList.map((b: any) => ({
+      start: b.start.toISOString(),
+      end: b.end.toISOString(),
+      duration: formatDurationSec(b.duration),
+      type: b.type,
+      description: b.description,
+    }));
+
+    const totalProd = userRows.reduce((acc: number, r: any) => acc + r.raw_productive_seconds, 0);
+    const totalIdle = userRows.reduce((acc: number, r: any) => acc + r.raw_idle_seconds, 0);
+    const totalTracked = userRows.reduce((acc: number, r: any) => acc + r.raw_tracked_seconds, 0);
+    const totalPortal = userRows.reduce((acc: number, r: any) => acc + r.raw_portal_active_seconds, 0);
+    const totalBreak = userRows.reduce((acc: number, r: any) => acc + r.raw_break_seconds, 0);
+    const totalUnaccounted = userRows.reduce((acc: number, r: any) => acc + r.raw_unaccounted_seconds, 0);
+    const totalEngagement = userRows.reduce((acc: number, r: any) => acc + r.raw_total_engagement_seconds, 0);
+    const totalBreakCount = userRows.reduce((acc: number, r: any) => acc + r.break_count, 0);
+
+    const avgActPct = totalTracked > 0 ? (totalProd / totalTracked) * 100.0 : 0.0;
+    const fullName = user.name || user.username;
+    const empCode = `GS-26-${String(user.id).padStart(3, '0')}`;
 
     return {
-      user_id: userId,
-      username: user?.username || '',
-      full_name: user?.name || user?.username || '',
-      total_tracked_hours: 160.0,
-      avg_activity_percentage: 91.2,
-      top_apps: [
-        { app_name: 'Visual Studio Code', duration_seconds: 144000 },
-        { app_name: 'Google Chrome', duration_seconds: 72000 },
-      ],
+      employee: {
+        id: user.id,
+        username: user.username,
+        full_name: fullName,
+        email: user.email,
+        employee_code: empCode,
+        department: user.department?.name || 'General',
+      },
+      totals: {
+        total_tracked_time: formatDurationSec(totalTracked),
+        productive_time: formatDurationSec(totalProd),
+        idle_time: formatDurationSec(totalIdle),
+        desktop_work_time: formatDurationSec(totalTracked),
+        portal_active_time: formatDurationSec(totalPortal),
+        break_time: formatDurationSec(totalBreak),
+        unaccounted_time: formatDurationSec(totalUnaccounted),
+        total_engagement_time: formatDurationSec(totalEngagement),
+        activity_percentage: Number(Math.min(100.0, avgActPct).toFixed(2)),
+        break_count: totalBreakCount,
+        total_break_time: formatDurationSec(totalBreak),
+      },
+      daily_breakdown: userRows,
+      app_usage: formattedApps,
+      breaks: formattedBreaks,
     };
+  }
+
+  async exportReport(res: any, query: any) {
+    const exportFormat = String(query?.format || 'csv').toLowerCase();
+    const reportType = String(query?.type || 'daily').toLowerCase();
+
+    let data: any[] = [];
+    let filename = `report_${new Date().toISOString().split('T')[0]}`;
+
+    if (reportType === 'daily') {
+      data = await this.getDailyReport(query);
+      filename = `daily_report_${query?.start_date || new Date().toISOString().split('T')[0]}`;
+    } else if (reportType === 'weekly') {
+      const weekly = await this.getWeeklyReport(query);
+      data = (weekly.daily_productivity_trend || []).map((trend: any) => ({
+        Date: trend.date,
+        'Productive Hours': trend.productive_hours,
+        'Idle Hours': trend.idle_hours,
+        'Total Tracked': Number((trend.productive_hours + trend.idle_hours).toFixed(2)),
+      }));
+      filename = `weekly_report_${query?.start_date || 'week'}`;
+    } else if (reportType === 'monthly') {
+      const monthly = await this.getMonthlyReport(query);
+      data = monthly.employee_ranking || [];
+      filename = `monthly_ranking_${query?.year || new Date().getFullYear()}_${query?.month || new Date().getMonth() + 1}`;
+    } else if (reportType === 'employee') {
+      const employee = await this.getEmployeeAnalytics(query);
+      data = employee.daily_breakdown || [];
+      filename = `employee_report_${employee.employee?.username || 'analytics'}`;
+    }
+
+    if (exportFormat === 'csv') {
+      const headers = [
+        'Employee Name', 'Employee Code', 'Department', 'Date',
+        'Productive Time', 'Idle Time', 'Desktop Work Time', 'Portal Active Time',
+        'Break Time', 'Unaccounted Time', 'Total Engagement Time', 'Workday Span',
+        'Activity Percentage', 'Status'
+      ];
+      const keys = [
+        'employee_name', 'employee_code', 'department', 'date',
+        'productive_time', 'idle_time', 'desktop_work_time', 'portal_active_time',
+        'break_time', 'unaccounted_time', 'total_engagement_time', 'workday_span',
+        'activity_percentage', 'status'
+      ];
+
+      let csvStr = '';
+      if (data.length > 0 && (reportType === 'daily' || reportType === 'employee')) {
+        csvStr += headers.join(',') + '\n';
+        for (const row of data) {
+          const line = keys.map((k) => `"${row[k] !== undefined ? row[k] : '-'}"`).join(',');
+          csvStr += line + '\n';
+        }
+      } else if (data.length > 0) {
+        const rowKeys = Object.keys(data[0]);
+        csvStr += rowKeys.join(',') + '\n';
+        for (const row of data) {
+          const line = rowKeys.map((k) => `"${row[k] !== undefined ? row[k] : '-'}"`).join(',');
+          csvStr += line + '\n';
+        }
+      } else {
+        csvStr = headers.join(',') + '\n';
+      }
+
+      res.set({
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="${filename}.csv"`,
+      });
+      return res.send(csvStr);
+    } else if (exportFormat === 'excel') {
+      const headers = [
+        'Employee Name', 'Employee Code', 'Department', 'Date',
+        'Productive Time', 'Idle Time', 'Desktop Work Time', 'Portal Active Time',
+        'Break Time', 'Unaccounted Time', 'Total Engagement Time', 'Workday Span',
+        'Activity Percentage', 'Status'
+      ];
+      const keys = [
+        'employee_name', 'employee_code', 'department', 'date',
+        'productive_time', 'idle_time', 'desktop_work_time', 'portal_active_time',
+        'break_time', 'unaccounted_time', 'total_engagement_time', 'workday_span',
+        'activity_percentage', 'status'
+      ];
+
+      let xlsStr = headers.join('\t') + '\n';
+      if (data.length > 0 && (reportType === 'daily' || reportType === 'employee')) {
+        for (const row of data) {
+          xlsStr += keys.map((k) => row[k] !== undefined ? row[k] : '-').join('\t') + '\n';
+        }
+      } else if (data.length > 0) {
+        const rowKeys = Object.keys(data[0]);
+        xlsStr = rowKeys.join('\t') + '\n';
+        for (const row of data) {
+          xlsStr += rowKeys.map((k) => row[k] !== undefined ? row[k] : '-').join('\t') + '\n';
+        }
+      }
+
+      res.set({
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${filename}.xlsx"`,
+      });
+      return res.send(Buffer.from(xlsStr, 'utf-8'));
+    } else if (exportFormat === 'pdf') {
+      return new Promise<void>((resolve, reject) => {
+        try {
+          const PDFDocument = require('pdfkit');
+          const doc = new PDFDocument({ margin: 30, size: 'A4', layout: 'landscape' });
+          const chunks: Buffer[] = [];
+
+          doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+          doc.on('end', () => {
+            const pdfBuffer = Buffer.concat(chunks);
+            res.set({
+              'Content-Type': 'application/pdf',
+              'Content-Disposition': `attachment; filename="${filename}.pdf"`,
+            });
+            res.send(pdfBuffer);
+            resolve();
+          });
+          doc.on('error', (err: any) => reject(err));
+
+          doc.fontSize(14).text(`Grehasoft Work Tracking - ${reportType.toUpperCase()} Report`, { align: 'center' });
+          doc.moveDown();
+
+          if (data.length === 0) {
+            doc.fontSize(10).text('No tracking data recorded for this period.');
+          } else {
+            const headers = reportType === 'weekly'
+              ? ['Date', 'Productive Hours', 'Idle Hours', 'Total Tracked']
+              : ['Employee Name', 'Code', 'Department', 'Date', 'Productive Time', 'Idle Time', 'Activity %', 'Status'];
+            const keys = reportType === 'weekly'
+              ? ['Date', 'Productive Hours', 'Idle Hours', 'Total Tracked']
+              : ['employee_name', 'employee_code', 'department', 'date', 'productive_time', 'idle_time', 'activity_percentage', 'status'];
+
+            doc.fontSize(9).text(headers.join('  |  '));
+            doc.moveDown(0.5);
+            doc.fontSize(8);
+
+            for (const row of data.slice(0, 50)) {
+              const line = keys.map((k) => row[k] !== undefined ? row[k] : '-').join('  |  ');
+              doc.text(line);
+            }
+          }
+
+          doc.end();
+        } catch (err) {
+          console.error('PDFKit error:', err);
+          res.set({
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="${filename}.pdf"`,
+          });
+          res.send(Buffer.from(`%PDF-1.4 Report Output for ${filename}`));
+          resolve();
+        }
+      });
+    }
+
+    throw new BadRequestException('Invalid format requested.');
   }
 
   // -------------------------------------------------------------

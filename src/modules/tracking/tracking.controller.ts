@@ -90,13 +90,8 @@ export class TrackingController {
   }
 
   @Get('reports/export')
-  async exportReport(@Query() query: any, @Response({ passthrough: true }) res: any) {
-    const csvContent = 'User,Date,Total Work Time,Productive Time,Status\nJohn Admin,2026-03-01,08:00:00,07:30:00,Completed\n';
-    res.set({
-      'Content-Type': 'text/csv',
-      'Content-Disposition': 'attachment; filename="work_report.csv"',
-    });
-    return csvContent;
+  async exportReport(@Query() query: any, @Response() res: any) {
+    return this.trackingService.exportReport(res, query);
   }
 }
 
