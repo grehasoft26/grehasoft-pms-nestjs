@@ -11,6 +11,23 @@ from reportlab.lib import colors
 from reportlab.platypus import Paragraph, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+def setup_poppins_fonts():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fonts_dir = os.path.join(script_dir, "fonts")
+    
+    reg_path = os.path.join(fonts_dir, "Poppins-Regular.ttf")
+    med_path = os.path.join(fonts_dir, "Poppins-Medium.ttf")
+    bold_path = os.path.join(fonts_dir, "Poppins-Bold.ttf")
+
+    if os.path.exists(reg_path):
+        pdfmetrics.registerFont(TTFont("Poppins", reg_path))
+    if os.path.exists(med_path):
+        pdfmetrics.registerFont(TTFont("Poppins-Medium", med_path))
+    if os.path.exists(bold_path):
+        pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
 
 def find_asset(media_root, filename):
     paths = [
@@ -96,6 +113,7 @@ class MockInvoice:
         self.payments = MockPaymentsQuerySet(payments_data)
 
 def generate_invoice_pdf(invoice, media_root=""):
+    setup_poppins_fonts()
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
 
     # 1️⃣ Create canvas FIRST
@@ -118,7 +136,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     # WATERMARK
     # -----------------------------
     p.saveState()
-    p.setFont("Helvetica-Bold", 80)
+    p.setFont("Poppins-Bold", 80)
     p.setFillGray(0.95, 0.15)
     p.drawCentredString(width/2, height/2, "GREHASOFT")
     p.restoreState()
@@ -126,7 +144,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     # -----------------------------
     # COMPANY INFO / TITLE
     # -----------------------------
-    p.setFont("Helvetica-Bold", 16)
+    p.setFont("Poppins-Bold", 16)
     p.drawCentredString(width/2, y, "INVOICE BILL")
     y -= 25
 
@@ -150,7 +168,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     # -----------------------------
     # INVOICE INFO HEADER
     # -----------------------------
-    p.setFont("Helvetica", 10)
+    p.setFont("Poppins", 10)
     p.drawString(50, y, f"Invoice No : {invoice.invoice_number}")
     p.drawString(190, y, f"Date : {invoice.issue_date}")
     if invoice.due_date:
@@ -164,7 +182,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     p.setFillColor(badge_color)
     p.roundRect(badge_x, badge_y, badge_width, 16, 3, fill=1, stroke=0)
     p.setFillColor(colors.white)
-    p.setFont("Helvetica-Bold", 8)
+    p.setFont("Poppins-Bold", 8)
     p.drawCentredString(badge_x + badge_width/2, badge_y + 4, status_display)
     p.restoreState()
 
@@ -183,7 +201,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     content_style = ParagraphStyle(
         'PanelContent',
         parent=styles['Normal'],
-        fontName='Helvetica',
+        fontName='Poppins',
         fontSize=9,
         leading=13
     )
@@ -296,7 +314,7 @@ def generate_invoice_pdf(invoice, media_root=""):
         ("GRID", (0, 0), (-1, items_count), 1, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (-1, 0), "Poppins-Bold"),
         ("ALIGN", (2, 1), (4, items_count), "RIGHT"),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -304,12 +322,12 @@ def generate_invoice_pdf(invoice, media_root=""):
 
     # Style summary rows
     table_styles.extend([
-        ("FONTNAME", (3, subtotal_row_idx), (4, subtotal_row_idx), "Helvetica"),
-        ("FONTNAME", (3, gst_row_idx), (4, gst_row_idx), "Helvetica"),
-        ("FONTNAME", (3, grand_total_row_idx), (4, grand_total_row_idx), "Helvetica-Bold"),
+        ("FONTNAME", (3, subtotal_row_idx), (4, subtotal_row_idx), "Poppins"),
+        ("FONTNAME", (3, gst_row_idx), (4, gst_row_idx), "Poppins"),
+        ("FONTNAME", (3, grand_total_row_idx), (4, grand_total_row_idx), "Poppins-Bold"),
         ("LINEABOVE", (3, grand_total_row_idx), (4, grand_total_row_idx), 1, colors.grey),
-        ("FONTNAME", (3, amount_paid_row_idx), (4, amount_paid_row_idx), "Helvetica"),
-        ("FONTNAME", (3, balance_due_row_idx), (4, balance_due_row_idx), "Helvetica-Bold"),
+        ("FONTNAME", (3, amount_paid_row_idx), (4, amount_paid_row_idx), "Poppins"),
+        ("FONTNAME", (3, balance_due_row_idx), (4, balance_due_row_idx), "Poppins-Bold"),
         ("LINEABOVE", (3, balance_due_row_idx), (4, balance_due_row_idx), 1, colors.grey),
         ("LINEBELOW", (3, balance_due_row_idx), (4, balance_due_row_idx), 1.5, colors.grey),
     ])
@@ -333,7 +351,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     if y - h < 120:
         p.showPage()
         p.saveState()
-        p.setFont("Helvetica-Bold", 80)
+        p.setFont("Poppins-Bold", 80)
         p.setFillGray(0.95, 0.15)
         p.drawCentredString(width/2, height/2, "GREHASOFT")
         p.restoreState()
@@ -364,7 +382,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     else:
         final_words = f"Rupees {amount_words} only"
 
-    p.setFont("Helvetica", 10)
+    p.setFont("Poppins", 10)
     p.drawString(50, y, f"Amount in Words: {final_words.capitalize()}")
     y -= 30
 
@@ -374,19 +392,19 @@ def generate_invoice_pdf(invoice, media_root=""):
     if y < 150:
         p.showPage()
         p.saveState()
-        p.setFont("Helvetica-Bold", 80)
+        p.setFont("Poppins-Bold", 80)
         p.setFillGray(0.95, 0.15)
         p.drawCentredString(width/2, height/2, "GREHASOFT")
         p.restoreState()
         y = height - 80
 
-    p.setFont("Helvetica-Bold", 12)
+    p.setFont("Poppins-Bold", 12)
     p.drawString(50, y, "Payment History")
     y -= 15
 
     payments = invoice.payments.all()
     if not payments.exists():
-        p.setFont("Helvetica-Oblique", 10)
+        p.setFont("Poppins", 10)
         p.drawString(50, y, "No payments received yet.")
         y -= 25
     else:
@@ -410,7 +428,7 @@ def generate_invoice_pdf(invoice, media_root=""):
         pay_table.setStyle(TableStyle([
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f1f1")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), "Poppins-Bold"),
             ("ALIGN", (1, 1), (1, -1), "RIGHT"),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
@@ -420,7 +438,7 @@ def generate_invoice_pdf(invoice, media_root=""):
         if y - ph < 120:
             p.showPage()
             p.saveState()
-            p.setFont("Helvetica-Bold", 80)
+            p.setFont("Poppins-Bold", 80)
             p.setFillGray(0.95, 0.15)
             p.drawCentredString(width/2, height/2, "GREHASOFT")
             p.restoreState()
@@ -489,7 +507,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     if y - fh < 60:
         p.showPage()
         p.saveState()
-        p.setFont("Helvetica-Bold", 80)
+        p.setFont("Poppins-Bold", 80)
         p.setFillGray(0.95, 0.15)
         p.drawCentredString(width/2, height/2, "GREHASOFT")
         p.restoreState()

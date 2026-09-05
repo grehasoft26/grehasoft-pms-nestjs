@@ -13,14 +13,31 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+def setup_poppins_fonts():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fonts_dir = os.path.join(script_dir, "fonts")
+    
+    reg_path = os.path.join(fonts_dir, "Poppins-Regular.ttf")
+    med_path = os.path.join(fonts_dir, "Poppins-Medium.ttf")
+    bold_path = os.path.join(fonts_dir, "Poppins-Bold.ttf")
+
+    if os.path.exists(reg_path):
+        pdfmetrics.registerFont(TTFont("Poppins", reg_path))
+    if os.path.exists(med_path):
+        pdfmetrics.registerFont(TTFont("Poppins-Medium", med_path))
+    if os.path.exists(bold_path):
+        pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
 
 TEMPLATES = {
     'corporate': {
         'primary': '#0753F6',
         'secondary': '#6B7280',
         'accent': '#1AB728',
-        'font_title': 'Helvetica-Bold',
-        'font_body': 'Helvetica',
+        'font_title': 'Poppins-Bold',
+        'font_body': 'Poppins',
         'spacing': 15,
         'bg_card': '#f8fafc',
     },
@@ -28,8 +45,8 @@ TEMPLATES = {
         'primary': '#0f172a',
         'secondary': '#3b82f6',
         'accent': '#10b981',
-        'font_title': 'Helvetica-Bold',
-        'font_body': 'Helvetica',
+        'font_title': 'Poppins-Bold',
+        'font_body': 'Poppins',
         'spacing': 18,
         'bg_card': '#f1f5f9',
     },
@@ -37,8 +54,8 @@ TEMPLATES = {
         'primary': '#1e3a8a',
         'secondary': '#3b82f6',
         'accent': '#047857',
-        'font_title': 'Helvetica-Bold',
-        'font_body': 'Helvetica',
+        'font_title': 'Poppins-Bold',
+        'font_body': 'Poppins',
         'spacing': 20,
         'bg_card': '#eff6ff',
     },
@@ -46,8 +63,8 @@ TEMPLATES = {
         'primary': '#000000',
         'secondary': '#4b5563',
         'accent': '#1f2937',
-        'font_title': 'Helvetica-Bold',
-        'font_body': 'Helvetica',
+        'font_title': 'Poppins-Bold',
+        'font_body': 'Poppins',
         'spacing': 12,
         'bg_card': '#ffffff',
     },
@@ -55,8 +72,8 @@ TEMPLATES = {
         'primary': '#701a75',
         'secondary': '#a21caf',
         'accent': '#b5179e',
-        'font_title': 'Helvetica-Bold',
-        'font_body': 'Helvetica',
+        'font_title': 'Poppins-Bold',
+        'font_body': 'Poppins',
         'spacing': 16,
         'bg_card': '#fae8ff',
     }
@@ -1043,6 +1060,7 @@ class ProposalPDFGenerator:
         return story
 
     def generate_pdf(self):
+        setup_poppins_fonts()
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         tmp_file.close()
         

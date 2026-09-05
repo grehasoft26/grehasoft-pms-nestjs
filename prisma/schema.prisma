@@ -893,13 +893,14 @@ model InvoiceItem {
 }
 
 model InvoicePayment {
-  id           Int         @id @default(autoincrement())
-  invoice_id   Int
-  amount       Decimal     @db.Decimal(10, 2)
-  payment_date DateTime    @db.Date
-  payment_mode PaymentMode
-  notes        String?     @db.Text
-  created_at   DateTime    @default(now()) @db.DateTime(3)
+  id             Int         @id @default(autoincrement())
+  invoice_id     Int
+  receipt_number String?     @unique @db.VarChar(50)
+  amount         Decimal     @db.Decimal(10, 2)
+  payment_date   DateTime    @db.Date
+  payment_mode   PaymentMode
+  notes          String?     @db.Text
+  created_at     DateTime    @default(now()) @db.DateTime(3)
 
   invoice Invoice @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
 

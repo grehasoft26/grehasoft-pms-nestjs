@@ -10,6 +10,23 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+def setup_poppins_fonts():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fonts_dir = os.path.join(script_dir, "fonts")
+    
+    reg_path = os.path.join(fonts_dir, "Poppins-Regular.ttf")
+    med_path = os.path.join(fonts_dir, "Poppins-Medium.ttf")
+    bold_path = os.path.join(fonts_dir, "Poppins-Bold.ttf")
+
+    if os.path.exists(reg_path):
+        pdfmetrics.registerFont(TTFont("Poppins", reg_path))
+    if os.path.exists(med_path):
+        pdfmetrics.registerFont(TTFont("Poppins-Medium", med_path))
+    if os.path.exists(bold_path):
+        pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
 
 # ---------------- MONEY FORMAT ----------------
 def _money(value: Any) -> str:
@@ -20,6 +37,7 @@ def _money(value: Any) -> str:
 
 # ---------------- HEADER + WATERMARK + FOOTER ----------------
 def draw_hr_document_template(p, width, height, media_root):
+    setup_poppins_fonts()
     # Header
     header_path = os.path.join(media_root, 'logo', 'invoice_header.png')
     if os.path.exists(header_path):
@@ -40,7 +58,7 @@ def draw_hr_document_template(p, width, height, media_root):
 
     # Footer text
     p.setFillColor(HexColor("#05044A"))
-    p.setFont("Helvetica", 9)
+    p.setFont("Poppins", 9)
     p.drawCentredString(width/2, 40, "Grehasoft | Infopark, Kochi | www.grehasoft.com")
 
 # ---------------- SIGNATURE + SEAL ----------------
@@ -49,10 +67,10 @@ def draw_signature_block(p, context, width, media_root):
     SIGN_Y = 200
 
     p.setFillColor(HexColor("#000000"))
-    p.setFont("Helvetica-Bold", 11)
+    p.setFont("Poppins-Bold", 11)
     p.drawString(SIGN_X, SIGN_Y, str(context.get("hr_name", "Authorized Signatory")))
 
-    p.setFont("Helvetica", 11)
+    p.setFont("Poppins", 11)
     p.drawString(SIGN_X, SIGN_Y - 15, "HR Manager")
     p.drawString(SIGN_X, SIGN_Y - 30, "GREHASOFT, Infopark, Kochi")
 
@@ -133,12 +151,13 @@ def build_internship_certificate_pdf(context, media_root):
     y = height - 200
 
     p.setFillColor(HexColor("#000000"))
-    p.setFont("Helvetica-Bold", 18)
+    p.setFont("Poppins-Bold", 18)
     p.drawCentredString(width / 2, y, "INTERNSHIP CERTIFICATE")
     y -= 50
 
     styles = getSampleStyleSheet()
     style = styles["Normal"]
+    style.fontName = "Poppins"
     style.fontSize = 12
     style.leading = 18
 
@@ -179,12 +198,13 @@ def build_experience_certificate_pdf(context, media_root):
     y = height - 200
 
     p.setFillColor(HexColor("#000000"))
-    p.setFont("Helvetica-Bold", 18)
+    p.setFont("Poppins-Bold", 18)
     p.drawCentredString(width / 2, y, "EXPERIENCE CERTIFICATE")
     y -= 50
 
     styles = getSampleStyleSheet()
     style = styles["Normal"]
+    style.fontName = "Poppins"
     style.fontSize = 12
     style.leading = 18
 
@@ -227,31 +247,31 @@ def build_offer_letter_pdf(context, media_root):
 
     styles = getSampleStyleSheet()
     style = styles["Normal"]
-    style.fontName = "Helvetica"
+    style.fontName = "Poppins"
     style.fontSize = 12
     style.leading = 18
 
     p.setFillColor(HexColor("#000000"))
     # Title
-    p.setFont("Helvetica-Bold", 16)
+    p.setFont("Poppins-Bold", 16)
     p.drawString(LEFT, y, "Job Offer Letter")
     y -= 30
 
     # Date
-    p.setFont("Helvetica", 11)
+    p.setFont("Poppins", 11)
     p.drawString(LEFT, y, f"Date: {context.get('date', '')}")
     y -= 25
 
     # To Address
-    p.setFont("Helvetica-Bold", 11)
+    p.setFont("Poppins-Bold", 11)
     p.drawString(LEFT, y, f"To, {context.get('employee_name', '')}")
     y -= 15
-    p.setFont("Helvetica", 11)
+    p.setFont("Poppins", 11)
     p.drawString(LEFT, y, f"Address: {context.get('address', '')}")
     y -= 25
 
     # Subject
-    p.setFont("Helvetica-Bold", 11)
+    p.setFont("Poppins-Bold", 11)
     p.drawString(LEFT, y, "Subject: Offer of Employment")
     y -= 25
 
@@ -291,12 +311,13 @@ def build_salary_certificate_pdf(context, media_root):
     y = height - 200
 
     p.setFillColor(HexColor("#000000"))
-    p.setFont("Helvetica-Bold", 16)
+    p.setFont("Poppins-Bold", 16)
     p.drawString(LEFT, y, "Salary Certificate")
     y -= 40
 
     styles = getSampleStyleSheet()
     style = styles["Normal"]
+    style.fontName = "Poppins"
     style.fontSize = 12
     style.leading = 18
 
@@ -331,12 +352,13 @@ def build_appraisal_letter_pdf(context, media_root):
     y = height - 200
 
     p.setFillColor(HexColor("#000000"))
-    p.setFont("Helvetica-Bold", 16)
+    p.setFont("Poppins-Bold", 16)
     p.drawString(LEFT, y, "Annual Appraisal Letter")
     y -= 40
 
     styles = getSampleStyleSheet()
     style = styles["Normal"]
+    style.fontName = "Poppins"
     style.fontSize = 12
     style.leading = 18
 

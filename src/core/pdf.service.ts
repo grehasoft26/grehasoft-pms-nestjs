@@ -82,6 +82,80 @@ export class PdfService {
   }
 
   /**
+   * Render Receipt PDF using Python ReportLab generator with Poppins typography
+   */
+  async generateReceiptPdf(receiptData: any): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const tempDir = os.tmpdir();
+      const inputPath = path.join(tempDir, `rct_in_${Date.now()}_${Math.random().toString(36).substring(7)}.json`);
+      const outputPath = path.join(tempDir, `rct_out_${Date.now()}_${Math.random().toString(36).substring(7)}.pdf`);
+
+      const possibleMediaRoots = [
+        path.join(process.cwd(), 'media'),
+        path.join(__dirname, '..', '..', '..', 'media'),
+        path.join(__dirname, '..', '..', 'media'),
+      ];
+      let mediaRoot = possibleMediaRoots[0];
+      for (const m of possibleMediaRoots) {
+        if (fs.existsSync(m)) {
+          mediaRoot = m;
+          break;
+        }
+      }
+
+      const payload = {
+        receipt: receiptData,
+        media_root: mediaRoot,
+      };
+
+      fs.writeFileSync(inputPath, JSON.stringify(payload), 'utf-8');
+
+      const possibleScriptPaths = [
+        path.join(process.cwd(), 'scripts', 'generate_receipt_pdf.py'),
+        path.join(__dirname, '..', '..', '..', 'scripts', 'generate_receipt_pdf.py'),
+        path.join(__dirname, '..', '..', 'scripts', 'generate_receipt_pdf.py'),
+      ];
+      let scriptPath = possibleScriptPaths[0];
+      for (const p of possibleScriptPaths) {
+        if (fs.existsSync(p)) {
+          scriptPath = p;
+          break;
+        }
+      }
+
+      execFile('python', [scriptPath, inputPath, outputPath], (error, stdout, stderr) => {
+        try {
+          if (fs.existsSync(inputPath)) {
+            fs.unlinkSync(inputPath);
+          }
+        } catch {}
+
+        if (error) {
+          try {
+            if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+          } catch {}
+          console.error('ReportLab Receipt PDF Generator Error:', error, stderr);
+          return reject(error);
+        }
+
+        try {
+          if (fs.existsSync(outputPath)) {
+            const pdfBuffer = fs.readFileSync(outputPath);
+            try {
+              fs.unlinkSync(outputPath);
+            } catch {}
+            return resolve(pdfBuffer);
+          } else {
+            return reject(new Error('PDF output file was not created by ReportLab receipt generator.'));
+          }
+        } catch (readErr) {
+          return reject(readErr);
+        }
+      });
+    });
+  }
+
+  /**
    * Render Proposal PDF using Python ReportLab generator for 1:1 exact parity
    */
   async generateProposalPdf(proposalData: any, customConfig?: any): Promise<Buffer> {

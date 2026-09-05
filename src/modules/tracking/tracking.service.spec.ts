@@ -565,6 +565,7 @@ describe('TrackingService — Daily Productive Time Parity Tests', () => {
       await service.exportReport(mockExcelRes, { type: 'daily', format: 'excel', date: todayStr });
       expect(excelHeader['Content-Type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       expect(excelData).toBeDefined();
+      expect(excelData!.toString('utf-8', 0, 4)).toContain('PK');
 
       let pdfHeader: any = {};
       let pdfData: Buffer | null = null;
@@ -575,7 +576,8 @@ describe('TrackingService — Daily Productive Time Parity Tests', () => {
       await service.exportReport(mockPdfRes, { type: 'daily', format: 'pdf', date: todayStr });
       expect(pdfHeader['Content-Type']).toBe('application/pdf');
       expect(pdfData).toBeDefined();
-    });
+      expect(pdfData!.toString('utf-8', 0, 10)).toContain('%PDF-');
+    }, 15000);
 
     it('M: Empty date range returns empty report rows gracefully', async () => {
       const report = await service.getDailyReport({ start_date: '2020-01-01', end_date: '2020-01-01' });

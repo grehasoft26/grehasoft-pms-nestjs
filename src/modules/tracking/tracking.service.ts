@@ -1,4 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../../core/prisma.service';
 
 @Injectable()
@@ -1504,43 +1506,81 @@ export class TrackingService {
       });
       return res.send(csvStr);
     } else if (exportFormat === 'excel') {
-      const headers = [
-        'Employee Name', 'Employee Code', 'Department', 'Date',
-        'Productive Time', 'Idle Time', 'Desktop Work Time', 'Portal Active Time',
-        'Break Time', 'Unaccounted Time', 'Total Engagement Time', 'Workday Span',
-        'Activity Percentage', 'Status'
-      ];
-      const keys = [
-        'employee_name', 'employee_code', 'department', 'date',
-        'productive_time', 'idle_time', 'desktop_work_time', 'portal_active_time',
-        'break_time', 'unaccounted_time', 'total_engagement_time', 'workday_span',
-        'activity_percentage', 'status'
-      ];
+      const ExcelJS = require('exceljs');
+      const wb = new ExcelJS.Workbook();
+      const sheetName = reportType.charAt(0).toUpperCase() + reportType.slice(1);
+      const ws = wb.addWorksheet(sheetName);
 
-      let xlsStr = headers.join('\t') + '\n';
-      if (data.length > 0 && (reportType === 'daily' || reportType === 'employee')) {
-        for (const row of data) {
-          xlsStr += keys.map((k) => row[k] !== undefined ? row[k] : '-').join('\t') + '\n';
-        }
+      let headers: string[] = [];
+      let keys: string[] = [];
+
+      if (reportType === 'daily' || reportType === 'reconciliation' || reportType === 'employee') {
+        headers = [
+          'Employee Name', 'Employee Code', 'Department', 'Date',
+          'Productive Time', 'Idle Time', 'Desktop Work Time', 'Portal Active Time',
+          'Break Time', 'Unaccounted Time', 'Total Engagement Time', 'Workday Span',
+          'Activity Percentage', 'Status'
+        ];
+        keys = [
+          'employee_name', 'employee_code', 'department', 'date',
+          'productive_time', 'idle_time', 'desktop_work_time', 'portal_active_time',
+          'break_time', 'unaccounted_time', 'total_engagement_time', 'workday_span',
+          'activity_percentage', 'status'
+        ];
       } else if (data.length > 0) {
-        const rowKeys = Object.keys(data[0]);
-        xlsStr = rowKeys.join('\t') + '\n';
-        for (const row of data) {
-          xlsStr += rowKeys.map((k) => row[k] !== undefined ? row[k] : '-').join('\t') + '\n';
-        }
+        keys = Object.keys(data[0]).filter((k) => !k.startsWith('raw_'));
+        headers = keys.map((k) => k.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase()));
       }
 
+      if (headers.length > 0) {
+        const headerRow = ws.addRow(headers);
+        headerRow.height = 24;
+        headerRow.eachCell((cell: any) => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4F46E5' } };
+          cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        });
+
+        for (const item of data) {
+          const rowData = keys.map((k) => (item[k] !== undefined && item[k] !== null ? item[k] : '-'));
+          const dataRow = ws.addRow(rowData);
+          dataRow.height = 20;
+        }
+
+        ws.columns.forEach((column: any) => {
+          let maxLen = 12;
+          column.eachCell({ includeEmpty: true }, (cell: any) => {
+            const valStr = cell.value !== undefined && cell.value !== null ? String(cell.value) : '';
+            if (valStr.length > maxLen) {
+              maxLen = valStr.length;
+            }
+          });
+          column.width = Math.max(maxLen + 3, 12);
+        });
+      }
+
+      const excelBuffer = await wb.xlsx.writeBuffer();
       res.set({
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         'Content-Disposition': `attachment; filename="${filename}.xlsx"`,
       });
-      return res.send(Buffer.from(xlsStr, 'utf-8'));
+      return res.send(Buffer.from(excelBuffer));
     } else if (exportFormat === 'pdf') {
       return new Promise<void>((resolve, reject) => {
         try {
-          const PDFDocument = require('pdfkit');
+          const PDFDocumentRaw = require('pdfkit');
+          const PDFDocument = PDFDocumentRaw.default || PDFDocumentRaw;
           const doc = new PDFDocument({ margin: 30, size: 'A4', layout: 'landscape' });
           const chunks: Buffer[] = [];
+
+          const fontsDir = path.join(process.cwd(), 'scripts', 'fonts');
+          const regFontPath = path.join(fontsDir, 'Poppins-Regular.ttf');
+          const medFontPath = path.join(fontsDir, 'Poppins-Medium.ttf');
+          const boldFontPath = path.join(fontsDir, 'Poppins-Bold.ttf');
+
+          if (fs.existsSync(regFontPath)) doc.registerFont('Poppins', regFontPath);
+          if (fs.existsSync(medFontPath)) doc.registerFont('Poppins-Medium', medFontPath);
+          if (fs.existsSync(boldFontPath)) doc.registerFont('Poppins-Bold', boldFontPath);
 
           doc.on('data', (chunk: Buffer) => chunks.push(chunk));
           doc.on('end', () => {
@@ -1554,29 +1594,10 @@ export class TrackingService {
           });
           doc.on('error', (err: any) => reject(err));
 
-          doc.fontSize(14).text(`Grehasoft Work Tracking - ${reportType.toUpperCase()} Report`, { align: 'center' });
-          doc.moveDown();
+          const startDateStr = String(query?.start_date || query?.date || new Date().toISOString().split('T')[0]);
+          const endDateStr = String(query?.end_date || query?.date || startDateStr);
 
-          if (data.length === 0) {
-            doc.fontSize(10).text('No tracking data recorded for this period.');
-          } else {
-            const headers = reportType === 'weekly'
-              ? ['Date', 'Productive Hours', 'Idle Hours', 'Total Tracked']
-              : ['Employee Name', 'Code', 'Department', 'Date', 'Productive Time', 'Idle Time', 'Activity %', 'Status'];
-            const keys = reportType === 'weekly'
-              ? ['Date', 'Productive Hours', 'Idle Hours', 'Total Tracked']
-              : ['employee_name', 'employee_code', 'department', 'date', 'productive_time', 'idle_time', 'activity_percentage', 'status'];
-
-            doc.fontSize(9).text(headers.join('  |  '));
-            doc.moveDown(0.5);
-            doc.fontSize(8);
-
-            for (const row of data.slice(0, 50)) {
-              const line = keys.map((k) => row[k] !== undefined ? row[k] : '-').join('  |  ');
-              doc.text(line);
-            }
-          }
-
+          this.generateReportPdf(doc, reportType, startDateStr, endDateStr, data);
           doc.end();
         } catch (err) {
           console.error('PDFKit error:', err);
@@ -1591,6 +1612,172 @@ export class TrackingService {
     }
 
     throw new BadRequestException('Invalid format requested.');
+  }
+
+  private generateReportPdf(doc: any, reportType: string, startDateStr: string, endDateStr: string, data: any[]): void {
+    const marginX = 30;
+    const marginY = 30;
+    const printableWidth = 841.89 - marginX * 2; // 781.89
+    const maxY = 595.28 - marginY; // 565.28
+
+    const titleReportName = reportType.charAt(0).toUpperCase() + reportType.slice(1);
+    doc.fillColor('#1E293B')
+       .font('Poppins-Bold')
+       .fontSize(15)
+       .text(`Grehasoft Work Tracking - ${titleReportName} Report (${startDateStr} to ${endDateStr})`, marginX, marginY);
+
+    let currentY = marginY + 28;
+
+    if (!data || data.length === 0) {
+      doc.fillColor('#334155')
+         .font('Poppins')
+         .fontSize(10)
+         .text('No tracking data recorded for this period.', marginX, currentY);
+      return;
+    }
+
+    interface ColumnDef {
+      key: string;
+      label: string;
+      width: number;
+      align: 'left' | 'center' | 'right';
+    }
+
+    let columns: ColumnDef[] = [];
+    const isLargeReport = reportType === 'daily' || reportType === 'reconciliation' || reportType === 'employee';
+
+    if (isLargeReport) {
+      columns = [
+        { key: 'employee_name', label: 'Employee\nName', width: 95, align: 'left' },
+        { key: 'employee_code', label: 'Employee\nCode', width: 50, align: 'left' },
+        { key: 'department', label: 'Department', width: 80, align: 'left' },
+        { key: 'date', label: 'Date', width: 55, align: 'center' },
+        { key: 'productive_time', label: 'Productive\nTime', width: 50, align: 'center' },
+        { key: 'idle_time', label: 'Idle\nTime', width: 47, align: 'center' },
+        { key: 'desktop_work_time', label: 'Desktop\nWork', width: 47, align: 'center' },
+        { key: 'portal_active_time', label: 'Portal\nActive', width: 47, align: 'center' },
+        { key: 'break_time', label: 'Break\nTime', width: 47, align: 'center' },
+        { key: 'unaccounted_time', label: 'Unaccounted\nTime', width: 56, align: 'center' },
+        { key: 'total_engagement_time', label: 'Total\nEngagement', width: 55, align: 'center' },
+        { key: 'workday_span', label: 'Workday\nSpan', width: 50, align: 'center' },
+        { key: 'activity_percentage', label: 'Activity\n%', width: 44, align: 'center' },
+        { key: 'status', label: 'Status', width: 58, align: 'center' },
+      ];
+    } else if (reportType === 'weekly') {
+      columns = [
+        { key: 'Date', label: 'Date', width: 180, align: 'left' },
+        { key: 'Productive Hours', label: 'Productive Hours', width: 200, align: 'center' },
+        { key: 'Idle Hours', label: 'Idle Hours', width: 200, align: 'center' },
+        { key: 'Total Tracked', label: 'Total Tracked', width: 201, align: 'center' },
+      ];
+    } else if (reportType === 'monthly') {
+      columns = [
+        { key: 'full_name', label: 'Full Name', width: 160, align: 'left' },
+        { key: 'employee_code', label: 'Employee Code', width: 100, align: 'left' },
+        { key: 'department', label: 'Department', width: 140, align: 'left' },
+        { key: 'productive_hours', label: 'Productive Hours', width: 120, align: 'center' },
+        { key: 'tracked_hours', label: 'Tracked Hours', width: 120, align: 'center' },
+        { key: 'activity_percentage', label: 'Activity %', width: 141, align: 'center' },
+      ];
+    }
+
+    const headerFontSize = isLargeReport ? 7 : 10;
+    const cellFontSize = isLargeReport ? 6.5 : 8.5;
+    const headerHeight = isLargeReport ? 24 : 22;
+    const rowHeight = isLargeReport ? 18 : 20;
+
+    const drawHeader = (y: number) => {
+      doc.rect(marginX, y, printableWidth, headerHeight)
+         .fill('#4F46E5');
+
+      let curX = marginX;
+      for (const col of columns) {
+        doc.rect(curX, y, col.width, headerHeight)
+           .lineWidth(0.5)
+           .stroke('#E2E8F0');
+
+        doc.fillColor('#FFFFFF')
+           .font('Poppins-Bold')
+           .fontSize(headerFontSize);
+
+        const lines = col.label.split('\n');
+        if (lines.length === 1) {
+          doc.text(col.label, curX + 2, y + (headerHeight - headerFontSize) / 2 - 1, {
+            width: col.width - 4,
+            align: 'center',
+            lineBreak: false,
+          });
+        } else {
+          const totalTextHeight = lines.length * (headerFontSize + 1);
+          let startTextY = y + (headerHeight - totalTextHeight) / 2;
+          for (const line of lines) {
+            doc.text(line, curX + 2, startTextY, {
+              width: col.width - 4,
+              align: 'center',
+              lineBreak: false,
+            });
+            startTextY += headerFontSize + 1;
+          }
+        }
+        curX += col.width;
+      }
+    };
+
+    drawHeader(currentY);
+    currentY += headerHeight;
+
+    for (let rowIndex = 0; rowIndex < data.length; rowIndex++) {
+      if (currentY + rowHeight > maxY) {
+        doc.addPage();
+        currentY = marginY;
+        drawHeader(currentY);
+        currentY += headerHeight;
+      }
+
+      const row = data[rowIndex];
+      const bgColor = rowIndex % 2 === 0 ? '#FFFFFF' : '#F1F5F9';
+
+      doc.rect(marginX, currentY, printableWidth, rowHeight)
+         .fill(bgColor);
+
+      let curX = marginX;
+      for (const col of columns) {
+        doc.rect(curX, currentY, col.width, rowHeight)
+           .lineWidth(0.5)
+           .stroke('#E2E8F0');
+
+        let val = row[col.key];
+        if (val === undefined || val === null || val === '') {
+          val = '-';
+        } else {
+          val = String(val);
+        }
+
+        if (col.key === 'status') {
+          if (val === 'Active') doc.fillColor('#16A34A');
+          else if (val === 'Idle') doc.fillColor('#D97706');
+          else doc.fillColor('#64748B');
+        } else {
+          doc.fillColor('#1E293B');
+        }
+
+        doc.font('Poppins')
+           .fontSize(cellFontSize);
+
+        const textY = currentY + (rowHeight - cellFontSize) / 2 - 1;
+        const paddingLeftRight = 3;
+
+        doc.text(val, curX + paddingLeftRight, textY, {
+          width: col.width - paddingLeftRight * 2,
+          align: col.align,
+          lineBreak: false,
+        });
+
+        curX += col.width;
+      }
+
+      currentY += rowHeight;
+    }
   }
 
   // -------------------------------------------------------------
