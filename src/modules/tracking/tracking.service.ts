@@ -1573,14 +1573,37 @@ export class TrackingService {
           const doc = new PDFDocument({ margin: 30, size: 'A4', layout: 'landscape' });
           const chunks: Buffer[] = [];
 
-          const fontsDir = path.join(process.cwd(), 'scripts', 'fonts');
+          const possibleFontsDirs = [
+            path.join(process.cwd(), 'scripts', 'fonts'),
+            path.join(__dirname, '..', '..', '..', 'scripts', 'fonts'),
+            path.join(__dirname, '..', '..', 'scripts', 'fonts'),
+            path.join(__dirname, '..', 'scripts', 'fonts'),
+          ];
+          let fontsDir = possibleFontsDirs[0];
+          for (const d of possibleFontsDirs) {
+            if (fs.existsSync(d)) {
+              fontsDir = d;
+              break;
+            }
+          }
+
           const regFontPath = path.join(fontsDir, 'Poppins-Regular.ttf');
           const medFontPath = path.join(fontsDir, 'Poppins-Medium.ttf');
           const boldFontPath = path.join(fontsDir, 'Poppins-Bold.ttf');
 
-          if (fs.existsSync(regFontPath)) doc.registerFont('Poppins', regFontPath);
-          if (fs.existsSync(medFontPath)) doc.registerFont('Poppins-Medium', medFontPath);
-          if (fs.existsSync(boldFontPath)) doc.registerFont('Poppins-Bold', boldFontPath);
+          const hasReg = fs.existsSync(regFontPath);
+          const hasMed = fs.existsSync(medFontPath);
+          const hasBold = fs.existsSync(boldFontPath);
+
+          if (hasReg) doc.registerFont('Poppins', regFontPath);
+          if (hasMed) doc.registerFont('Poppins-Medium', medFontPath);
+          if (hasBold) doc.registerFont('Poppins-Bold', boldFontPath);
+
+          const fonts = {
+            regular: hasReg ? 'Poppins' : 'Helvetica',
+            medium: hasMed ? 'Poppins-Medium' : 'Helvetica-Bold',
+            bold: hasBold ? 'Poppins-Bold' : 'Helvetica-Bold',
+          };
 
           doc.on('data', (chunk: Buffer) => chunks.push(chunk));
           doc.on('end', () => {
@@ -1597,16 +1620,11 @@ export class TrackingService {
           const startDateStr = String(query?.start_date || query?.date || new Date().toISOString().split('T')[0]);
           const endDateStr = String(query?.end_date || query?.date || startDateStr);
 
-          this.generateReportPdf(doc, reportType, startDateStr, endDateStr, data);
+          this.generateReportPdf(doc, reportType, startDateStr, endDateStr, data, fonts);
           doc.end();
         } catch (err) {
-          console.error('PDFKit error:', err);
-          res.set({
-            'Content-Type': 'application/pdf',
-            'Content-Disposition': `attachment; filename="${filename}.pdf"`,
-          });
-          res.send(Buffer.from(`%PDF-1.4 Report Output for ${filename}`));
-          resolve();
+          console.error('PDFKit exportReport error:', err);
+          reject(err);
         }
       });
     }
@@ -1614,7 +1632,10 @@ export class TrackingService {
     throw new BadRequestException('Invalid format requested.');
   }
 
-  private generateReportPdf(doc: any, reportType: string, startDateStr: string, endDateStr: string, data: any[]): void {
+  private generateReportPdf(doc: any, reportType: string, startDateStr: string, endDateStr: string, data: any[], fonts?: { regular: string; medium: string; bold: string }): void {
+    const fontBold = fonts?.bold || 'Poppins-Bold';
+    const fontRegular = fonts?.regular || 'Poppins';
+
     const marginX = 30;
     const marginY = 30;
     const printableWidth = 841.89 - marginX * 2; // 781.89
@@ -1622,7 +1643,7 @@ export class TrackingService {
 
     const titleReportName = reportType.charAt(0).toUpperCase() + reportType.slice(1);
     doc.fillColor('#1E293B')
-       .font('Poppins-Bold')
+       .font(fontBold)
        .fontSize(15)
        .text(`Grehasoft Work Tracking - ${titleReportName} Report (${startDateStr} to ${endDateStr})`, marginX, marginY);
 
@@ -1630,7 +1651,7 @@ export class TrackingService {
 
     if (!data || data.length === 0) {
       doc.fillColor('#334155')
-         .font('Poppins')
+         .font(fontRegular)
          .fontSize(10)
          .text('No tracking data recorded for this period.', marginX, currentY);
       return;
@@ -1697,7 +1718,7 @@ export class TrackingService {
            .stroke('#E2E8F0');
 
         doc.fillColor('#FFFFFF')
-           .font('Poppins-Bold')
+           .font(fontBold)
            .fontSize(headerFontSize);
 
         const lines = col.label.split('\n');
@@ -1761,7 +1782,7 @@ export class TrackingService {
           doc.fillColor('#1E293B');
         }
 
-        doc.font('Poppins')
+        doc.font(fontRegular)
            .fontSize(cellFontSize);
 
         const textY = currentY + (rowHeight - cellFontSize) / 2 - 1;
