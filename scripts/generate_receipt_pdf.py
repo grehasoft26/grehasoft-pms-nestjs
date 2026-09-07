@@ -18,10 +18,13 @@ def find_asset(media_root, filename):
     paths = [
         os.path.join(media_root, filename),
         os.path.join(media_root, "logo", filename),
+        os.path.join(media_root, "icons", filename),
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", filename),
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", "logo", filename),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", "icons", filename),
         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", filename),
-        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", "logo", filename)
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", "logo", filename),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", "icons", filename)
     ]
     for p in paths:
         if os.path.exists(p):
@@ -192,8 +195,8 @@ def generate_receipt_pdf(receipt, media_root=""):
 
     to_html = "<br/>".join(to_lines) if to_lines else "Valued Client"
 
-    left_cell = Paragraph(f"<font color='#1f4e79'><b>RECEIVED FROM / FROM:</b></font><br/><br/>{from_html}", content_style)
-    right_cell = Paragraph(f"<font color='#1f4e79'><b>RECEIVED BY / TO:</b></font><br/><br/>{to_html}", content_style)
+    left_cell = Paragraph(f"<font color='#1f4e79'><b>FROM:</b></font><br/><br/>{from_html}", content_style)
+    right_cell = Paragraph(f"<font color='#1f4e79'><b>TO:</b></font><br/><br/>{to_html}", content_style)
 
     info_table = Table([[left_cell, right_cell]], colWidths=[265, 265])
     info_table.setStyle(TableStyle([
@@ -307,76 +310,38 @@ def generate_receipt_pdf(receipt, media_root=""):
 
     p.setFont("Poppins", 9.5)
     p.drawString(50, y, f"Amount Received in Words: {final_words.capitalize()}")
-    y -= 16
+    y -= 18
     p.drawString(50, y, f"Payment Mode: {receipt.payment_mode}" + (f" | Notes: {receipt.notes}" if receipt.notes else ""))
-    y -= 25
+    y -= 15
 
     # -----------------------------
-    # DYNAMIC FOOTER TABLE
+    # FOOTER: PLACE, DATE, SEAL & HR STYLE FOOTER BAR
     # -----------------------------
-    bank_html = (
-        "<b>Bank Details</b><br/>"
-        "Account Name : GREHASOFT<br/>"
-        "Bank Name : SBI<br/>"
-        "Account Number : 41597828369<br/>"
-        "IFSC Code : SBIN0018060"
-    )
+    place_date_y = 120
+    p.setFillColor(colors.HexColor("#000000"))
+    p.setFont("Poppins", 10)
+    p.drawString(50, place_date_y, "Place: Kochi")
+    p.drawString(50, place_date_y - 15, f"Date: {receipt.payment_date}")
 
-    terms_html = (
-        "<br/><b>Terms & Conditions:</b><br/>"
-        "1. This is an official computer generated payment receipt.<br/>"
-        "2. All payments are subject to realization.<br/>"
-        "3. All disputes are subject to Kochi jurisdiction."
-    )
+    # Seal beside Date/Place on the right
+    seal_path = find_asset(media_root, "seal.png")
+    if seal_path and os.path.exists(seal_path):
+        try:
+            seal = ImageReader(seal_path)
+            p.drawImage(seal, width - 50 - 130, 70, width=130, height=110, mask='auto')
+        except Exception as e:
+            print("Seal image error:", e, file=sys.stderr)
 
-    left_footer_flowable = Paragraph(f"{bank_html}<br/>{terms_html}", content_style)
+    # Green Footer Line (matching HR Documents PDF)
+    p.setStrokeColor(colors.HexColor("#1AB728"))
+    p.setLineWidth(2)
+    p.line(50, 60, width - 50, 60)
 
-    qr_flowable = None
-    qr_path = find_asset(media_root, "scanpay.jpeg")
-    try:
-        if qr_path and os.path.exists(qr_path):
-            qr_flowable = Image(qr_path, width=80, height=104)
-    except Exception as e:
-        print("QR image error:", e, file=sys.stderr)
+    # Footer Text (matching HR Documents PDF)
+    p.setFillColor(colors.HexColor("#05044A"))
+    p.setFont("Poppins", 9)
+    p.drawCentredString(width / 2, 40, "Grehasoft | Infopark, Kochi | www.grehasoft.com")
 
-    sig_html = (
-        "<br/><b>For GREHASOFT</b><br/><br/><br/>"
-        "_______________________<br/>"
-        "Authorized Signature"
-    )
-    sig_style = ParagraphStyle(
-        'SigStyle',
-        parent=content_style,
-        alignment=2
-    )
-    sig_flowable = Paragraph(sig_html, sig_style)
-
-    right_cell_content = []
-    if qr_flowable:
-        right_cell_content.append(qr_flowable)
-    right_cell_content.append(sig_flowable)
-
-    footer_table = Table([[left_footer_flowable, right_cell_content]], colWidths=[270, 260])
-    footer_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
-        ('TOPPADDING', (0, 0), (-1, -1), 0),
-        ('LEFTPADDING', (0, 0), (-1, -1), 0),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-    ]))
-
-    fw, fh = footer_table.wrap(width - 100, height)
-    if y - fh < 60:
-        p.showPage()
-        p.saveState()
-        p.setFont("Poppins-Bold", 80)
-        p.setFillGray(0.95, 0.15)
-        p.drawCentredString(width/2, height/2, "GREHASOFT")
-        p.restoreState()
-        y = height - 60
-
-    footer_table.drawOn(p, 50, y - fh)
     p.save()
 
     return tmp_file.name
