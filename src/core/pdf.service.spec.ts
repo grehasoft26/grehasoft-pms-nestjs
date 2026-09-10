@@ -39,6 +39,16 @@ describe('PdfService', () => {
     expect(resolved).toBe(validExec);
   });
 
+  it('should prioritize custom PYTHON_BIN path like /opt/alt/python311/bin/python3.11 when valid', () => {
+    const customBin = '/opt/alt/python311/bin/python3.11';
+    process.env.PYTHON_BIN = customBin;
+    jest
+      .spyOn(service as any, 'isPythonExecutableValid')
+      .mockImplementation((cmd) => cmd === customBin);
+    const resolved = service.getPythonExecutable(true);
+    expect(resolved).toBe(customBin);
+  });
+
   it('should throw clear actionable error if no python binary is valid', () => {
     jest.spyOn(service as any, 'isPythonExecutableValid').mockReturnValue(false);
     expect(() => service.getPythonExecutable(true)).toThrowError(
@@ -46,3 +56,4 @@ describe('PdfService', () => {
     );
   });
 });
+
