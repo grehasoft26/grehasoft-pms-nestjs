@@ -55,5 +55,38 @@ describe('PdfService', () => {
       /Python executable not found/i,
     );
   });
-});
 
+  it('should generate invoice PDF buffer with discount and advance received', async () => {
+    const mockInvoiceData = {
+      id: 17,
+      invoice_number: 'GSI/2026-27/001',
+      issue_date: '2026-09-10',
+      due_date: '2026-09-24',
+      status: 'partial',
+      subtotal: 2500,
+      tax: 0,
+      total: 2000,
+      advance: 600,
+      total_paid: 600,
+      balance: 1400,
+      client: {
+        name: 'Test Client',
+        company_name: 'Acme Corp',
+        email: 'test@example.com',
+        phone: '9876543210',
+        address: 'Kochi, Kerala',
+        gst_no: '32ABCDE1234F1Z5',
+      },
+      items: [
+        { description: 'Web Development Services', quantity: 1, rate: 2500, amount: 2500 },
+      ],
+      payments: [],
+    };
+
+    const pdfBuffer = await service.generateInvoicePdf(mockInvoiceData);
+    expect(Buffer.isBuffer(pdfBuffer)).toBe(true);
+    expect(pdfBuffer.length).toBeGreaterThan(100);
+    // PDF Magic bytes check
+    expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
+  });
+});

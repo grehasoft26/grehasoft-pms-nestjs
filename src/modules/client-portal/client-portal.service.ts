@@ -29,7 +29,8 @@ export class ClientPortalService {
 
   private calculateInvoiceStatus(inv: any): string {
     const total = Number(inv.total || 0);
-    const paid = (inv.payments || []).reduce((acc: number, p: any) => acc + Number(p.amount || 0), 0);
+    const advance = Number(inv.advance || 0);
+    const paid = advance + (inv.payments || []).reduce((acc: number, p: any) => acc + Number(p.amount || 0), 0);
 
     if (total > 0 && paid >= total) return 'paid';
     if (paid > 0 && paid < total) return 'partially_paid';

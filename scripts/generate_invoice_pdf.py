@@ -8,7 +8,7 @@ from num2words import num2words
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import Paragraph, Table, TableStyle, Image
+from reportlab.platypus import Paragraph, Table, TableStyle, Image, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -33,10 +33,13 @@ def find_asset(media_root, filename):
     paths = [
         os.path.join(media_root, filename),
         os.path.join(media_root, "logo", filename),
+        os.path.join(media_root, "icons", filename),
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", filename),
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", "logo", filename),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", "icons", filename),
         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", filename),
-        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", "logo", filename)
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", "logo", filename),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "grehasoft-pythonpms", "backend", "media", "icons", filename)
     ]
     for p in paths:
         if os.path.exists(p):
@@ -81,6 +84,8 @@ class MockPaymentsQuerySet:
         return self._payments
     def exists(self):
         return len(self._payments) > 0
+    def __len__(self):
+        return len(self._payments)
     def __iter__(self):
         return iter(self._payments)
 
@@ -94,6 +99,7 @@ class MockInvoice:
         self.subtotal = float(data.get('subtotal', 0.0))
         self.tax = float(data.get('tax', 0.0))
         self.total = float(data.get('total', 0.0))
+        self.advance = float(data.get('advance', 0.0))
         self.total_paid = float(data.get('total_paid') or data.get('totalPaid') or 0.0)
         self.balance = float(data.get('balance', 0.0))
         
@@ -170,13 +176,11 @@ def generate_invoice_pdf(invoice, media_root=""):
     # -----------------------------
     p.setFont("Poppins", 10)
     p.drawString(50, y, f"Invoice No : {invoice.invoice_number}")
-    p.drawString(190, y, f"Date : {invoice.issue_date}")
-    if invoice.due_date:
-        p.drawString(320, y, f"Due Date : {invoice.due_date}")
+    p.drawString(50, y - 16, f"Date : {invoice.issue_date}")
 
     badge_width = 110 if status_display == "PARTIALLY PAID" else 80
     badge_x = width - 50 - badge_width
-    badge_y = y - 4
+    badge_y = y - 10
 
     p.saveState()
     p.setFillColor(badge_color)
@@ -186,7 +190,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     p.drawCentredString(badge_x + badge_width/2, badge_y + 4, status_display)
     p.restoreState()
 
-    y -= 15
+    y -= 32
 
     # Top separator line
     p.setStrokeColor(colors.HexColor("#e2e8f0"))
@@ -195,7 +199,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     y -= 15
 
     # -----------------------------
-    # ISSUED BY & BILL TO PANELS
+    # BILL TO PANEL
     # -----------------------------
     styles = getSampleStyleSheet()
     content_style = ParagraphStyle(
@@ -206,26 +210,14 @@ def generate_invoice_pdf(invoice, media_root=""):
         leading=13
     )
 
-    issued_by_html = (
-        "<b>Grehasoft Smart IT Solutions</b><br/>"
-        "Vismaya Building, Infopark Phase 1,<br/>"
-        "Kakkanad, Kochi, Kerala - 682030<br/>"
-        "Phone: +91 89215 40183<br/>"
-        "Email: info@grehasoft.com<br/>"
-        "Website: www.grehasoft.com<br/>"
-        "PAN: ABCDE1234F"
-    )
-
     client = invoice.client
     bill_to_lines = []
-    if client.company_name:
+    if client.company_name and client.company_name.strip() != (client.name or "").strip():
         bill_to_lines.append(f"<b>{client.company_name}</b>")
     if client.name:
-        bill_to_lines.append(f"Contact: {client.name}")
+        bill_to_lines.append(f"{client.name}")
     if client.email:
         bill_to_lines.append(f"Email: {client.email}")
-    if client.phone:
-        bill_to_lines.append(f"Phone: {client.phone}")
     if client.address:
         addr_clean = client.address.replace("\n", "<br/>").replace("\r", "")
         bill_to_lines.append(f"Address: {addr_clean}")
@@ -234,10 +226,9 @@ def generate_invoice_pdf(invoice, media_root=""):
 
     bill_to_html = "<br/>".join(bill_to_lines) if bill_to_lines else "Valued Client"
 
-    left_cell = Paragraph(f"<font color='#1f4e79'><b>ISSUED BY:</b></font><br/><br/>{issued_by_html}", content_style)
-    right_cell = Paragraph(f"<font color='#1f4e79'><b>BILL TO:</b></font><br/><br/>{bill_to_html}", content_style)
+    bill_to_cell = Paragraph(f"<font color='#1f4e79'><b>BILL TO:</b></font><br/><br/>{bill_to_html}", content_style)
 
-    info_table = Table([[left_cell, right_cell]], colWidths=[265, 265])
+    info_table = Table([[bill_to_cell]], colWidths=[530])
     info_table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
@@ -295,11 +286,35 @@ def generate_invoice_pdf(invoice, media_root=""):
     gst_row_idx = len(data)
     data.append(["", "", "", "GST", f"Rs {float(invoice.tax):,.2f}"])
 
+    discount_amount = max(subtotal + float(invoice.tax) - float(invoice.total), 0.0)
+    discount_row_idx = None
+    if discount_amount > 0.001:
+        discount_row_idx = len(data)
+        data.append(["", "", "", "Discount", f"-Rs {discount_amount:,.2f}"])
+
     grand_total_row_idx = len(data)
     data.append(["", "", "", "Grand Total", f"Rs {float(invoice.total):,.2f}"])
 
+    advance_val = float(getattr(invoice, 'advance', 0.0) or 0.0)
+    payments_prop = getattr(invoice, 'payments', [])
+    if hasattr(payments_prop, 'exists'):
+        has_subsequent_payments = payments_prop.exists()
+    elif hasattr(payments_prop, 'all'):
+        p_all = payments_prop.all()
+        if hasattr(p_all, 'exists'):
+            has_subsequent_payments = p_all.exists()
+        else:
+            has_subsequent_payments = len(p_all) > 0
+    else:
+        has_subsequent_payments = len(payments_prop or []) > 0
+
+    if advance_val > 0 and not has_subsequent_payments:
+        payment_label = "Advance Received"
+    else:
+        payment_label = "Amount Paid"
+
     amount_paid_row_idx = len(data)
-    data.append(["", "", "", "Amount Paid", f"Rs {float(invoice.total_paid):,.2f}"])
+    data.append(["", "", "", payment_label, f"Rs {float(invoice.total_paid):,.2f}"])
 
     balance_due_row_idx = len(data)
     data.append(["", "", "", "Balance Due", f"Rs {float(invoice.balance):,.2f}"])
@@ -324,6 +339,12 @@ def generate_invoice_pdf(invoice, media_root=""):
     table_styles.extend([
         ("FONTNAME", (3, subtotal_row_idx), (4, subtotal_row_idx), "Poppins"),
         ("FONTNAME", (3, gst_row_idx), (4, gst_row_idx), "Poppins"),
+    ])
+
+    if discount_row_idx is not None:
+        table_styles.append(("FONTNAME", (3, discount_row_idx), (4, discount_row_idx), "Poppins"))
+
+    table_styles.extend([
         ("FONTNAME", (3, grand_total_row_idx), (4, grand_total_row_idx), "Poppins-Bold"),
         ("LINEABOVE", (3, grand_total_row_idx), (4, grand_total_row_idx), 1, colors.grey),
         ("FONTNAME", (3, amount_paid_row_idx), (4, amount_paid_row_idx), "Poppins"),
@@ -387,86 +408,40 @@ def generate_invoice_pdf(invoice, media_root=""):
     y -= 30
 
     # -----------------------------
-    # PAYMENT HISTORY
-    # -----------------------------
-    if y < 150:
-        p.showPage()
-        p.saveState()
-        p.setFont("Poppins-Bold", 80)
-        p.setFillGray(0.95, 0.15)
-        p.drawCentredString(width/2, height/2, "GREHASOFT")
-        p.restoreState()
-        y = height - 80
-
-    p.setFont("Poppins-Bold", 12)
-    p.drawString(50, y, "Payment History")
-    y -= 15
-
-    payments = invoice.payments.all()
-    if not payments.exists():
-        p.setFont("Poppins", 10)
-        p.drawString(50, y, "No payments received yet.")
-        y -= 25
-    else:
-        pay_data = [["Date", "Amount", "Method", "Notes"]]
-        for pay in payments:
-            mode_display = {
-                "cash": "Cash",
-                "bank": "Bank Transfer",
-                "upi": "UPI",
-                "card": "Card"
-            }.get(pay.payment_mode, pay.payment_mode.capitalize() if pay.payment_mode else "Cash")
-
-            pay_data.append([
-                str(pay.payment_date),
-                f"Rs {float(pay.amount):,.2f}",
-                mode_display,
-                pay.notes or "-"
-            ])
-
-        pay_table = Table(pay_data, colWidths=[100, 100, 100, 230])
-        pay_table.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f1f1")),
-            ("FONTNAME", (0, 0), (-1, 0), "Poppins-Bold"),
-            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ]))
-
-        pw, ph = pay_table.wrap(width - 100, height)
-        if y - ph < 120:
-            p.showPage()
-            p.saveState()
-            p.setFont("Poppins-Bold", 80)
-            p.setFillGray(0.95, 0.15)
-            p.drawCentredString(width/2, height/2, "GREHASOFT")
-            p.restoreState()
-            y = height - 80
-            pw, ph = pay_table.wrap(width - 100, height)
-
-        pay_table.drawOn(p, 50, y - ph)
-        y = y - ph - 30
-
-    # -----------------------------
     # DYNAMIC FOOTER TABLE
     # -----------------------------
+    seal_flowable = None
+    seal_path = find_asset(media_root, "seal.png") or find_asset(media_root, "seal.jpeg")
+    if seal_path and os.path.exists(seal_path):
+        try:
+            seal_img = ImageReader(seal_path)
+            img_w, img_h = seal_img.getSize()
+            aspect = img_w / float(img_h)
+            target_w = 75
+            target_h = target_w / aspect
+            seal_flowable = Image(seal_path, width=target_w, height=target_h)
+        except Exception as e:
+            print("Seal image error:", e, file=sys.stderr)
+
+    pan_html = "PAN: <b>AXMPP3677M</b>"
+
     bank_html = (
-        "<b>Bank Details</b><br/>"
-        "Account Name : GREHASOFT<br/>"
-        "Bank Name : SBI<br/>"
-        "Account Number : 41597828369<br/>"
-        "IFSC Code : SBIN0018060"
+        "<u><b>Bank Details</b></u><br/>"
+        "Account Name - GREHASOFT<br/>"
+        "Bank Name - SBI<br/>"
+        "Account Number - 4159 7828 369<br/>"
+        "IFSC code - SBIN0018060"
     )
 
-    terms_html = (
-        "<br/><b>Terms & Conditions:</b><br/>"
-        "1. Please quote Invoice Number in all payments.<br/>"
-        "2. Payments should be made as per the agreed schedule.<br/>"
-        "3. All disputes are subject to Kochi jurisdiction."
-    )
+    upi_html = "UPI ID: <b>grehasoft@sbi</b>"
 
-    left_footer_flowable = Paragraph(f"{bank_html}<br/>{terms_html}", content_style)
+    left_footer_flowable = Paragraph(f"{pan_html}<br/><br/>{bank_html}<br/><br/>{upi_html}", content_style)
+
+    left_cell_content = []
+    if seal_flowable:
+        left_cell_content.append(seal_flowable)
+        left_cell_content.append(Spacer(1, 6))
+    left_cell_content.append(left_footer_flowable)
 
     qr_flowable = None
     qr_path = find_asset(media_root, "scanpay.jpeg")
@@ -476,24 +451,22 @@ def generate_invoice_pdf(invoice, media_root=""):
     except Exception as e:
         print("QR image error:", e, file=sys.stderr)
 
-    sig_html = (
-        "<br/><b>For GREHASOFT</b><br/><br/><br/>"
-        "_______________________<br/>"
-        "Authorized Signature"
-    )
-    sig_style = ParagraphStyle(
-        'SigStyle',
+    qr_upi_style = ParagraphStyle(
+        'QRUPIStyle',
         parent=content_style,
+        fontName='Poppins-Bold',
+        fontSize=8,
         alignment=2
     )
-    sig_flowable = Paragraph(sig_html, sig_style)
+    qr_upi_paragraph = Paragraph("<b>UPI ID: grehasoft@sbi</b>", qr_upi_style)
 
     right_cell_content = []
     if qr_flowable:
         right_cell_content.append(qr_flowable)
-    right_cell_content.append(sig_flowable)
+        right_cell_content.append(Spacer(1, 4))
+    right_cell_content.append(qr_upi_paragraph)
 
-    footer_table = Table([[left_footer_flowable, right_cell_content]], colWidths=[270, 260])
+    footer_table = Table([[left_cell_content, right_cell_content]], colWidths=[270, 260])
     footer_table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('ALIGN', (1, 0), (1, 0), 'RIGHT'),

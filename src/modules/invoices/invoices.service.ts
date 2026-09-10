@@ -76,6 +76,7 @@ export class InvoicesService {
     const subtotal = i.subtotal ? Number(i.subtotal) : 0;
     const tax = i.tax ? Number(i.tax) : 0;
     const total = i.total ? Number(i.total) : subtotal + tax;
+    const advance = i.advance ? Number(i.advance) : 0;
 
     const payments = (i.payments || []).map((p: any) => ({
       id: p.id,
@@ -87,8 +88,9 @@ export class InvoicesService {
       created_at: p.created_at ? p.created_at.toISOString() : null,
     }));
 
-    const total_paid = payments.reduce((sum: number, p: any) => sum + p.amount, 0);
-    const balance = total - total_paid;
+    const paymentsSum = payments.reduce((sum: number, p: any) => sum + p.amount, 0);
+    const total_paid = advance + paymentsSum;
+    const balance = Math.max(0, total - total_paid);
 
     const todayStr = new Date().toISOString().split('T')[0];
     const dueDateStr = i.due_date ? i.due_date.toISOString().split('T')[0] : null;
@@ -237,7 +239,7 @@ export class InvoicesService {
     }
 
     const tax = Number(body.tax || 0);
-    const total = subtotal + tax;
+    const total = body.total !== undefined ? Number(body.total) : subtotal + tax;
 
     const created = await this.prisma.invoice.create({
       data: {
@@ -280,6 +282,16 @@ export class InvoicesService {
     if (!existing) throw new NotFoundException('Invoice not found');
 
     const data: any = {};
+    if (body.client !== undefined || body.client_id !== undefined) {
+      const clientId = Number(body.client ?? body.client_id);
+      const client = await this.prisma.client.findUnique({ where: { id: clientId } });
+      if (!client) {
+        throw new BadRequestException({
+          client: ['Invalid client specified.'],
+        });
+      }
+      data.client_id = clientId;
+    }
     if (body.invoice_number !== undefined) data.invoice_number = body.invoice_number;
     if (body.issue_date !== undefined) data.issue_date = new Date(body.issue_date);
     if (body.due_date !== undefined) data.due_date = new Date(body.due_date);
@@ -296,7 +308,7 @@ export class InvoicesService {
       data.subtotal = subtotal;
       const tax = body.tax !== undefined ? Number(body.tax) : Number(existing.tax);
       data.tax = tax;
-      data.total = subtotal + tax;
+      data.total = body.total !== undefined ? Number(body.total) : subtotal + tax;
 
       await this.prisma.invoiceItem.deleteMany({ where: { invoice_id: id } });
       for (const item of body.items) {
@@ -312,9 +324,9 @@ export class InvoicesService {
           },
         });
       }
-    } else if (body.tax !== undefined) {
-      data.tax = Number(body.tax);
-      data.total = Number(existing.subtotal) + data.tax;
+    } else if (body.tax !== undefined || body.total !== undefined) {
+      if (body.tax !== undefined) data.tax = Number(body.tax);
+      data.total = body.total !== undefined ? Number(body.total) : Number(existing.subtotal) + (data.tax ?? Number(existing.tax));
     }
 
     await this.prisma.invoice.update({

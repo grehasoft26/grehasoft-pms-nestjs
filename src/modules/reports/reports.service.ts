@@ -272,7 +272,8 @@ export class ReportsService {
       const total = Number(inv.total || 0);
       totalBilled += total;
 
-      const paid = inv.payments.reduce((acc, p) => acc + Number(p.amount || 0), 0);
+      const advance = Number(inv.advance || 0);
+      const paid = advance + inv.payments.reduce((acc, p) => acc + Number(p.amount || 0), 0);
       totalPaid += paid;
       totalPending += Math.max(0, total - paid);
     }
