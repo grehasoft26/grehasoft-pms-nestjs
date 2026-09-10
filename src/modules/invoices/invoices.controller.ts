@@ -25,37 +25,12 @@ export class InvoicesController {
     return this.invoicesService.getAnalytics(user);
   }
 
-  @Get(':id')
-  async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
-    return this.invoicesService.findOne(id, user);
-  }
-
-  @Post()
-  async create(@CurrentUser() user: any, @Body() body: any) {
-    return this.invoicesService.create(user, body);
-  }
-
-  @Patch(':id')
-  async update(
-    @Param('id', ParseIntPipe) id: number,
-    @CurrentUser() user: any,
-    @Body() body: any,
-  ) {
-    return this.invoicesService.update(id, user, body);
-  }
-
-  @Delete(':id')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  async remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
-    return this.invoicesService.remove(id, user);
-  }
-
-  @Get(':id/secure-link')
+  @Get([':id/secure-link', ':id/secure-link/'])
   async getSecureLink(@Param('id', ParseIntPipe) id: number) {
     return { secure_pdf_link: `/api/v1/invoices/${id}/download/` };
   }
 
-  @Get(':id/download')
+  @Get([':id/download', ':id/download/'])
   async downloadPdf(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -70,7 +45,32 @@ export class InvoicesController {
     res.send(pdfBuffer);
   }
 
-  @Post([':id/send_email', ':id/send-email'])
+  @Get([':id', ':id/'])
+  async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.invoicesService.findOne(id, user);
+  }
+
+  @Post()
+  async create(@CurrentUser() user: any, @Body() body: any) {
+    return this.invoicesService.create(user, body);
+  }
+
+  @Patch([':id', ':id/'])
+  async update(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: any,
+    @Body() body: any,
+  ) {
+    return this.invoicesService.update(id, user, body);
+  }
+
+  @Delete([':id', ':id/'])
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.invoicesService.remove(id, user);
+  }
+
+  @Post([':id/send_email', ':id/send-email', ':id/send_email/', ':id/send-email/'])
   async sendEmail(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicesService.sendEmail(id, user);
   }
