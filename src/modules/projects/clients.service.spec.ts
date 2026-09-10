@@ -38,7 +38,7 @@ describe('ClientsService', () => {
           name: data.name,
           email: data.email,
           phone: data.phone || '',
-          company_name: data.company_name,
+          company_name: data.company_name || '',
           gst_no: data.gst_no || null,
           address: data.address || '',
           status: data.status || 'active',
@@ -83,7 +83,7 @@ describe('ClientsService', () => {
   });
 
   describe('create', () => {
-    it('should create a client successfully with a valid email', async () => {
+    it('should create a client successfully with a valid email and company name', async () => {
       const payload = {
         name: 'John Doe',
         company_name: 'Tech Corp',
@@ -99,6 +99,30 @@ describe('ClientsService', () => {
       expect(result.name).toBe('John Doe');
       expect(result.company_name).toBe('Tech Corp');
       expect(result.email).toBe('john@techcorp.com');
+    });
+
+    it('should create a client successfully with blank company name when contact_person is provided', async () => {
+      const payload = {
+        name: 'Individual Client',
+        company_name: '',
+        email: 'individual@domain.com',
+      };
+
+      const result = await service.create(payload);
+
+      expect(result).toBeDefined();
+      expect(result.name).toBe('Individual Client');
+      expect(result.company_name).toBe('');
+    });
+
+    it('should reject creation when contact_person name is blank', async () => {
+      const payload = {
+        name: '',
+        company_name: 'Acme Corp',
+        email: 'acme@domain.com',
+      };
+
+      await expect(service.create(payload)).rejects.toThrow(BadRequestException);
     });
 
     it('should create a client successfully with a blank/empty email', async () => {
@@ -167,6 +191,29 @@ describe('ClientsService', () => {
       const updated = await service.update(created.id, user, { email: '' });
 
       expect(updated.email).toBe('');
+    });
+
+    it('should allow clearing company_name on update', async () => {
+      const created = await service.create({
+        name: 'Client Initial',
+        company_name: 'Corp Initial',
+        email: 'initial@company.com',
+      });
+
+      const user = { id: 1, role: { name: 'SUPER_ADMIN' } };
+      const updated = await service.update(created.id, user, { company_name: '' });
+
+      expect(updated.company_name).toBe('');
+    });
+
+    it('should reject update if contact_person name is cleared to blank', async () => {
+      const created = await service.create({
+        name: 'Client Initial',
+        company_name: 'Corp Initial',
+      });
+
+      const user = { id: 1, role: { name: 'SUPER_ADMIN' } };
+      await expect(service.update(created.id, user, { name: '' })).rejects.toThrow(BadRequestException);
     });
   });
 });

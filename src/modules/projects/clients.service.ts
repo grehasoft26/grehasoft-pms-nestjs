@@ -99,6 +99,10 @@ export class ClientsService {
   }
 
   async create(body: any) {
+    if (!body.name || !body.name.trim()) {
+      throw new BadRequestException({ contact_person: ['Contact person name is required.'] });
+    }
+
     const emailVal = body.email ? body.email.trim() : '';
     if (emailVal !== '') {
       const existing = await this.prisma.client.findFirst({
@@ -111,10 +115,10 @@ export class ClientsService {
 
     const client = await this.prisma.client.create({
       data: {
-        name: body.name,
+        name: body.name.trim(),
         email: emailVal,
         phone: body.phone || '',
-        company_name: body.company_name,
+        company_name: body.company_name ? body.company_name.trim() : '',
         gst_no: body.gst_number || body.gst_no || null,
         address: body.address || '',
         status: body.status || 'active',
@@ -141,7 +145,12 @@ export class ClientsService {
     }
 
     const data: any = {};
-    if (body.name !== undefined) data.name = body.name;
+    if (body.name !== undefined) {
+      if (!body.name || !body.name.trim()) {
+        throw new BadRequestException({ contact_person: ['Contact person name is required.'] });
+      }
+      data.name = body.name.trim();
+    }
     if (body.email !== undefined) {
       const emailVal = body.email ? body.email.trim() : '';
       if (emailVal !== '') {
@@ -155,7 +164,7 @@ export class ClientsService {
       data.email = emailVal;
     }
     if (body.phone !== undefined) data.phone = body.phone;
-    if (body.company_name !== undefined) data.company_name = body.company_name;
+    if (body.company_name !== undefined) data.company_name = body.company_name ? body.company_name.trim() : '';
     if (body.gst_number !== undefined || body.gst_no !== undefined) {
       data.gst_no = body.gst_number || body.gst_no || null;
     }
