@@ -99,21 +99,24 @@ export class ClientsService {
   }
 
   async create(body: any) {
-    const existing = await this.prisma.client.findFirst({
-      where: { email: body.email, deleted_at: null },
-    });
-    if (existing) {
-      throw new BadRequestException({ email: ['A client with this email address already exists.'] });
+    const emailVal = body.email ? body.email.trim() : '';
+    if (emailVal !== '') {
+      const existing = await this.prisma.client.findFirst({
+        where: { email: emailVal, deleted_at: null },
+      });
+      if (existing) {
+        throw new BadRequestException({ email: ['A client with this email address already exists.'] });
+      }
     }
 
     const client = await this.prisma.client.create({
       data: {
         name: body.name,
-        email: body.email,
+        email: emailVal,
         phone: body.phone || '',
         company_name: body.company_name,
         gst_no: body.gst_number || body.gst_no || null,
-        address: body.address,
+        address: body.address || '',
         status: body.status || 'active',
       },
       include: { portal_users: true },
@@ -139,7 +142,18 @@ export class ClientsService {
 
     const data: any = {};
     if (body.name !== undefined) data.name = body.name;
-    if (body.email !== undefined) data.email = body.email;
+    if (body.email !== undefined) {
+      const emailVal = body.email ? body.email.trim() : '';
+      if (emailVal !== '') {
+        const existing = await this.prisma.client.findFirst({
+          where: { email: emailVal, id: { not: id }, deleted_at: null },
+        });
+        if (existing) {
+          throw new BadRequestException({ email: ['A client with this email address already exists.'] });
+        }
+      }
+      data.email = emailVal;
+    }
     if (body.phone !== undefined) data.phone = body.phone;
     if (body.company_name !== undefined) data.company_name = body.company_name;
     if (body.gst_number !== undefined || body.gst_no !== undefined) {
