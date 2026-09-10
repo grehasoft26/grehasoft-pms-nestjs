@@ -93,6 +93,44 @@ export class PdfService {
     }
   }
 
+  private resolveScriptPath(scriptName: string): string {
+    const possibleScriptPaths = [
+      path.join(process.cwd(), 'scripts', scriptName),
+      path.join(process.cwd(), 'dist', 'scripts', scriptName),
+      path.join(__dirname, '..', 'scripts', scriptName),
+      path.join(__dirname, '..', '..', 'scripts', scriptName),
+      path.join(__dirname, '..', '..', '..', 'scripts', scriptName),
+      path.join(__dirname, 'scripts', scriptName),
+    ];
+
+    for (const p of possibleScriptPaths) {
+      if (fs.existsSync(p)) {
+        return p;
+      }
+    }
+
+    return possibleScriptPaths[0];
+  }
+
+  private resolveMediaRoot(): string {
+    const possibleMediaRoots = [
+      path.join(process.cwd(), 'media'),
+      path.join(process.cwd(), 'dist', 'media'),
+      path.join(__dirname, '..', 'media'),
+      path.join(__dirname, '..', '..', 'media'),
+      path.join(__dirname, '..', '..', '..', 'media'),
+      path.join(__dirname, 'media'),
+    ];
+
+    for (const m of possibleMediaRoots) {
+      if (fs.existsSync(m)) {
+        return m;
+      }
+    }
+
+    return possibleMediaRoots[0];
+  }
+
   /**
    * Helper to execute python script with resolved executable and ENOENT handling
    */
@@ -184,19 +222,7 @@ export class PdfService {
       `inv_out_${Date.now()}_${Math.random().toString(36).substring(7)}.pdf`,
     );
 
-    const possibleMediaRoots = [
-      path.join(process.cwd(), 'media'),
-      path.join(__dirname, '..', '..', '..', 'media'),
-      path.join(__dirname, '..', '..', 'media'),
-    ];
-    let mediaRoot = possibleMediaRoots[0];
-    for (const m of possibleMediaRoots) {
-      if (fs.existsSync(m)) {
-        mediaRoot = m;
-        break;
-      }
-    }
-
+    const mediaRoot = this.resolveMediaRoot();
     const payload = {
       invoice: invoiceData,
       media_root: mediaRoot,
@@ -204,25 +230,7 @@ export class PdfService {
 
     fs.writeFileSync(inputPath, JSON.stringify(payload), 'utf-8');
 
-    const possibleScriptPaths = [
-      path.join(process.cwd(), 'scripts', 'generate_invoice_pdf.py'),
-      path.join(
-        __dirname,
-        '..',
-        '..',
-        '..',
-        'scripts',
-        'generate_invoice_pdf.py',
-      ),
-      path.join(__dirname, '..', '..', 'scripts', 'generate_invoice_pdf.py'),
-    ];
-    let scriptPath = possibleScriptPaths[0];
-    for (const p of possibleScriptPaths) {
-      if (fs.existsSync(p)) {
-        scriptPath = p;
-        break;
-      }
-    }
+    const scriptPath = this.resolveScriptPath('generate_invoice_pdf.py');
 
     return this.runPythonScript(
       scriptPath,
@@ -246,19 +254,7 @@ export class PdfService {
       `rct_out_${Date.now()}_${Math.random().toString(36).substring(7)}.pdf`,
     );
 
-    const possibleMediaRoots = [
-      path.join(process.cwd(), 'media'),
-      path.join(__dirname, '..', '..', '..', 'media'),
-      path.join(__dirname, '..', '..', 'media'),
-    ];
-    let mediaRoot = possibleMediaRoots[0];
-    for (const m of possibleMediaRoots) {
-      if (fs.existsSync(m)) {
-        mediaRoot = m;
-        break;
-      }
-    }
-
+    const mediaRoot = this.resolveMediaRoot();
     const payload = {
       receipt: receiptData,
       media_root: mediaRoot,
@@ -266,25 +262,7 @@ export class PdfService {
 
     fs.writeFileSync(inputPath, JSON.stringify(payload), 'utf-8');
 
-    const possibleScriptPaths = [
-      path.join(process.cwd(), 'scripts', 'generate_receipt_pdf.py'),
-      path.join(
-        __dirname,
-        '..',
-        '..',
-        '..',
-        'scripts',
-        'generate_receipt_pdf.py',
-      ),
-      path.join(__dirname, '..', '..', 'scripts', 'generate_receipt_pdf.py'),
-    ];
-    let scriptPath = possibleScriptPaths[0];
-    for (const p of possibleScriptPaths) {
-      if (fs.existsSync(p)) {
-        scriptPath = p;
-        break;
-      }
-    }
+    const scriptPath = this.resolveScriptPath('generate_receipt_pdf.py');
 
     return this.runPythonScript(
       scriptPath,
@@ -311,19 +289,7 @@ export class PdfService {
       `prop_out_${Date.now()}_${Math.random().toString(36).substring(7)}.pdf`,
     );
 
-    const possibleMediaRoots = [
-      path.join(process.cwd(), 'media'),
-      path.join(__dirname, '..', '..', '..', 'media'),
-      path.join(__dirname, '..', '..', 'media'),
-    ];
-    let mediaRoot = possibleMediaRoots[0];
-    for (const m of possibleMediaRoots) {
-      if (fs.existsSync(m)) {
-        mediaRoot = m;
-        break;
-      }
-    }
-
+    const mediaRoot = this.resolveMediaRoot();
     const payload = {
       proposal: proposalData,
       builder_config: customConfig || proposalData.builder_config || {},
@@ -332,25 +298,7 @@ export class PdfService {
 
     fs.writeFileSync(inputPath, JSON.stringify(payload), 'utf-8');
 
-    const possibleScriptPaths = [
-      path.join(process.cwd(), 'scripts', 'generate_proposal_pdf.py'),
-      path.join(
-        __dirname,
-        '..',
-        '..',
-        '..',
-        'scripts',
-        'generate_proposal_pdf.py',
-      ),
-      path.join(__dirname, '..', '..', 'scripts', 'generate_proposal_pdf.py'),
-    ];
-    let scriptPath = possibleScriptPaths[0];
-    for (const p of possibleScriptPaths) {
-      if (fs.existsSync(p)) {
-        scriptPath = p;
-        break;
-      }
-    }
+    const scriptPath = this.resolveScriptPath('generate_proposal_pdf.py');
 
     return this.runPythonScript(
       scriptPath,
@@ -377,19 +325,7 @@ export class PdfService {
       `hr_out_${Date.now()}_${Math.random().toString(36).substring(7)}.pdf`,
     );
 
-    const possibleMediaRoots = [
-      path.join(process.cwd(), 'media'),
-      path.join(__dirname, '..', '..', '..', 'media'),
-      path.join(__dirname, '..', '..', 'media'),
-    ];
-    let mediaRoot = possibleMediaRoots[0];
-    for (const m of possibleMediaRoots) {
-      if (fs.existsSync(m)) {
-        mediaRoot = m;
-        break;
-      }
-    }
-
+    const mediaRoot = this.resolveMediaRoot();
     const payload = {
       doc_type: docTypeTitle,
       ctx,
@@ -398,18 +334,7 @@ export class PdfService {
 
     fs.writeFileSync(inputPath, JSON.stringify(payload), 'utf-8');
 
-    const possibleScriptPaths = [
-      path.join(process.cwd(), 'scripts', 'generate_hr_pdf.py'),
-      path.join(__dirname, '..', '..', '..', 'scripts', 'generate_hr_pdf.py'),
-      path.join(__dirname, '..', '..', 'scripts', 'generate_hr_pdf.py'),
-    ];
-    let scriptPath = possibleScriptPaths[0];
-    for (const p of possibleScriptPaths) {
-      if (fs.existsSync(p)) {
-        scriptPath = p;
-        break;
-      }
-    }
+    const scriptPath = this.resolveScriptPath('generate_hr_pdf.py');
 
     return this.runPythonScript(
       scriptPath,
