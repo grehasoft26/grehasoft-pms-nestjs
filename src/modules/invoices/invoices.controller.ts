@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, ParseIntPipe, HttpCode, HttpStatus, Res } from '@nestjs/common';
+import { Controller, Get, Post, Put, Patch, Delete, Param, Query, Body, UseGuards, ParseIntPipe, HttpCode, HttpStatus, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { InvoicesService } from './invoices.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
@@ -55,6 +55,7 @@ export class InvoicesController {
     return this.invoicesService.create(user, body);
   }
 
+  @Put([':id', ':id/'])
   @Patch([':id', ':id/'])
   async update(
     @Param('id', ParseIntPipe) id: number,
@@ -63,6 +64,7 @@ export class InvoicesController {
   ) {
     return this.invoicesService.update(id, user, body);
   }
+
 
   @Delete([':id', ':id/'])
   @HttpCode(HttpStatus.NO_CONTENT)

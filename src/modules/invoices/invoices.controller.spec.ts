@@ -67,4 +67,18 @@ describe('InvoicesController', () => {
       expect(result).toEqual({ secure_pdf_link: '/api/v1/invoices/17/download/' });
     });
   });
+
+  describe('update', () => {
+    it('should delegate to invoicesService.update when invoked via PUT or PATCH route handler', async () => {
+      const user = { id: 1 };
+      const body = { notes: 'Updated notes' };
+      mockInvoicesService.update.mockResolvedValue({ id: 17, ...body });
+
+      const result = await controller.update(17, user, body);
+
+      expect(invoicesService.update).toHaveBeenCalledWith(17, user, body);
+      expect(result).toEqual({ id: 17, notes: 'Updated notes' });
+    });
+  });
 });
+
