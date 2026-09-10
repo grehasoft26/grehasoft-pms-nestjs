@@ -353,6 +353,131 @@ describe('InvoicesService', () => {
       expect(result.total_paid).toBe(500);
       expect(result.balance).toBe(1500);
     });
+
+    it('should create invoice with custom client_address and persist it', async () => {
+      const customAddress = '456 Custom Suite, Infopark, Kochi';
+      mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Client A', address: 'Master Address' });
+      mockPrismaService.invoice.create.mockResolvedValue({
+        id: 10,
+        invoice_number: 'GSI/2026-27/010',
+        client_id: 1,
+        client_address: customAddress,
+        subtotal: 1000,
+        tax: 0,
+        total: 1000,
+        advance: 0,
+        due_date: futureDueDate,
+      });
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        id: 10,
+        invoice_number: 'GSI/2026-27/010',
+        client_id: 1,
+        client_address: customAddress,
+        subtotal: 1000,
+        tax: 0,
+        total: 1000,
+        advance: 0,
+        due_date: futureDueDate,
+        client: { id: 1, name: 'Client A', address: 'Master Address' },
+        items: [],
+        payments: [],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        client_address: customAddress,
+        items: [{ description: 'Dev', quantity: 1, rate: 1000 }],
+      });
+
+      expect(mockPrismaService.invoice.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ client_address: customAddress }),
+      });
+      expect(result.client_address).toBe(customAddress);
+    });
+
+    it('should update invoice client_address and return updated address', async () => {
+      const updatedAddress = '789 New Billing Address, Bangalore';
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          client_address: updatedAddress,
+          client: { id: 1, name: 'Client A', address: 'Master Address' },
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue({
+        ...existingInvoice,
+        client_address: updatedAddress,
+      });
+
+      const result = await service.update(1, adminUser, { client_address: updatedAddress });
+
+      expect(mockPrismaService.invoice.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: expect.objectContaining({ client_address: updatedAddress }),
+      });
+      expect(result.client_address).toBe(updatedAddress);
+    });
+
+    it('should create invoice with blank due_date (null) without auto-generating a default date', async () => {
+      mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Client A' });
+      mockPrismaService.invoice.create.mockResolvedValue({
+        id: 11,
+        invoice_number: 'GSI/2026-27/011',
+        client_id: 1,
+        issue_date: new Date(),
+        due_date: null,
+        subtotal: 1000,
+        tax: 0,
+        total: 1000,
+      });
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        id: 11,
+        invoice_number: 'GSI/2026-27/011',
+        client_id: 1,
+        issue_date: new Date(),
+        due_date: null,
+        subtotal: 1000,
+        tax: 0,
+        total: 1000,
+        client: { id: 1, name: 'Client A' },
+        items: [],
+        payments: [],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        due_date: '',
+        items: [{ description: 'Dev', quantity: 1, rate: 1000 }],
+      });
+
+      expect(mockPrismaService.invoice.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ due_date: null }),
+      });
+      expect(result.due_date).toBeNull();
+    });
+
+    it('should update invoice to clear due_date to null when passed empty string', async () => {
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          due_date: null,
+          client: { id: 1, name: 'Client A' },
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue({
+        ...existingInvoice,
+        due_date: null,
+      });
+
+      const result = await service.update(1, adminUser, { due_date: '' });
+
+      expect(mockPrismaService.invoice.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: expect.objectContaining({ due_date: null }),
+      });
+      expect(result.due_date).toBeNull();
+    });
   });
 });
-

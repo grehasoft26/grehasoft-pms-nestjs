@@ -863,8 +863,9 @@ model Invoice {
   id             Int      @id @default(autoincrement())
   invoice_number String   @unique @db.VarChar(50)
   client_id      Int
-  issue_date     DateTime @db.Date
-  due_date       DateTime @db.Date
+  client_address String?  @db.Text
+  issue_date     DateTime  @db.Date
+  due_date       DateTime? @db.Date
   advance        Decimal  @default(0.00) @db.Decimal(10, 2)
   subtotal       Decimal  @db.Decimal(10, 2)
   tax            Decimal  @db.Decimal(10, 2)

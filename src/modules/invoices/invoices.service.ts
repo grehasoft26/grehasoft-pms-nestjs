@@ -114,6 +114,7 @@ export class InvoicesService {
       client: i.client_id,
       client_name: i.client ? i.client.name : null,
       client_phone: i.client ? i.client.phone : null,
+      client_address: i.client_address !== null && i.client_address !== undefined ? i.client_address : (i.client ? i.client.address : null),
       project_name: null,
       issue_date: i.issue_date ? i.issue_date.toISOString().split('T')[0] : null,
       due_date: dueDateStr,
@@ -245,8 +246,9 @@ export class InvoicesService {
       data: {
         invoice_number: invoiceNumber,
         client_id: clientId,
+        client_address: body.client_address !== undefined ? body.client_address : (client.address || ''),
         issue_date: new Date(body.issue_date || new Date()),
-        due_date: new Date(body.due_date || new Date(Date.now() + 14 * 86400000)),
+        due_date: body.due_date ? new Date(body.due_date) : null,
         advance: Number(body.advance || 0),
         subtotal,
         tax,
@@ -294,8 +296,9 @@ export class InvoicesService {
     }
     if (body.invoice_number !== undefined) data.invoice_number = body.invoice_number;
     if (body.issue_date !== undefined) data.issue_date = new Date(body.issue_date);
-    if (body.due_date !== undefined) data.due_date = new Date(body.due_date);
+    if (body.due_date !== undefined) data.due_date = body.due_date ? new Date(body.due_date) : null;
     if (body.advance !== undefined) data.advance = Number(body.advance);
+    if (body.client_address !== undefined) data.client_address = body.client_address;
     if (body.notes !== undefined) data.notes = body.notes;
 
     if (body.items !== undefined && Array.isArray(body.items)) {

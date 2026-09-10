@@ -110,6 +110,8 @@ class MockInvoice:
             client_data['name'] = data.get('client_name')
         if not client_data.get('phone') and data.get('client_phone'):
             client_data['phone'] = data.get('client_phone')
+        if not client_data.get('address') and data.get('client_address'):
+            client_data['address'] = data.get('client_address')
         self.client = MockClient(client_data)
         
         items_data = data.get('items', [])
@@ -118,6 +120,39 @@ class MockInvoice:
         payments_data = data.get('payments', [])
         self.payments = MockPaymentsQuerySet(payments_data)
 
+def draw_watermark(canvas_obj, width, height, media_root):
+    watermark_path = find_asset(media_root, "grehasoftwatermark.png")
+    if watermark_path and os.path.exists(watermark_path):
+        canvas_obj.saveState()
+        try:
+            canvas_obj.setFillAlpha(0.15)
+            canvas_obj.setStrokeAlpha(0.15)
+        except AttributeError:
+            pass
+        
+        try:
+            from PIL import Image as PILImage
+            img = PILImage.open(watermark_path)
+            img_w, img_h = img.size
+            
+            draw_w = width * 0.65
+            scale = draw_w / img_w
+            draw_h = img_h * scale
+            
+            if draw_h > height * 0.65:
+                draw_h = height * 0.65
+                scale = draw_h / img_h
+                draw_w = img_w * scale
+            
+            x = (width - draw_w) / 2.0
+            y = (height - draw_h) / 2.0
+            
+            watermark = ImageReader(watermark_path)
+            canvas_obj.drawImage(watermark, x, y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+        except Exception as e:
+            print("Watermark draw error:", e, file=sys.stderr)
+        canvas_obj.restoreState()
+
 def generate_invoice_pdf(invoice, media_root=""):
     setup_poppins_fonts()
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
@@ -125,6 +160,9 @@ def generate_invoice_pdf(invoice, media_root=""):
     # 1️⃣ Create canvas FIRST
     p = canvas.Canvas(tmp_file.name, pagesize=A4)
     width, height = A4
+
+    # Watermark background
+    draw_watermark(p, width, height, media_root)
 
     # 2️⃣ Then draw header
     header_path = find_asset(media_root, "invoice_header.png")
@@ -137,15 +175,6 @@ def generate_invoice_pdf(invoice, media_root=""):
 
     # 3️⃣ Start content lower because header occupies space
     y = height - 135
-
-    # -----------------------------
-    # WATERMARK
-    # -----------------------------
-    p.saveState()
-    p.setFont("Poppins-Bold", 80)
-    p.setFillGray(0.95, 0.15)
-    p.drawCentredString(width/2, height/2, "GREHASOFT")
-    p.restoreState()
 
     # -----------------------------
     # COMPANY INFO / TITLE
@@ -371,11 +400,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     w, h = table.wrap(width - 100, height)
     if y - h < 120:
         p.showPage()
-        p.saveState()
-        p.setFont("Poppins-Bold", 80)
-        p.setFillGray(0.95, 0.15)
-        p.drawCentredString(width/2, height/2, "GREHASOFT")
-        p.restoreState()
+        draw_watermark(p, width, height, media_root)
         y = height - 80
         w, h = table.wrap(width - 100, height)
 
@@ -479,11 +504,7 @@ def generate_invoice_pdf(invoice, media_root=""):
     fw, fh = footer_table.wrap(width - 100, height)
     if y - fh < 60:
         p.showPage()
-        p.saveState()
-        p.setFont("Poppins-Bold", 80)
-        p.setFillGray(0.95, 0.15)
-        p.drawCentredString(width/2, height/2, "GREHASOFT")
-        p.restoreState()
+        draw_watermark(p, width, height, media_root)
         y = height - 60
 
     footer_table.drawOn(p, 50, y - fh)

@@ -89,4 +89,35 @@ describe('PdfService', () => {
     // PDF Magic bytes check
     expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
   });
+
+  it('should generate invoice PDF buffer with custom invoice client_address', async () => {
+    const mockInvoiceData = {
+      id: 18,
+      invoice_number: 'GSI/2026-27/002',
+      issue_date: '2026-09-10',
+      due_date: '2026-09-24',
+      status: 'unpaid',
+      subtotal: 1000,
+      tax: 0,
+      total: 1000,
+      advance: 0,
+      total_paid: 0,
+      balance: 1000,
+      client_name: 'Rahul Menon',
+      client_address: '456 Custom Billing Address, InfoPark Kochi',
+      client: {
+        name: 'Rahul Menon',
+        address: 'Old Master Address',
+      },
+      items: [
+        { description: 'Consulting', quantity: 1, rate: 1000, amount: 1000 },
+      ],
+      payments: [],
+    };
+
+    const pdfBuffer = await service.generateInvoicePdf(mockInvoiceData);
+    expect(Buffer.isBuffer(pdfBuffer)).toBe(true);
+    expect(pdfBuffer.length).toBeGreaterThan(100);
+    expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
+  });
 });
