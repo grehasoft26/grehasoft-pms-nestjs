@@ -96,8 +96,8 @@ export class SeoKeywordsController {
   constructor(private readonly seoService: SeoService) {}
 
   @Get()
-  async findAll(@Request() req: any, @Query('website') websiteId?: number) {
-    return this.seoService.getKeywords(req.user, websiteId);
+  async findAll(@Request() req: any, @Query() query: any) {
+    return this.seoService.getKeywords(req.user, query);
   }
 
   @Post()

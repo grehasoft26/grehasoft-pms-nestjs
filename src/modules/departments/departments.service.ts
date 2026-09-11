@@ -17,23 +17,42 @@ export class DepartmentsService {
     };
   }
 
-  async findAll(query: { all?: string }) {
+  async findAll(query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+    const where: any = { deleted_at: null };
+
+    if (query.search) {
+      where.name = { contains: query.search, mode: 'insensitive' };
+    }
+
+    if (query.all === 'true') {
+      const depts = await this.prisma.department.findMany({
+        where,
+        include: { parent: true },
+        orderBy: { id: 'asc' },
+      });
+      return depts.map((d) => this.formatDepartment(d));
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.department.count({ where });
+
     const depts = await this.prisma.department.findMany({
-      where: { deleted_at: null },
+      where,
       include: { parent: true },
-      orderBy: { id: 'asc' },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
     const formatted = depts.map((d) => this.formatDepartment(d));
 
-    if (query.all === 'true') {
-      return formatted;
-    }
-
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/departments?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/departments?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }

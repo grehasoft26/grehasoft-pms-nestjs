@@ -44,13 +44,24 @@ export class ProposalsService {
     };
   }
 
-  async findAll(user: any, query: { lead?: string; leadId?: string; all?: string }) {
+  async findAll(user: any, query: { lead?: string; leadId?: string; status?: string; search?: string; all?: string; page?: string; limit?: string }) {
     const roleName = user.role?.name;
     const where: any = {};
 
     const leadId = Number(query.lead || query.leadId);
     if (leadId) {
       where.lead_id = leadId;
+    }
+
+    if (query.status) {
+      where.status = query.status;
+    }
+
+    if (query.search) {
+      where.OR = [
+        { title: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
+      ];
     }
 
     if (roleName === 'CLIENT') {
@@ -64,6 +75,27 @@ export class ProposalsService {
       }
     }
 
+    if (query.all === 'true' || (leadId && !query.page)) {
+      const proposals = await this.prisma.proposal.findMany({
+        where,
+        include: {
+          lead: true,
+          items: true,
+          client: true,
+        },
+        orderBy: { id: 'desc' },
+      });
+
+      const formatted = proposals.map((p) => this.formatProposal(p));
+      return formatted;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.proposal.count({ where });
+
     const proposals = await this.prisma.proposal.findMany({
       where,
       include: {
@@ -71,19 +103,17 @@ export class ProposalsService {
         items: true,
         client: true,
       },
-      orderBy: { created_at: 'desc' },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
     const formatted = proposals.map((p) => this.formatProposal(p));
 
-    if (query.all === 'true' || leadId) {
-      return formatted;
-    }
-
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/proposals?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/proposals?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }

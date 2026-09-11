@@ -26,8 +26,8 @@ export class ServersController {
   constructor(private readonly infraService: InfrastructureService) {}
 
   @Get()
-  async findAll(@Request() req: any) {
-    return this.infraService.getServers(req.user);
+  async findAll(@Request() req: any, @Query() query: any) {
+    return this.infraService.getServers(req.user, query);
   }
 
   @Get(':id')
@@ -66,8 +66,8 @@ export class DomainsController {
   constructor(private readonly infraService: InfrastructureService) {}
 
   @Get()
-  async findAll(@Request() req: any, @Query('search') search?: string) {
-    return this.infraService.getDomains(req.user, search);
+  async findAll(@Request() req: any, @Query() query: any) {
+    return this.infraService.getDomains(req.user, query);
   }
 
   @Get(':id')
@@ -106,8 +106,8 @@ export class CredentialsController {
   constructor(private readonly infraService: InfrastructureService) {}
 
   @Get()
-  async findAll(@Request() req: any) {
-    return this.infraService.getCredentials(req.user);
+  async findAll(@Request() req: any, @Query() query: any) {
+    return this.infraService.getCredentials(req.user, query);
   }
 
   @Get(':id')

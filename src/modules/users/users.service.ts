@@ -95,7 +95,7 @@ export class UsersService {
     }));
   }
 
-  async findAll(query: { department?: string; role?: string; role_name?: string; is_active?: string; all?: string }) {
+  async findAll(query: { department?: string; role?: string; role_name?: string; is_active?: string; search?: string; page?: string; limit?: string; all?: string }) {
     const where: any = { deleted_at: null };
 
     if (query.department) {
@@ -121,22 +121,45 @@ export class UsersService {
       where.is_active = query.is_active.toLowerCase() === 'true';
     }
 
+    if (query.search) {
+      where.OR = [
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { username: { contains: query.search, mode: 'insensitive' } },
+        { email: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
+
+    if (query.all === 'true') {
+      const users = await this.prisma.user.findMany({
+        where,
+        include: { role: true, department: true, client: true },
+        orderBy: { name: 'asc' },
+      });
+
+      const formatted = users.map((u) => formatUserResponse(u));
+      return formatted;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.user.count({ where });
+
     const users = await this.prisma.user.findMany({
       where,
       include: { role: true, department: true, client: true },
-      orderBy: { name: 'asc' },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
     const formatted = users.map((u) => formatUserResponse(u));
 
-    if (query.all === 'true') {
-      return formatted;
-    }
-
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/users?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/users?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }

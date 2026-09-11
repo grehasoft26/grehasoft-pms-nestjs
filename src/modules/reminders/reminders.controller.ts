@@ -7,6 +7,7 @@ import {
   Delete,
   Param,
   Body,
+  Query,
   UseGuards,
   Request,
   ParseIntPipe,
@@ -25,8 +26,8 @@ export class RemindersController {
   constructor(private readonly remindersService: RemindersService) {}
 
   @Get()
-  async findAll(@Request() req: any) {
-    return this.remindersService.getReminders(req.user);
+  async findAll(@Request() req: any, @Query() query: any) {
+    return this.remindersService.getReminders(req.user, query);
   }
 
   @Get(':id')

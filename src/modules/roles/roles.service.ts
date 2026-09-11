@@ -5,20 +5,41 @@ import { PrismaService } from '../../core/prisma.service';
 export class RolesService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async findAll(query: { all?: string }) {
-    const roles = await this.prisma.role.findMany({
-      where: { deleted_at: null },
-      orderBy: { id: 'asc' },
-    });
+  async findAll(query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+    const where: any = { deleted_at: null };
+
+    if (query.search) {
+      where.OR = [
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
 
     if (query.all === 'true') {
+      const roles = await this.prisma.role.findMany({
+        where,
+        orderBy: { id: 'asc' },
+      });
       return roles;
     }
 
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.role.count({ where });
+
+    const roles = await this.prisma.role.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
+    });
+
     return {
-      count: roles.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/roles?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/roles?page=${pageNum - 1}` : null,
       results: roles,
     };
   }

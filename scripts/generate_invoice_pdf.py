@@ -110,8 +110,9 @@ class MockInvoice:
             client_data['name'] = data.get('client_name')
         if not client_data.get('phone') and data.get('client_phone'):
             client_data['phone'] = data.get('client_phone')
-        if not client_data.get('address') and data.get('client_address'):
-            client_data['address'] = data.get('client_address')
+        client_address_inv = data.get('client_address')
+        if client_address_inv is not None and str(client_address_inv).strip():
+            client_data['address'] = client_address_inv
         self.client = MockClient(client_data)
         
         items_data = data.get('items', [])
@@ -169,12 +170,14 @@ def generate_invoice_pdf(invoice, media_root=""):
     if header_path and os.path.exists(header_path):
         try:
             header = ImageReader(header_path)
-            p.drawImage(header, 0, height-90, width=width, height=90)
+            img_w, img_h = header.getSize()
+            header_h = width * (float(img_h) / float(img_w))
+            p.drawImage(header, -4, height - header_h + 4, width=width + 8, height=header_h, preserveAspectRatio=True)
         except Exception as e:
             print("Header image error:", e, file=sys.stderr)
 
     # 3️⃣ Start content lower because header occupies space
-    y = height - 135
+    y = height - 122
 
     # -----------------------------
     # COMPANY INFO / TITLE
@@ -184,47 +187,18 @@ def generate_invoice_pdf(invoice, media_root=""):
     y -= 25
 
     # -----------------------------
-    # STATUS BADGE CALCULATION
-    # -----------------------------
-    status_val = invoice.status.upper()
-    if status_val == "PARTIAL":
-        status_display = "PARTIALLY PAID"
-        badge_color = colors.HexColor("#17a2b8")
-    elif status_val == "PAID":
-        status_display = "PAID"
-        badge_color = colors.HexColor("#28a745")
-    elif status_val == "OVERDUE":
-        status_display = "OVERDUE"
-        badge_color = colors.HexColor("#dc3545")
-    else:
-        status_display = "UNPAID"
-        badge_color = colors.HexColor("#fd7e14")
-
-    # -----------------------------
     # INVOICE INFO HEADER
     # -----------------------------
     p.setFont("Poppins", 10)
-    p.drawString(50, y, f"Invoice No : {invoice.invoice_number}")
-    p.drawString(50, y - 16, f"Date : {invoice.issue_date}")
-
-    badge_width = 110 if status_display == "PARTIALLY PAID" else 80
-    badge_x = width - 50 - badge_width
-    badge_y = y - 10
-
-    p.saveState()
-    p.setFillColor(badge_color)
-    p.roundRect(badge_x, badge_y, badge_width, 16, 3, fill=1, stroke=0)
-    p.setFillColor(colors.white)
-    p.setFont("Poppins-Bold", 8)
-    p.drawCentredString(badge_x + badge_width/2, badge_y + 4, status_display)
-    p.restoreState()
+    p.drawString(65, y, f"Invoice No : {invoice.invoice_number}")
+    p.drawString(65, y - 16, f"Date : {invoice.issue_date}")
 
     y -= 32
 
     # Top separator line
     p.setStrokeColor(colors.HexColor("#e2e8f0"))
     p.setLineWidth(1)
-    p.line(50, y, width - 50, y)
+    p.line(65, y, width - 65, y)
     y -= 15
 
     # -----------------------------
@@ -235,8 +209,8 @@ def generate_invoice_pdf(invoice, media_root=""):
         'PanelContent',
         parent=styles['Normal'],
         fontName='Poppins',
-        fontSize=9,
-        leading=13
+        fontSize=10,
+        leading=14
     )
 
     client = invoice.client
@@ -249,7 +223,7 @@ def generate_invoice_pdf(invoice, media_root=""):
         bill_to_lines.append(f"Email: {client.email}")
     if client.address:
         addr_clean = client.address.replace("\n", "<br/>").replace("\r", "")
-        bill_to_lines.append(f"Address: {addr_clean}")
+        bill_to_lines.append(f"{addr_clean}")
     if client.gst_no:
         bill_to_lines.append(f"GSTIN: {client.gst_no}")
 
@@ -257,7 +231,7 @@ def generate_invoice_pdf(invoice, media_root=""):
 
     bill_to_cell = Paragraph(f"<font color='#1f4e79'><b>BILL TO:</b></font><br/><br/>{bill_to_html}", content_style)
 
-    info_table = Table([[bill_to_cell]], colWidths=[530])
+    info_table = Table([[bill_to_cell]], colWidths=[465])
     info_table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
@@ -266,43 +240,45 @@ def generate_invoice_pdf(invoice, media_root=""):
         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
     ]))
 
-    iw, ih = info_table.wrap(width - 100, height)
-    info_table.drawOn(p, 50, y - ih)
+    iw, ih = info_table.wrap(465, height)
+    info_table.drawOn(p, 65, y - ih)
     y = y - ih - 15
 
     # Bottom separator line
-    p.line(50, y, width - 50, y)
+    p.line(65, y, width - 65, y)
     y -= 20
 
     # -----------------------------
     # TABLE DATA
     # -----------------------------
+    desc_style = ParagraphStyle(
+        'ItemDescription',
+        parent=styles['Normal'],
+        fontName='Poppins',
+        fontSize=10,
+        leading=13,
+        textColor=colors.black
+    )
+
     data = [
-        ["#", "Description", "Qty", "Rate", "Amount"]
+        ["Description of Services", "Amount"]
     ]
 
-    i = 1
     subtotal = 0.0
 
     items_list = invoice.items.all()
     for item in items_list:
         subtotal += float(item.amount)
+        desc_text = str(item.description or '').replace('\n', '<br/>')
         data.append([
-            i,
-            item.description,
-            item.quantity,
-            f"Rs {item.rate:,.2f}",
+            Paragraph(desc_text, desc_style) if desc_text else "",
             f"Rs {item.amount:,.2f}"
         ])
-        i += 1
 
     if not items_list:
         subtotal = invoice.subtotal or invoice.total or 0.0
         data.append([
-            1,
-            "Professional Services",
-            1,
-            f"Rs {subtotal:,.2f}",
+            Paragraph("Professional Services", desc_style),
             f"Rs {subtotal:,.2f}"
         ])
 
@@ -310,109 +286,124 @@ def generate_invoice_pdf(invoice, media_root=""):
     # SUMMARY ROWS
     # -----------------------------
     subtotal_row_idx = len(data)
-    data.append(["", "", "", "Sub Total", f"Rs {subtotal:,.2f}"])
+    data.append(["Sub Total", f"Rs {subtotal:,.2f}"])
 
-    gst_row_idx = len(data)
-    data.append(["", "", "", "GST", f"Rs {float(invoice.tax):,.2f}"])
+    tax_val = float(getattr(invoice, 'tax', 0.0) or 0.0)
+    gst_row_idx = None
+    if round(tax_val, 2) > 0:
+        gst_row_idx = len(data)
+        data.append(["GST", f"Rs {tax_val:,.2f}"])
 
-    discount_amount = max(subtotal + float(invoice.tax) - float(invoice.total), 0.0)
+    total_val = float(getattr(invoice, 'total', 0.0) or 0.0)
+    discount_amount = max(subtotal + tax_val - total_val, 0.0)
     discount_row_idx = None
-    if discount_amount > 0.001:
+    if round(discount_amount, 2) > 0:
         discount_row_idx = len(data)
-        data.append(["", "", "", "Discount", f"-Rs {discount_amount:,.2f}"])
+        data.append(["Discount", f"-Rs {discount_amount:,.2f}"])
 
     grand_total_row_idx = len(data)
-    data.append(["", "", "", "Grand Total", f"Rs {float(invoice.total):,.2f}"])
+    data.append(["Grand Total", f"Rs {total_val:,.2f}"])
 
-    advance_val = float(getattr(invoice, 'advance', 0.0) or 0.0)
-    payments_prop = getattr(invoice, 'payments', [])
-    if hasattr(payments_prop, 'exists'):
-        has_subsequent_payments = payments_prop.exists()
-    elif hasattr(payments_prop, 'all'):
-        p_all = payments_prop.all()
-        if hasattr(p_all, 'exists'):
-            has_subsequent_payments = p_all.exists()
+    paid_val = float(getattr(invoice, 'total_paid', 0.0) or 0.0)
+    amount_paid_row_idx = None
+    if round(paid_val, 2) > 0:
+        advance_val = float(getattr(invoice, 'advance', 0.0) or 0.0)
+        payments_prop = getattr(invoice, 'payments', [])
+        if hasattr(payments_prop, 'exists'):
+            has_subsequent_payments = payments_prop.exists()
+        elif hasattr(payments_prop, 'all'):
+            p_all = payments_prop.all()
+            if hasattr(p_all, 'exists'):
+                has_subsequent_payments = p_all.exists()
+            else:
+                has_subsequent_payments = len(p_all) > 0
         else:
-            has_subsequent_payments = len(p_all) > 0
-    else:
-        has_subsequent_payments = len(payments_prop or []) > 0
+            has_subsequent_payments = len(payments_prop or []) > 0
 
-    if advance_val > 0 and not has_subsequent_payments:
-        payment_label = "Advance Received"
-    else:
-        payment_label = "Amount Paid"
+        if advance_val > 0 and not has_subsequent_payments:
+            payment_label = "Advance Received"
+        else:
+            payment_label = "Amount Paid"
 
-    amount_paid_row_idx = len(data)
-    data.append(["", "", "", payment_label, f"Rs {float(invoice.total_paid):,.2f}"])
+        amount_paid_row_idx = len(data)
+        data.append([payment_label, f"Rs {paid_val:,.2f}"])
 
-    balance_due_row_idx = len(data)
-    data.append(["", "", "", "Balance Due", f"Rs {float(invoice.balance):,.2f}"])
+    balance_val = float(getattr(invoice, 'balance', 0.0) or 0.0)
+    balance_due_row_idx = None
+    if round(balance_val, 2) > 0 and round(balance_val, 2) != round(total_val, 2):
+        balance_due_row_idx = len(data)
+        data.append(["Balance Due", f"Rs {balance_val:,.2f}"])
 
     # -----------------------------
     # TABLE STYLING
     # -----------------------------
-    table = Table(data, colWidths=[40, 250, 60, 80, 100])
+    table = Table(data, colWidths=[355, 110])
     
     items_count = len(items_list) if items_list else 1
     table_styles = [
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("GRID", (0, 0), (-1, items_count), 1, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Poppins-Bold"),
-        ("ALIGN", (2, 1), (4, items_count), "RIGHT"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("ALIGN", (1, 1), (1, items_count), "RIGHT"),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
     ]
 
     # Style summary rows
-    table_styles.extend([
-        ("FONTNAME", (3, subtotal_row_idx), (4, subtotal_row_idx), "Poppins"),
-        ("FONTNAME", (3, gst_row_idx), (4, gst_row_idx), "Poppins"),
-    ])
+    table_styles.append(("FONTNAME", (0, subtotal_row_idx), (1, subtotal_row_idx), "Poppins"))
+    
+    if gst_row_idx is not None:
+        table_styles.append(("FONTNAME", (0, gst_row_idx), (1, gst_row_idx), "Poppins"))
 
     if discount_row_idx is not None:
-        table_styles.append(("FONTNAME", (3, discount_row_idx), (4, discount_row_idx), "Poppins"))
+        table_styles.append(("FONTNAME", (0, discount_row_idx), (1, discount_row_idx), "Poppins"))
 
     table_styles.extend([
-        ("FONTNAME", (3, grand_total_row_idx), (4, grand_total_row_idx), "Poppins-Bold"),
-        ("LINEABOVE", (3, grand_total_row_idx), (4, grand_total_row_idx), 1, colors.grey),
-        ("FONTNAME", (3, amount_paid_row_idx), (4, amount_paid_row_idx), "Poppins"),
-        ("FONTNAME", (3, balance_due_row_idx), (4, balance_due_row_idx), "Poppins-Bold"),
-        ("LINEABOVE", (3, balance_due_row_idx), (4, balance_due_row_idx), 1, colors.grey),
-        ("LINEBELOW", (3, balance_due_row_idx), (4, balance_due_row_idx), 1.5, colors.grey),
+        ("FONTNAME", (0, grand_total_row_idx), (1, grand_total_row_idx), "Poppins-Bold"),
+        ("LINEABOVE", (0, grand_total_row_idx), (1, grand_total_row_idx), 1, colors.grey),
     ])
 
-    # Highlight Balance Due
-    if invoice.balance > 0:
+    if amount_paid_row_idx is not None:
+        table_styles.append(("FONTNAME", (0, amount_paid_row_idx), (1, amount_paid_row_idx), "Poppins"))
+
+    if balance_due_row_idx is not None:
         table_styles.extend([
-            ("BACKGROUND", (3, balance_due_row_idx), (4, balance_due_row_idx), colors.HexColor("#fff3cd")),
-            ("TEXTCOLOR", (3, balance_due_row_idx), (4, balance_due_row_idx), colors.HexColor("#856404")),
-        ])
-    else:
-        table_styles.extend([
-            ("BACKGROUND", (3, balance_due_row_idx), (4, balance_due_row_idx), colors.HexColor("#d4edda")),
-            ("TEXTCOLOR", (3, balance_due_row_idx), (4, balance_due_row_idx), colors.HexColor("#155724")),
+            ("FONTNAME", (0, balance_due_row_idx), (1, balance_due_row_idx), "Poppins-Bold"),
+            ("LINEABOVE", (0, balance_due_row_idx), (1, balance_due_row_idx), 1, colors.grey),
+            ("LINEBELOW", (0, balance_due_row_idx), (1, balance_due_row_idx), 1.5, colors.grey),
+            ("BACKGROUND", (0, balance_due_row_idx), (1, balance_due_row_idx), colors.HexColor("#fff3cd")),
+            ("TEXTCOLOR", (0, balance_due_row_idx), (1, balance_due_row_idx), colors.HexColor("#856404")),
         ])
 
-    table_styles.append(("ALIGN", (3, subtotal_row_idx), (4, -1), "RIGHT"))
+    table_styles.append(("ALIGN", (0, subtotal_row_idx), (1, -1), "RIGHT"))
     table.setStyle(TableStyle(table_styles))
 
-    w, h = table.wrap(width - 100, height)
+    w, h = table.wrap(465, height)
     if y - h < 120:
         p.showPage()
         draw_watermark(p, width, height, media_root)
         y = height - 80
-        w, h = table.wrap(width - 100, height)
+        w, h = table.wrap(465, height)
 
-    table.drawOn(p, 50, y - h)
+    table.drawOn(p, 65, y - h)
     y = y - h - 15
 
     # -----------------------------
     # AMOUNT IN WORDS
     # -----------------------------
-    grand_total = float(invoice.total)
-    rupees = int(grand_total)
-    paise = int(round((grand_total - rupees) * 100))
+    grand_total_val = float(getattr(invoice, 'total', 0.0) or 0.0)
+    balance_val = float(getattr(invoice, 'balance', 0.0) or 0.0)
+
+    if round(balance_val, 2) > 0 and round(balance_val, 2) < round(grand_total_val, 2):
+        amount_for_words = balance_val
+    else:
+        amount_for_words = grand_total_val
+
+    rupees = int(amount_for_words)
+    paise = int(round((amount_for_words - rupees) * 100))
 
     try:
         amount_words = num2words(rupees, lang="en_IN").replace(",", "")
@@ -424,17 +415,29 @@ def generate_invoice_pdf(invoice, media_root=""):
             paise_words = num2words(paise, lang="en_IN")
         except Exception:
             paise_words = str(paise)
-        final_words = f"Rupees {amount_words} and {paise_words} paise only"
+        final_words = f"Rupees {amount_words.title()} and {paise_words.title()} Paise Only."
     else:
-        final_words = f"Rupees {amount_words} only"
+        final_words = f"Rupees {amount_words.title()} Only."
 
-    p.setFont("Poppins", 10)
-    p.drawString(50, y, f"Amount in Words: {final_words.capitalize()}")
+    p.saveState()
+    p.setFont("Poppins", 11)
+    p.setFillColor(colors.HexColor("#1f4e79"))
+    p.drawString(65, y, f"Net Amount (in words): {final_words}")
+    p.restoreState()
     y -= 30
 
     # -----------------------------
     # DYNAMIC FOOTER TABLE
     # -----------------------------
+    footer_style = ParagraphStyle(
+        'FooterStyle',
+        parent=styles['Normal'],
+        fontName='Poppins',
+        fontSize=11,
+        leading=15,
+        textColor=colors.black
+    )
+
     seal_flowable = None
     seal_path = find_asset(media_root, "seal.png") or find_asset(media_root, "seal.jpeg")
     if seal_path and os.path.exists(seal_path):
@@ -442,7 +445,7 @@ def generate_invoice_pdf(invoice, media_root=""):
             seal_img = ImageReader(seal_path)
             img_w, img_h = seal_img.getSize()
             aspect = img_w / float(img_h)
-            target_w = 75
+            target_w = 90
             target_h = target_w / aspect
             seal_flowable = Image(seal_path, width=target_w, height=target_h)
         except Exception as e:
@@ -460,27 +463,27 @@ def generate_invoice_pdf(invoice, media_root=""):
 
     upi_html = "UPI ID: <b>grehasoft@sbi</b>"
 
-    left_footer_flowable = Paragraph(f"{pan_html}<br/><br/>{bank_html}<br/><br/>{upi_html}", content_style)
+    left_footer_flowable = Paragraph(f"{pan_html}<br/><br/>{bank_html}<br/>{upi_html}", footer_style)
 
     left_cell_content = []
     if seal_flowable:
         left_cell_content.append(seal_flowable)
-        left_cell_content.append(Spacer(1, 6))
+        left_cell_content.append(Spacer(1, 4))
     left_cell_content.append(left_footer_flowable)
 
     qr_flowable = None
     qr_path = find_asset(media_root, "scanpay.jpeg")
     try:
         if qr_path and os.path.exists(qr_path):
-            qr_flowable = Image(qr_path, width=80, height=104)
+            qr_flowable = Image(qr_path, width=140, height=182)
     except Exception as e:
         print("QR image error:", e, file=sys.stderr)
 
     qr_upi_style = ParagraphStyle(
         'QRUPIStyle',
-        parent=content_style,
+        parent=footer_style,
         fontName='Poppins-Bold',
-        fontSize=8,
+        fontSize=9,
         alignment=2
     )
     qr_upi_paragraph = Paragraph("<b>UPI ID: grehasoft@sbi</b>", qr_upi_style)
@@ -488,10 +491,10 @@ def generate_invoice_pdf(invoice, media_root=""):
     right_cell_content = []
     if qr_flowable:
         right_cell_content.append(qr_flowable)
-        right_cell_content.append(Spacer(1, 4))
-    right_cell_content.append(qr_upi_paragraph)
+    else:
+        right_cell_content.append(qr_upi_paragraph)
 
-    footer_table = Table([[left_cell_content, right_cell_content]], colWidths=[270, 260])
+    footer_table = Table([[left_cell_content, right_cell_content]], colWidths=[255, 210])
     footer_table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
@@ -501,13 +504,13 @@ def generate_invoice_pdf(invoice, media_root=""):
         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
     ]))
 
-    fw, fh = footer_table.wrap(width - 100, height)
+    fw, fh = footer_table.wrap(465, height)
     if y - fh < 60:
         p.showPage()
         draw_watermark(p, width, height, media_root)
         y = height - 60
 
-    footer_table.drawOn(p, 50, y - fh)
+    footer_table.drawOn(p, 65, y - fh)
     p.save()
 
     return tmp_file.name

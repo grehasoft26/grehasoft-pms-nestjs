@@ -73,12 +73,38 @@ export class TasksService {
     };
   }
 
-  async findAll(user: any, query: { project?: string; all?: string }) {
+  async findAll(
+    user: any,
+    query: {
+      project?: string;
+      all?: string;
+      search?: string;
+      status?: string;
+      priority?: string;
+      page?: string;
+      limit?: string;
+    },
+  ) {
     const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
     if (query.project) {
       where.project_id = Number(query.project);
+    }
+
+    if (query.status && query.status !== 'all') {
+      where.status = query.status;
+    }
+
+    if (query.priority && query.priority !== 'all') {
+      where.priority = query.priority;
+    }
+
+    if (query.search) {
+      where.OR = [
+        { title: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
+      ];
     }
 
     if (roleName === 'CLIENT') {
@@ -100,6 +126,36 @@ export class TasksService {
       };
     }
 
+    if (query.all === 'true' || (query.project && !query.page)) {
+      const tasks = await this.prisma.task.findMany({
+        where,
+        include: {
+          project: true,
+          task_type: true,
+          assignments: {
+            where: { deleted_at: null },
+            include: { employee: { include: { role: true, department: true, client: true } } },
+          },
+          files: { where: { deleted_at: null } },
+          comments: {
+            where: { deleted_at: null },
+            include: { user: true },
+          },
+          progress_history: true,
+        },
+        orderBy: { id: 'desc' },
+      });
+
+      const formatted = tasks.map((t) => this.formatTask(t));
+      return formatted;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.task.count({ where });
+
     const tasks = await this.prisma.task.findMany({
       where,
       include: {
@@ -117,18 +173,16 @@ export class TasksService {
         progress_history: true,
       },
       orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
     const formatted = tasks.map((t) => this.formatTask(t));
 
-    if (query.project || query.all === 'true') {
-      return formatted;
-    }
-
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/tasks?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/tasks?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }

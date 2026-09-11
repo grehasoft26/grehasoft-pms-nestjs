@@ -209,22 +209,52 @@ export class SeoService {
   // -------------------------------------------------------------
   // 3. SEO KEYWORDS
   // -------------------------------------------------------------
-  async getKeywords(user: any, websiteId?: number) {
+  async getKeywords(user: any, queryParam: any = {}) {
+    const query = typeof queryParam === 'object' && queryParam !== null ? queryParam : { website: queryParam };
     const where: any = {};
+    const websiteId = query.website || query.website_id;
     if (websiteId) where.website_id = Number(websiteId);
 
+    if (query.search) {
+      where.keyword = { contains: query.search, mode: 'insensitive' };
+    }
+
     if (this.isClient(user)) {
-      if (!user.client_id) return [];
+      if (!user.client_id) return query.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
       where.website = { client_id: user.client_id };
     } else if (this.isExecutive(user)) {
       where.website = { assigned_executive_id: user.id };
     }
 
-    return this.prisma.sEOKeyword.findMany({
+    if (query.all === 'true') {
+      const keywords = await this.prisma.sEOKeyword.findMany({
+        where,
+        include: { website: true },
+        orderBy: { keyword: 'asc' },
+      });
+      return keywords;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit || query.page_size) || 10);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.sEOKeyword.count({ where });
+
+    const keywords = await this.prisma.sEOKeyword.findMany({
       where,
       include: { website: true },
-      orderBy: { keyword: 'asc' },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
+
+    return {
+      count,
+      next: pageNum * limitNum < count ? `/api/seo-keywords?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/seo-keywords?page=${pageNum - 1}` : null,
+      results: keywords,
+    };
   }
 
   async createKeyword(user: any, data: any) {
@@ -317,11 +347,11 @@ export class SeoService {
     };
   }
 
-  async getDailyLogs(user: any, query: any) {
+  async getDailyLogs(user: any, query: any = {}) {
     const where: any = {};
 
     if (this.isClient(user)) {
-      if (!user.client_id) return [];
+      if (!user.client_id) return query.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
       where.website = { client_id: user.client_id };
       where.status = 'approved';
     } else if (this.isExecutive(user)) {
@@ -345,6 +375,31 @@ export class SeoService {
       };
     }
 
+    if (query.all === 'true') {
+      const logs = await this.prisma.sEODailyWorkLog.findMany({
+        where,
+        include: {
+          website: true,
+          executive: true,
+          created_by: true,
+          updated_by: true,
+          approved_by: true,
+          rejected_by: true,
+          items: { include: { activity_type: true } },
+          proof_files: true,
+        },
+        orderBy: [{ log_date: 'desc' }, { created_at: 'desc' }],
+      });
+
+      return logs.map((l) => this.formatDailyLog(l));
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit || query.page_size) || 10);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.sEODailyWorkLog.count({ where });
+
     const logs = await this.prisma.sEODailyWorkLog.findMany({
       where,
       include: {
@@ -357,10 +412,19 @@ export class SeoService {
         items: { include: { activity_type: true } },
         proof_files: true,
       },
-      orderBy: [{ log_date: 'desc' }, { created_at: 'desc' }],
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
-    return logs.map((l) => this.formatDailyLog(l));
+    const formatted = logs.map((l) => this.formatDailyLog(l));
+
+    return {
+      count,
+      next: pageNum * limitNum < count ? `/api/seo-daily-logs?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/seo-daily-logs?page=${pageNum - 1}` : null,
+      results: formatted,
+    };
   }
 
   async getDailyLogById(user: any, id: number) {

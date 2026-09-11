@@ -43,7 +43,7 @@ export class ProjectsService {
     };
   }
 
-  async findAll(user: any, query: { status?: string; client?: string }) {
+  async findAll(user: any, query: { status?: string; client?: string; search?: string; page?: string; limit?: string; all?: string }) {
     const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
@@ -53,6 +53,13 @@ export class ProjectsService {
 
     if (query.client) {
       where.client_id = Number(query.client);
+    }
+
+    if (query.search) {
+      where.OR = [
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
+      ];
     }
 
     if (roleName === 'CLIENT') {
@@ -79,6 +86,33 @@ export class ProjectsService {
       };
     }
 
+    if (query.all === 'true') {
+      const projects = await this.prisma.project.findMany({
+        where,
+        include: {
+          client: true,
+          project_manager: true,
+          milestones: true,
+          members: { include: { user: true } },
+        },
+        orderBy: { id: 'desc' },
+      });
+
+      const formatted = projects.map((p) => this.formatProject(p));
+      return {
+        count: formatted.length,
+        next: null,
+        previous: null,
+        results: formatted,
+      };
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.project.count({ where });
+
     const projects = await this.prisma.project.findMany({
       where,
       include: {
@@ -88,13 +122,15 @@ export class ProjectsService {
         members: { include: { user: true } },
       },
       orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
     const formatted = projects.map((p) => this.formatProject(p));
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/projects?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/projects?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }

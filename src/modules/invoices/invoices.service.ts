@@ -143,7 +143,7 @@ export class InvoicesService {
     };
   }
 
-  async findAll(user: any, query: { search?: string; client?: string; all?: string }) {
+  async findAll(user: any, query: { search?: string; client?: string; all?: string; page?: string; limit?: string }) {
     const roleName = user.role?.name;
     const where: any = {};
 
@@ -170,6 +170,26 @@ export class InvoicesService {
       }
     }
 
+    if (query.all === 'true') {
+      const invoices = await this.prisma.invoice.findMany({
+        where,
+        include: {
+          client: true,
+          items: true,
+          payments: true,
+        },
+        orderBy: { id: 'desc' },
+      });
+
+      return invoices.map((i) => this.formatInvoice(i));
+    }
+
+    const page = Math.max(1, parseInt(query.page as string, 10) || 1);
+    const limit = Math.max(1, parseInt(query.limit as string, 10) || 5);
+    const skip = (page - 1) * limit;
+
+    const totalCount = await this.prisma.invoice.count({ where });
+
     const invoices = await this.prisma.invoice.findMany({
       where,
       include: {
@@ -178,16 +198,14 @@ export class InvoicesService {
         payments: true,
       },
       orderBy: { id: 'desc' },
+      skip,
+      take: limit,
     });
 
     const formatted = invoices.map((i) => this.formatInvoice(i));
 
-    if (query.all === 'true') {
-      return formatted;
-    }
-
     return {
-      count: formatted.length,
+      count: totalCount,
       next: null,
       previous: null,
       results: formatted,

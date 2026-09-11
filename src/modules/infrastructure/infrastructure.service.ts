@@ -26,26 +26,56 @@ export class InfrastructureService {
   // -------------------------------------------------------------
   // 1. SERVERS
   // -------------------------------------------------------------
-  async getServers(user: any) {
-    if (this.isAdmin(user)) {
-      return this.prisma.server.findMany({
-        orderBy: { name: 'asc' },
-      });
+  async getServers(user: any, query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+    const where: any = {};
+
+    if (!this.isAdmin(user)) {
+      const projectIds = await this.getAccessibleProjectIds(user);
+      if (projectIds.length === 0) {
+        return query.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
+      }
+      where.domains = {
+        some: {
+          project_id: { in: projectIds },
+        },
+      };
     }
 
-    const projectIds = await this.getAccessibleProjectIds(user);
-    if (projectIds.length === 0) return [];
+    if (query.search) {
+      where.OR = [
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { provider: { contains: query.search, mode: 'insensitive' } },
+        { ip_address: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
 
-    return this.prisma.server.findMany({
-      where: {
-        domains: {
-          some: {
-            project_id: { in: projectIds },
-          },
-        },
-      },
-      orderBy: { name: 'asc' },
+    if (query.all === 'true') {
+      const servers = await this.prisma.server.findMany({
+        where,
+        orderBy: { name: 'asc' },
+      });
+      return servers;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.server.count({ where });
+
+    const results = await this.prisma.server.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
+
+    return {
+      count,
+      next: pageNum * limitNum < count ? `/api/infrastructure/servers?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/infrastructure/servers?page=${pageNum - 1}` : null,
+      results,
+    };
   }
 
   async getServerById(user: any, id: number) {
@@ -93,22 +123,51 @@ export class InfrastructureService {
   // -------------------------------------------------------------
   // 2. DOMAINS
   // -------------------------------------------------------------
-  async getDomains(user: any, search?: string) {
+  async getDomains(user: any, query: { page?: string; limit?: string; search?: string; all?: string } | string = {}) {
+    const queryObj = typeof query === 'string' ? { search: query } : query;
     const where: any = {};
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
-      if (projectIds.length === 0) return [];
+      if (projectIds.length === 0) {
+        return queryObj.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
+      }
       where.project_id = { in: projectIds };
     }
 
+    const search = queryObj.search;
     if (search) {
       where.OR = [
-        { domain_name: { contains: search } },
-        { provider: { contains: search } },
-        { project: { name: { contains: search } } },
+        { domain_name: { contains: search, mode: 'insensitive' } },
+        { provider: { contains: search, mode: 'insensitive' } },
+        { project: { name: { contains: search, mode: 'insensitive' } } },
       ];
     }
+
+    if (queryObj.all === 'true') {
+      const domains = await this.prisma.domain.findMany({
+        where,
+        include: {
+          project: { select: { id: true, name: true } },
+          server: { select: { id: true, name: true } },
+        },
+        orderBy: { expiry_date: 'desc' },
+      });
+
+      return domains.map((d) => ({
+        ...d,
+        project: d.project_id,
+        server: d.server_id,
+        project_name: d.project?.name || null,
+        server_name: d.server?.name || null,
+      }));
+    }
+
+    const pageNum = Math.max(1, Number(queryObj.page) || 1);
+    const limitNum = Math.max(1, Number(queryObj.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.domain.count({ where });
 
     const domains = await this.prisma.domain.findMany({
       where,
@@ -116,16 +175,25 @@ export class InfrastructureService {
         project: { select: { id: true, name: true } },
         server: { select: { id: true, name: true } },
       },
-      orderBy: { expiry_date: 'desc' },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
-    return domains.map((d) => ({
+    const formatted = domains.map((d) => ({
       ...d,
       project: d.project_id,
       server: d.server_id,
       project_name: d.project?.name || null,
       server_name: d.server?.name || null,
     }));
+
+    return {
+      count,
+      next: pageNum * limitNum < count ? `/api/infrastructure/domains?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/infrastructure/domains?page=${pageNum - 1}` : null,
+      results: formatted,
+    };
   }
 
   async getDomainById(user: any, id: number) {
@@ -237,15 +305,74 @@ export class InfrastructureService {
 
   // -------------------------------------------------------------
   // 3. WEBSITE CREDENTIALS
+  private formatCredential(c: any, isAdm: boolean) {
+    const res: any = {
+      ...c,
+      project: c.project_id,
+      domain: c.domain_id,
+      project_name: c.project?.name || null,
+      domain_name: c.domain?.domain_name || null,
+    };
+
+    if (!isAdm) {
+      if (res.admin_password) res.admin_password = '••••••••';
+      if (res.cpanel_password) res.cpanel_password = '••••••••';
+      if (res.ftp_password) res.ftp_password = '••••••••';
+      if (res.client_email_password) res.client_email_password = '••••••••';
+      if (res.business_email_password) res.business_email_password = '••••••••';
+    } else {
+      if (res.admin_password) res.admin_password = this.decryptPassword(res.admin_password);
+      if (res.cpanel_password) res.cpanel_password = this.decryptPassword(res.cpanel_password);
+      if (res.ftp_password) res.ftp_password = this.decryptPassword(res.ftp_password);
+      if (res.client_email_password) res.client_email_password = this.decryptPassword(res.client_email_password);
+      if (res.business_email_password) res.business_email_password = this.decryptPassword(res.business_email_password);
+    }
+
+    return res;
+  }
+
   // -------------------------------------------------------------
-  async getCredentials(user: any) {
+  // 3. WEBSITE CREDENTIALS
+  // -------------------------------------------------------------
+  async getCredentials(user: any, query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
     const where: any = {};
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
-      if (projectIds.length === 0) return [];
+      if (projectIds.length === 0) {
+        return query.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
+      }
       where.project_id = { in: projectIds };
     }
+
+    if (query.search) {
+      where.OR = [
+        { url: { contains: query.search, mode: 'insensitive' } },
+        { username: { contains: query.search, mode: 'insensitive' } },
+        { project: { name: { contains: query.search, mode: 'insensitive' } } },
+      ];
+    }
+
+    const isAdm = this.isAdmin(user);
+
+    if (query.all === 'true') {
+      const credentials = await this.prisma.websiteCredential.findMany({
+        where,
+        include: {
+          project: { select: { id: true, name: true } },
+          domain: { select: { id: true, domain_name: true } },
+        },
+        orderBy: { created_at: 'desc' },
+      });
+
+      return credentials.map((c) => this.formatCredential(c, isAdm));
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.websiteCredential.count({ where });
 
     const credentials = await this.prisma.websiteCredential.findMany({
       where,
@@ -253,36 +380,19 @@ export class InfrastructureService {
         project: { select: { id: true, name: true } },
         domain: { select: { id: true, domain_name: true } },
       },
-      orderBy: { created_at: 'desc' },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
-    const isAdm = this.isAdmin(user);
+    const formatted = credentials.map((c) => this.formatCredential(c, isAdm));
 
-    return credentials.map((c) => {
-      const res: any = {
-        ...c,
-        project: c.project_id,
-        domain: c.domain_id,
-        project_name: c.project?.name || null,
-        domain_name: c.domain?.domain_name || null,
-      };
-
-      if (!isAdm) {
-        if (res.admin_password) res.admin_password = '••••••••';
-        if (res.cpanel_password) res.cpanel_password = '••••••••';
-        if (res.ftp_password) res.ftp_password = '••••••••';
-        if (res.client_email_password) res.client_email_password = '••••••••';
-        if (res.business_email_password) res.business_email_password = '••••••••';
-      } else {
-        if (res.admin_password) res.admin_password = this.decryptPassword(res.admin_password);
-        if (res.cpanel_password) res.cpanel_password = this.decryptPassword(res.cpanel_password);
-        if (res.ftp_password) res.ftp_password = this.decryptPassword(res.ftp_password);
-        if (res.client_email_password) res.client_email_password = this.decryptPassword(res.client_email_password);
-        if (res.business_email_password) res.business_email_password = this.decryptPassword(res.business_email_password);
-      }
-
-      return res;
-    });
+    return {
+      count,
+      next: pageNum * limitNum < count ? `/api/infrastructure/credentials?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/infrastructure/credentials?page=${pageNum - 1}` : null,
+      results: formatted,
+    };
   }
 
   async getCredentialById(user: any, id: number) {

@@ -5,20 +5,41 @@ import { PrismaService } from '../../core/prisma.service';
 export class TaskTypesService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async findAll(query: { all?: string }) {
-    const types = await this.prisma.taskType.findMany({
-      where: { deleted_at: null },
-      orderBy: { id: 'asc' },
-    });
+  async findAll(query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+    const where: any = { deleted_at: null };
+
+    if (query.search) {
+      where.OR = [
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
 
     if (query.all === 'true') {
+      const types = await this.prisma.taskType.findMany({
+        where,
+        orderBy: { id: 'asc' },
+      });
       return types;
     }
 
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.taskType.count({ where });
+
+    const types = await this.prisma.taskType.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
+    });
+
     return {
-      count: types.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/task-types?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/task-types?page=${pageNum - 1}` : null,
       results: types,
     };
   }

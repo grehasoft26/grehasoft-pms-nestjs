@@ -8,11 +8,43 @@ export class RemindersService {
   // -------------------------------------------------------------
   // 1. REMINDERS CRUD
   // -------------------------------------------------------------
-  async getReminders(user: any) {
-    return this.prisma.reminder.findMany({
-      where: { user_id: user.id },
+  async getReminders(user: any, query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+    const where: any = { user_id: user.id };
+
+    if (query.search) {
+      where.OR = [
+        { title: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
+
+    if (query.all === 'true') {
+      const reminders = await this.prisma.reminder.findMany({
+        where,
+        orderBy: { id: 'desc' },
+      });
+      return reminders;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.reminder.count({ where });
+
+    const results = await this.prisma.reminder.findMany({
+      where,
       orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
+
+    return {
+      count,
+      next: pageNum * limitNum < count ? `/api/reminders?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/reminders?page=${pageNum - 1}` : null,
+      results,
+    };
   }
 
   async getReminderById(user: any, id: number) {

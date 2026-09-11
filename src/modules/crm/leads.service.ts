@@ -53,7 +53,7 @@ export class LeadsService {
     };
   }
 
-  async findAll(user: any, query: { status?: string; search?: string; all?: string }) {
+  async findAll(user: any, query: { status?: string; search?: string; all?: string; page?: string; limit?: string }) {
     const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
@@ -63,10 +63,10 @@ export class LeadsService {
 
     if (query.search) {
       where.OR = [
-        { name: { contains: query.search } },
-        { company_name: { contains: query.search } },
-        { email: { contains: query.search } },
-        { phone: { contains: query.search } },
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { company_name: { contains: query.search, mode: 'insensitive' } },
+        { email: { contains: query.search, mode: 'insensitive' } },
+        { phone: { contains: query.search, mode: 'insensitive' } },
       ];
     }
 
@@ -77,6 +77,30 @@ export class LeadsService {
         },
       };
     }
+
+    if (query.all === 'true') {
+      const leads = await this.prisma.lead.findMany({
+        where,
+        include: {
+          client: true,
+          converted_project: true,
+          followups: { include: { created_by: true } },
+          assignments: {
+            include: { sales_exec: { include: { role: true, department: true, client: true } } },
+          },
+        },
+        orderBy: { id: 'desc' },
+      });
+
+      const formatted = leads.map((l) => this.formatLead(l));
+      return formatted;
+    }
+
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.lead.count({ where });
 
     const leads = await this.prisma.lead.findMany({
       where,
@@ -89,18 +113,16 @@ export class LeadsService {
         },
       },
       orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
     });
 
     const formatted = leads.map((l) => this.formatLead(l));
 
-    if (query.all === 'true') {
-      return formatted;
-    }
-
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/leads?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/leads?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }

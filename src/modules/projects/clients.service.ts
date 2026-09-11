@@ -32,9 +32,17 @@ export class ClientsService {
     };
   }
 
-  async findAll(user: any, query: { all?: string }) {
+  async findAll(user: any, query: { all?: string; search?: string; page?: string; limit?: string }) {
     const roleName = user.role?.name;
     const where: any = { deleted_at: null };
+
+    if (query.search) {
+      where.OR = [
+        { company_name: { contains: query.search, mode: 'insensitive' } },
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { email: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
 
     if (roleName === 'CLIENT') {
       const client = await this.prisma.client.findFirst({
@@ -47,13 +55,13 @@ export class ClientsService {
       }
     }
 
-    const clients = await this.prisma.client.findMany({
-      where,
-      include: { portal_users: true },
-      orderBy: { id: 'desc' },
-    });
-
     if (query.all === 'true') {
+      const clients = await this.prisma.client.findMany({
+        where,
+        include: { portal_users: true },
+        orderBy: { id: 'desc' },
+      });
+
       const isAdminOrManager = user.is_superuser || ['SUPER_ADMIN', 'SEO_MANAGER', 'PROJECT_MANAGER', 'SALES_MANAGER'].includes(roleName);
 
       let allowedClients = clients;
@@ -67,14 +75,29 @@ export class ClientsService {
         id: c.id,
         company_name: c.company_name ? c.company_name.trim() : c.name ? c.name.trim() : `Client #${c.id}`,
         contact_person: c.name ? c.name.trim() : null,
+        address: c.address || '',
       })).sort((a, b) => a.company_name.localeCompare(b.company_name));
     }
 
+    const pageNum = Math.max(1, Number(query.page) || 1);
+    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const skip = (pageNum - 1) * limitNum;
+
+    const count = await this.prisma.client.count({ where });
+
+    const clients = await this.prisma.client.findMany({
+      where,
+      include: { portal_users: true },
+      orderBy: { id: 'desc' },
+      skip,
+      take: limitNum,
+    });
+
     const formatted = clients.map((c) => this.formatClient(c));
     return {
-      count: formatted.length,
-      next: null,
-      previous: null,
+      count,
+      next: pageNum * limitNum < count ? `/api/clients?page=${pageNum + 1}` : null,
+      previous: pageNum > 1 ? `/api/clients?page=${pageNum - 1}` : null,
       results: formatted,
     };
   }
