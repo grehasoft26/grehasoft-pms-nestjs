@@ -43,9 +43,14 @@ export class ProjectsService {
     };
   }
 
-  async findAll(user: any, query: { status?: string; client?: string; search?: string; page?: string; limit?: string; all?: string }) {
+  async findAll(user: any, query: { status?: string; client?: string; search?: string; project_id?: string; project?: string; page?: string; limit?: string; all?: string }) {
     const roleName = user.role?.name;
     const where: any = { deleted_at: null };
+
+    const projectId = query.project_id || query.project;
+    if (projectId && projectId !== 'all') {
+      where.id = Number(projectId);
+    }
 
     if (query.status) {
       where.status = query.status;
@@ -59,6 +64,8 @@ export class ProjectsService {
       where.OR = [
         { name: { contains: query.search, mode: 'insensitive' } },
         { description: { contains: query.search, mode: 'insensitive' } },
+        { client: { name: { contains: query.search, mode: 'insensitive' } } },
+        { client: { company_name: { contains: query.search, mode: 'insensitive' } } },
       ];
     }
 

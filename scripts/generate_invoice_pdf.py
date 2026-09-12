@@ -94,7 +94,11 @@ class MockInvoice:
         self.id = data.get('id')
         self.invoice_number = data.get('invoice_number') or data.get('invoiceNumber') or 'INV-001'
         self.issue_date = str(data.get('issue_date') or data.get('issueDate') or '')
-        self.due_date = str(data.get('due_date') or data.get('dueDate') or '')
+        raw_due_date = data.get('due_date') if data.get('due_date') is not None else data.get('dueDate')
+        if raw_due_date and str(raw_due_date).strip() and str(raw_due_date).strip().lower() not in ('none', 'null', 'undefined'):
+            self.due_date = str(raw_due_date).strip()
+        else:
+            self.due_date = None
         self.status = str(data.get('status') or 'unpaid')
         self.subtotal = float(data.get('subtotal', 0.0))
         self.tax = float(data.get('tax', 0.0))
@@ -191,9 +195,12 @@ def generate_invoice_pdf(invoice, media_root=""):
     # -----------------------------
     p.setFont("Poppins", 10)
     p.drawString(65, y, f"Invoice No : {invoice.invoice_number}")
-    p.drawString(65, y - 16, f"Date : {invoice.issue_date}")
-
-    y -= 32
+    p.drawString(65, y - 16, f"Issue Date : {invoice.issue_date}")
+    if invoice.due_date:
+        p.drawString(65, y - 32, f"Due Date : {invoice.due_date}")
+        y -= 48
+    else:
+        y -= 32
 
     # Top separator line
     p.setStrokeColor(colors.HexColor("#e2e8f0"))
@@ -272,37 +279,37 @@ def generate_invoice_pdf(invoice, media_root=""):
         desc_text = str(item.description or '').replace('\n', '<br/>')
         data.append([
             Paragraph(desc_text, desc_style) if desc_text else "",
-            f"Rs {item.amount:,.2f}"
+            f"₹ {item.amount:,.2f}"
         ])
 
     if not items_list:
         subtotal = invoice.subtotal or invoice.total or 0.0
         data.append([
             Paragraph("Professional Services", desc_style),
-            f"Rs {subtotal:,.2f}"
+            f"₹ {subtotal:,.2f}"
         ])
 
     # -----------------------------
     # SUMMARY ROWS
     # -----------------------------
     subtotal_row_idx = len(data)
-    data.append(["Sub Total", f"Rs {subtotal:,.2f}"])
+    data.append(["Sub Total", f"₹ {subtotal:,.2f}"])
 
     tax_val = float(getattr(invoice, 'tax', 0.0) or 0.0)
     gst_row_idx = None
     if round(tax_val, 2) > 0:
         gst_row_idx = len(data)
-        data.append(["GST", f"Rs {tax_val:,.2f}"])
+        data.append(["GST", f"₹ {tax_val:,.2f}"])
 
     total_val = float(getattr(invoice, 'total', 0.0) or 0.0)
     discount_amount = max(subtotal + tax_val - total_val, 0.0)
     discount_row_idx = None
     if round(discount_amount, 2) > 0:
         discount_row_idx = len(data)
-        data.append(["Discount", f"-Rs {discount_amount:,.2f}"])
+        data.append(["Discount", f"-₹ {discount_amount:,.2f}"])
 
     grand_total_row_idx = len(data)
-    data.append(["Grand Total", f"Rs {total_val:,.2f}"])
+    data.append(["Grand Total", f"₹ {total_val:,.2f}"])
 
     paid_val = float(getattr(invoice, 'total_paid', 0.0) or 0.0)
     amount_paid_row_idx = None
@@ -326,13 +333,13 @@ def generate_invoice_pdf(invoice, media_root=""):
             payment_label = "Amount Paid"
 
         amount_paid_row_idx = len(data)
-        data.append([payment_label, f"Rs {paid_val:,.2f}"])
+        data.append([payment_label, f"₹ {paid_val:,.2f}"])
 
     balance_val = float(getattr(invoice, 'balance', 0.0) or 0.0)
     balance_due_row_idx = None
     if round(balance_val, 2) > 0 and round(balance_val, 2) != round(total_val, 2):
         balance_due_row_idx = len(data)
-        data.append(["Balance Due", f"Rs {balance_val:,.2f}"])
+        data.append(["Balance Due", f"₹ {balance_val:,.2f}"])
 
     # -----------------------------
     # TABLE STYLING
@@ -347,6 +354,7 @@ def generate_invoice_pdf(invoice, media_root=""):
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Poppins-Bold"),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("FONTNAME", (0, 1), (-1, items_count), "Poppins"),
         ("ALIGN", (1, 1), (1, items_count), "RIGHT"),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -511,6 +519,22 @@ def generate_invoice_pdf(invoice, media_root=""):
         y = height - 60
 
     footer_table.drawOn(p, 65, y - fh)
+    y = y - fh - 12
+
+    if invoice.due_date:
+        note_style = ParagraphStyle(
+            'NoteStyle',
+            parent=styles['Normal'],
+            fontName='Poppins-Bold',
+            fontSize=9.5,
+            leading=13,
+            textColor=colors.HexColor("#334155")
+        )
+        note_paragraph = Paragraph("<b>Note: Interest may be charged on delayed payments as per the agreed payment terms.</b>", note_style)
+        nw, nh = note_paragraph.wrap(465, height)
+        note_paragraph.drawOn(p, 65, y - nh)
+        y = y - nh
+
     p.save()
 
     return tmp_file.name
