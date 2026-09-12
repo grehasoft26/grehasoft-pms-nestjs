@@ -143,7 +143,7 @@ export class InvoicesService {
     };
   }
 
-  async findAll(user: any, query: { search?: string; client?: string; all?: string; page?: string; limit?: string }) {
+  async findAll(user: any, query: { search?: string; client?: string; status?: string; all?: string; page?: string; limit?: string }) {
     const roleName = user.role?.name;
     const where: any = {};
 
@@ -181,14 +181,15 @@ export class InvoicesService {
         orderBy: { id: 'desc' },
       });
 
-      return invoices.map((i) => this.formatInvoice(i));
+      let formatted = invoices.map((i) => this.formatInvoice(i));
+      if (query.status && query.status !== 'all') {
+        formatted = formatted.filter((inv) => inv.status === query.status);
+      }
+      return formatted;
     }
 
     const page = Math.max(1, parseInt(query.page as string, 10) || 1);
-    const limit = Math.max(1, parseInt(query.limit as string, 10) || 5);
-    const skip = (page - 1) * limit;
-
-    const totalCount = await this.prisma.invoice.count({ where });
+    const limit = Math.max(1, parseInt(query.limit as string, 10) || 10);
 
     const invoices = await this.prisma.invoice.findMany({
       where,
@@ -198,17 +199,22 @@ export class InvoicesService {
         payments: true,
       },
       orderBy: { id: 'desc' },
-      skip,
-      take: limit,
     });
 
-    const formatted = invoices.map((i) => this.formatInvoice(i));
+    let formatted = invoices.map((i) => this.formatInvoice(i));
+    if (query.status && query.status !== 'all') {
+      formatted = formatted.filter((inv) => inv.status === query.status);
+    }
+
+    const totalCount = formatted.length;
+    const skip = (page - 1) * limit;
+    const paginated = formatted.slice(skip, skip + limit);
 
     return {
       count: totalCount,
-      next: null,
-      previous: null,
-      results: formatted,
+      next: page * limit < totalCount ? `/api/v1/invoices?page=${page + 1}` : null,
+      previous: page > 1 ? `/api/v1/invoices?page=${page - 1}` : null,
+      results: paginated,
     };
   }
 
