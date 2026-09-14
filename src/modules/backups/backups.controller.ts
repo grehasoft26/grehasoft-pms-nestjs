@@ -207,7 +207,13 @@ export class BackupsController {
     return this.backupsService.executeRestore(id, user, body);
   }
 
-
+  @Post([':id/cancel', ':id/cancel/'])
+  @HttpCode(HttpStatus.OK)
+  @Permissions('MANAGE_BACKUPS')
+  async cancelBackup(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    this.checkAdminPermission(user);
+    return this.backupsService.cancelBackup(id);
+  }
 
   @Delete([':id', ':id/'])
   @HttpCode(HttpStatus.NO_CONTENT)
