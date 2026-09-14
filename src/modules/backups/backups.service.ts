@@ -11,10 +11,12 @@ import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { GenerateBackupDto } from './dto/generate-backup.dto';
 import { BackupCategory } from './enums/backup-category.enum';
+import { RestorePreviewDto } from './dto/restore-preview.dto';
+import { TriggerRestoreDto, ConflictStrategy } from './dto/trigger-restore.dto';
 import { BackupRecord, BackupType, BackupStatus } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as unzipper from 'unzipper';
 
@@ -82,6 +84,39 @@ export class BackupsService {
   private readonly backupStorageDir = path.resolve(process.cwd(), 'private_storage', 'backups');
   private readonly tmpDir = path.resolve(process.cwd(), 'private_storage', 'tmp');
   private readonly cacheRootDir = path.resolve(process.cwd(), 'private_storage', 'cache', 'backups');
+  private readonly activeBackupProcesses = new Map<
+    number,
+    { childProcess?: any; workDir?: string; isCancelled?: boolean }
+  >();
+
+  private readonly categoryTopologicalTables: string[] = [
+    'roles',
+    'departments',
+    'users',
+    'clients',
+    'leads',
+    'lead_assignments',
+    'lead_followups',
+    'portal_user_audit',
+    'projects',
+    'milestones',
+    'project_members',
+    'project_activity_logs',
+    'task_types',
+    'tasks',
+    'task_assignments',
+    'task_progress',
+    'task_files',
+    'task_reviews',
+    'task_comments',
+    'invoices',
+    'invoice_items',
+    'invoice_payments',
+    'proposals',
+    'proposal_items',
+    'employees',
+    'hr_documents',
+  ];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -268,6 +303,9 @@ export class BackupsService {
     const workDir = path.join(this.tmpDir, `backup_job_${recordId}_${Date.now()}`);
     this.ensureDirectoryExists(workDir);
 
+    const jobInfo = { workDir, isCancelled: false, childProcess: null as any };
+    this.activeBackupProcesses.set(recordId, jobInfo);
+
     try {
       await this.prisma.backupRecord.update({
         where: { id: recordId },
@@ -291,12 +329,18 @@ export class BackupsService {
       const entityCounts: Record<string, number> = {};
       const documentCounts: Record<string, number> = {};
 
+      if (jobInfo.isCancelled) {
+        throw new Error('Operation cancelled by administrator.');
+      }
+
       if (dto.backupType === BackupType.FULL_SYSTEM) {
         sqlFilename = 'database.sql';
-        await this.dumpFullDatabase(path.join(dbDir, sqlFilename));
+        await this.dumpFullDatabase(path.join(dbDir, sqlFilename), recordId);
+        if (jobInfo.isCancelled) throw new Error('Operation cancelled by administrator.');
         totalFilesCopied = await this.copyFullMedia(mediaDir);
         mediaIncluded = ['./media/*'];
 
+        if (jobInfo.isCancelled) throw new Error('Operation cancelled by administrator.');
         // Generate full snapshots for all 49 database tables & documents
         await this.exportFullSnapshotsAndDocuments(dataDir, docsDir, entityCounts, documentCounts);
       } else {
@@ -315,6 +359,7 @@ export class BackupsService {
         mediaIncluded = categoryResult.mediaIncluded;
       }
 
+      if (jobInfo.isCancelled) throw new Error('Operation cancelled by administrator.');
       const totalDocuments = Object.values(documentCounts).reduce((a, b) => a + b, 0);
 
       // Generate Manifest v2
@@ -334,10 +379,19 @@ export class BackupsService {
       };
       fs.writeFileSync(path.join(workDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 
+      if (jobInfo.isCancelled) throw new Error('Operation cancelled by administrator.');
+
       // Create ZIP Archive
       const record = await this.prisma.backupRecord.findUnique({ where: { id: recordId } });
       const archivePath = path.join(this.backupStorageDir, record.filename);
       const archiveSize = await this.createZipArchive(workDir, archivePath);
+
+      if (jobInfo.isCancelled) {
+        if (fs.existsSync(archivePath)) {
+          fs.rmSync(archivePath, { force: true });
+        }
+        throw new Error('Operation cancelled by administrator.');
+      }
 
       // Mark COMPLETED
       await this.prisma.backupRecord.update({
@@ -351,8 +405,8 @@ export class BackupsService {
 
       this.logger.log(`Backup #${recordId} completed successfully. Size: ${archiveSize} bytes.`);
     } catch (error) {
-      this.logger.error(`Backup #${recordId} failed: ${error.message}`, error.stack);
       const safeErrorMsg = error.message || 'An error occurred during backup generation.';
+      this.logger.error(`Backup #${recordId} job ended: ${safeErrorMsg}`);
 
       await this.prisma.backupRecord.update({
         where: { id: recordId },
@@ -363,6 +417,7 @@ export class BackupsService {
         },
       }).catch((e) => this.logger.error(`Failed to update FAILED status: ${e.message}`));
     } finally {
+      this.activeBackupProcesses.delete(recordId);
       if (fs.existsSync(workDir)) {
         fs.rmSync(workDir, { recursive: true, force: true });
       }
@@ -370,20 +425,111 @@ export class BackupsService {
   }
 
   /**
-   * Full Database Dump using mysqldump with MYSQL_PWD credential isolation
+   * Cancel RUNNING or PENDING Backup Operation API
    */
-  private async dumpFullDatabase(outputPath: string): Promise<void> {
-    const creds = this.parseDatabaseUrl();
-    const env = { ...process.env, MYSQL_PWD: creds.password };
+  async cancelBackup(id: number): Promise<{ message: string; backup_id: number }> {
+    const record = await this.findOne(id);
 
-    const cmd = `mysqldump --host="${creds.host}" --port="${creds.port}" --user="${creds.username}" --single-transaction --quick --routines --triggers --events "${creds.database}" > "${outputPath}"`;
-
-    try {
-      await execAsync(cmd, { env });
-    } catch (err) {
-      this.logger.error(`mysqldump execution failed: ${err.message}`);
-      throw new InternalServerErrorException(`Full database dump failed: ${err.message}`);
+    if (
+      record.status === BackupStatus.FAILED &&
+      record.error_message?.toLowerCase().includes('cancelled')
+    ) {
+      return { message: 'Backup operation is already cancelled.', backup_id: id };
     }
+
+    if (record.status !== BackupStatus.PENDING && record.status !== BackupStatus.RUNNING) {
+      throw new BadRequestException(
+        `Only PENDING or RUNNING backup operations can be cancelled (status: ${record.status}).`,
+      );
+    }
+
+    const activeJob = this.activeBackupProcesses.get(id);
+    if (activeJob) {
+      activeJob.isCancelled = true;
+      if (activeJob.childProcess) {
+        try {
+          activeJob.childProcess.kill('SIGTERM');
+        } catch (e) {
+          this.logger.warn(`Failed to terminate child process for backup #${id}: ${e.message}`);
+        }
+      }
+      if (activeJob.workDir && fs.existsSync(activeJob.workDir)) {
+        try {
+          fs.rmSync(activeJob.workDir, { recursive: true, force: true });
+        } catch {}
+      }
+      this.activeBackupProcesses.delete(id);
+    }
+
+    // Mark status as FAILED with cancellation message
+    await this.prisma.backupRecord.update({
+      where: { id },
+      data: {
+        status: BackupStatus.FAILED,
+        completed_at: new Date(),
+        error_message: 'Operation cancelled by administrator.',
+      },
+    });
+
+    // Delete incomplete archive ZIP if created
+    const archivePath = path.join(this.backupStorageDir, record.filename);
+    if (fs.existsSync(archivePath)) {
+      try {
+        fs.rmSync(archivePath, { force: true });
+      } catch {}
+    }
+
+    this.logger.log(`Backup #${id} operation cancelled successfully.`);
+    return { message: 'Backup operation cancelled.', backup_id: id };
+  }
+
+  /**
+   * Full Database Dump using mysqldump with process handle tracking
+   */
+  private async dumpFullDatabase(outputPath: string, recordId?: number): Promise<void> {
+    const creds = this.parseDatabaseUrl();
+
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        'mysqldump',
+        [
+          '--host=' + creds.host,
+          '--port=' + creds.port,
+          '--user=' + creds.username,
+          '--single-transaction',
+          '--quick',
+          '--routines',
+          '--triggers',
+          '--events',
+          creds.database,
+        ],
+        { env: { ...process.env, MYSQL_PWD: creds.password } },
+      );
+
+      if (recordId && this.activeBackupProcesses.has(recordId)) {
+        this.activeBackupProcesses.get(recordId)!.childProcess = child;
+      }
+
+      let stderrOutput = '';
+      child.stderr.on('data', (data) => {
+        stderrOutput += data.toString();
+      });
+
+      child.on('error', (err) => {
+        reject(new InternalServerErrorException(`Full database dump failed: ${err.message}`));
+      });
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          reject(new InternalServerErrorException(`mysqldump process exited with code ${code}: ${stderrOutput}`));
+        } else {
+          resolve();
+        }
+      });
+
+      const writeStream = fs.createWriteStream(outputPath);
+      child.stdout.pipe(writeStream);
+    });
   }
 
   /**
@@ -439,7 +585,6 @@ export class BackupsService {
     entityCounts: Record<string, number>,
     documentCounts: Record<string, number>,
   ): Promise<void> {
-    // Export ALL 49 Prisma models to data/*.json
     const roles = await this.prisma.role.findMany();
     const depts = await this.prisma.department.findMany();
     const users = await this.prisma.user.findMany();
@@ -540,7 +685,7 @@ export class BackupsService {
     this.writeJsonSnapshot(dataDir, 'notifications', notifications, entityCounts);
     this.writeJsonSnapshot(dataDir, 'client_notifications', clientNotifications, entityCounts);
 
-    // Generate Invoices PDFs using exported snapshot record payloads
+    // Generate Invoices PDFs
     const invDocsDir = path.join(docsDir, 'invoices');
     this.ensureDirectoryExists(invDocsDir);
     let invPdfCount = 0;
@@ -557,7 +702,7 @@ export class BackupsService {
     }
     documentCounts['invoices'] = invPdfCount;
 
-    // Generate Proposals PDFs using exported snapshot record payloads
+    // Generate Proposals PDFs
     const propDocsDir = path.join(docsDir, 'proposals');
     this.ensureDirectoryExists(propDocsDir);
     let propPdfCount = 0;
@@ -1304,7 +1449,6 @@ export class BackupsService {
       throw new NotFoundException(`Record #${recordId} in "${entityName}" was not found in backup #${id}.`);
     }
 
-    // Resolve FK relationships exclusively from snapshot JSON files
     const relations: Record<string, any> = {};
 
     const readSnapshotFile = (file: string) => {
@@ -1384,7 +1528,6 @@ export class BackupsService {
       relations.items = items.filter((i: any) => i.proposal_id === targetRecord.id);
     }
 
-    // Discover linked files in documents/
     const docs: any[] = [];
     const docsDir = path.join(cacheDir, 'documents');
     if (fs.existsSync(docsDir)) {
@@ -1472,7 +1615,6 @@ export class BackupsService {
     const cacheDir = await this.ensureExtractedCache(id);
     const safeFilePath = path.resolve(cacheDir, relativePath);
 
-    // Strict path traversal containment check
     if (!safeFilePath.startsWith(cacheDir)) {
       throw new ForbiddenException('Invalid document path traversal attempt.');
     }
@@ -1482,5 +1624,412 @@ export class BackupsService {
     }
 
     return { filePath: safeFilePath, filename: path.basename(safeFilePath) };
+  }
+
+  // ============================================================================
+  // PHASE 2 STEP 1: SAFE RESTORE WORKFLOW ENGINE
+  // ============================================================================
+
+  /**
+   * Pre-Restore Impact & Safety Preview API
+   */
+  async previewRestore(id: number, dto: RestorePreviewDto): Promise<any> {
+    const record = await this.findOne(id);
+
+    if (record.status !== BackupStatus.COMPLETED) {
+      throw new BadRequestException(`Backup #${id} is not COMPLETED (status: ${record.status}).`);
+    }
+
+    const isProduction = process.env.NODE_ENV === 'production';
+    const allowProd = process.env.ALLOW_PRODUCTION_RESTORE === 'true';
+    const productionBlocked = isProduction && !allowProd;
+
+    const cacheDir = await this.ensureExtractedCache(id);
+    const manifestPath = path.join(cacheDir, 'manifest.json');
+
+    let manifest: any = null;
+    if (fs.existsSync(manifestPath)) {
+      try {
+        manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      } catch {}
+    }
+
+    const isLegacy = !manifest || manifest.manifest_version !== '2.0';
+
+    if (dto.restoreMode === 'CATEGORY' && isLegacy) {
+      throw new BadRequestException('Category restore is not supported on legacy backups.');
+    }
+
+    const confirmationRequired = `RESTORE DATABASE ${id}`;
+    let totalRecords = 0;
+    const tablesAffected: string[] = [];
+
+    const dataDir = path.join(cacheDir, 'data');
+    if (fs.existsSync(dataDir)) {
+      const files = fs.readdirSync(dataDir).filter((f) => f.endsWith('.json'));
+      for (const file of files) {
+        const tableName = file.replace('.json', '');
+        tablesAffected.push(tableName);
+        try {
+          const rows = JSON.parse(fs.readFileSync(path.join(dataDir, file), 'utf8'));
+          totalRecords += Array.isArray(rows) ? rows.length : 0;
+        } catch {}
+      }
+    }
+
+    return {
+      backup_id: id,
+      filename: record.filename,
+      backup_type: record.backup_type,
+      restore_mode: dto.restoreMode,
+      selected_categories: dto.categories || record.selected_categories || null,
+      is_legacy: isLegacy,
+      production_blocked: productionBlocked,
+      production_warning: productionBlocked
+        ? 'Production database restore is disabled by safety environment configuration (ALLOW_PRODUCTION_RESTORE is not true).'
+        : null,
+      confirmation_required: confirmationRequired,
+      tables_affected: tablesAffected,
+      total_records_in_snapshot: totalRecords,
+      documents_in_snapshot: manifest?.total_documents || 0,
+      pre_restore_backup_notice:
+        'A full pre-restore safety backup will be automatically created before applying any changes to the database.',
+    };
+  }
+
+  /**
+   * Execute Restore Workflow Engine (Full SQL or Record-Scoped Category Restore)
+   */
+  async executeRestore(id: number, user: any, dto: TriggerRestoreDto): Promise<any> {
+    const record = await this.findOne(id);
+
+    if (record.status !== BackupStatus.COMPLETED) {
+      throw new BadRequestException(`Backup #${id} is not COMPLETED (status: ${record.status}).`);
+    }
+
+    // 1. Production Safety Guard
+    const isProduction = process.env.NODE_ENV === 'production';
+    const allowProd = process.env.ALLOW_PRODUCTION_RESTORE === 'true';
+    if (isProduction && !allowProd) {
+      throw new ForbiddenException(
+        'Production database restore is disabled by safety environment configuration. Set ALLOW_PRODUCTION_RESTORE=true to enable.',
+      );
+    }
+
+    // 2. Strict Confirmation Code Check
+    const expectedCode = `RESTORE DATABASE ${id}`;
+    if (!dto.confirmationCode || dto.confirmationCode.trim() !== expectedCode) {
+      throw new BadRequestException(
+        `Invalid confirmation code. Must exactly match: ${expectedCode}`,
+      );
+    }
+
+    // 3. Mode Validation
+    if (!['FULL', 'CATEGORY'].includes(dto.restoreMode)) {
+      throw new BadRequestException('Invalid restoreMode. Must be FULL or CATEGORY.');
+    }
+
+    // 4. Strategy Validation
+    if (!['UPSERT', 'SKIP_EXISTING'].includes(dto.conflictStrategy)) {
+      throw new BadRequestException('Invalid conflictStrategy. Must be UPSERT or SKIP_EXISTING.');
+    }
+
+    // 5. Active Concurrency Lock Check
+    const running = await this.prisma.backupRecord.findFirst({
+      where: {
+        status: { in: [BackupStatus.PENDING, BackupStatus.RUNNING] },
+      },
+    });
+    if (running) {
+      throw new ConflictException('Another backup or restore operation is currently in progress.');
+    }
+
+    // 6. Extracted Cache & Legacy Check
+    const cacheDir = await this.ensureExtractedCache(id);
+    const manifestPath = path.join(cacheDir, 'manifest.json');
+    let manifest: any = null;
+    if (fs.existsSync(manifestPath)) {
+      try {
+        manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      } catch {}
+    }
+
+    const isLegacy = !manifest || manifest.manifest_version !== '2.0';
+    if (dto.restoreMode === 'CATEGORY' && isLegacy) {
+      throw new BadRequestException('Category restore is not supported on legacy backups.');
+    }
+
+    // 7. Automatic Pre-Restore FULL_SYSTEM Safety Backup
+    this.logger.log(`Triggering pre-restore FULL_SYSTEM safety backup before restoring #${id}...`);
+    let preRestoreRecord: BackupRecord;
+    try {
+      preRestoreRecord = await this.generateBackup(user, {
+        backupType: BackupType.FULL_SYSTEM,
+      });
+
+      // Await safety backup completion
+      let preStatus: BackupStatus = BackupStatus.PENDING;
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const cur = await this.findOne(preRestoreRecord.id);
+        preStatus = cur.status;
+        if (preStatus === BackupStatus.COMPLETED || preStatus === BackupStatus.FAILED) break;
+      }
+
+      if (preStatus !== BackupStatus.COMPLETED) {
+        throw new InternalServerErrorException(
+          'Pre-restore safety backup failed. Restore operation aborted to prevent data loss.',
+        );
+      }
+      this.logger.log(`Pre-restore safety backup #${preRestoreRecord.id} completed successfully.`);
+    } catch (err) {
+      this.logger.error(`Pre-restore safety backup error: ${err.message}`);
+      throw new InternalServerErrorException(`Pre-restore safety backup failed: ${err.message}`);
+    }
+
+    // 8. Execute Database & File Restore
+    try {
+      if (dto.restoreMode === 'FULL') {
+        const sqlPath = path.join(cacheDir, 'database', 'database.sql');
+        if (!fs.existsSync(sqlPath)) {
+          throw new NotFoundException(`Database dump file database.sql was not found in backup #${id}.`);
+        }
+        await this.runFullSqlRestore(sqlPath);
+        await this.restoreMediaFiles(cacheDir, 'FULL');
+      } else {
+        await this.runCategoryJsonRestore(cacheDir, dto.categories || record.selected_categories || [], dto.conflictStrategy);
+        await this.restoreMediaFiles(cacheDir, 'CATEGORY');
+      }
+
+      return {
+        message: 'Restore operation completed successfully.',
+        backup_id: id,
+        pre_restore_backup_id: preRestoreRecord.id,
+        restore_mode: dto.restoreMode,
+        conflict_strategy: dto.conflictStrategy,
+        completed_at: new Date().toISOString(),
+      };
+    } catch (err) {
+      this.logger.error(`Restore operation failed for backup #${id}: ${err.message}`, err.stack);
+      throw new InternalServerErrorException(
+        `Restore operation failed: ${err.message}. A pre-restore safety backup (#${preRestoreRecord.id}) exists to revert the database state.`,
+      );
+    }
+  }
+
+  /**
+   * Helper to strip relation fields and non-scalar properties from snapshot rows
+   */
+  private stripRelationFields(row: Record<string, any>): Record<string, any> {
+    const clean = { ...row };
+    const relationKeys = [
+      '_documents',
+      'client_name',
+      'total_paid',
+      'balance',
+      'items',
+      'payments',
+      'client',
+      'lead',
+      'user',
+      'project',
+      'department',
+      'role',
+      'milestones',
+      'members',
+      'tasks',
+      'employee',
+      'hr_documents',
+      'assignments',
+      'followups',
+      'files',
+      'reviews',
+      'comments',
+      'sales_exec',
+      'assigned_by',
+      'portal_user',
+      'performed_by',
+      'uploaded_by',
+      'reviewer',
+      'task_type',
+      'parent_task',
+      'activity_logs',
+      'progresses',
+    ];
+
+    for (const key of relationKeys) {
+      delete clean[key];
+    }
+
+    for (const key of Object.keys(clean)) {
+      if (
+        typeof clean[key] === 'string' &&
+        /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?/.test(clean[key])
+      ) {
+        clean[key] = new Date(clean[key]);
+      }
+    }
+
+    return clean;
+  }
+
+  /**
+   * Run Full MySQL Dump SQL Restore using child process STDIN pipe for cross-platform safety
+   */
+  private async runFullSqlRestore(sqlPath: string): Promise<void> {
+    const creds = this.parseDatabaseUrl();
+
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        'mysql',
+        ['--host=' + creds.host, '--port=' + creds.port, '--user=' + creds.username, creds.database],
+        { env: { ...process.env, MYSQL_PWD: creds.password } },
+      );
+
+      let stderrOutput = '';
+      child.stderr.on('data', (data) => {
+        stderrOutput += data.toString();
+      });
+
+      child.on('error', (err) => {
+        this.logger.error(`Failed to spawn mysql client: ${err.message}`);
+        reject(new InternalServerErrorException(`Failed to spawn mysql client: ${err.message}`));
+      });
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          this.logger.error(`mysql restore process exited with code ${code}: ${stderrOutput}`);
+          reject(new InternalServerErrorException(`Full SQL restore failed: ${stderrOutput || 'mysql process exited with code ' + code}`));
+        } else {
+          resolve();
+        }
+      });
+
+      const readStream = fs.createReadStream(sqlPath);
+      readStream.pipe(child.stdin);
+    });
+  }
+
+  /**
+   * Run Record-Scoped Category JSON Restore in Topological Dependency Order with strict Audit Tracking & Error Reporting
+   */
+  private async runCategoryJsonRestore(
+    cacheDir: string,
+    selectedCategories: string[],
+    strategy: ConflictStrategy,
+  ): Promise<void> {
+    const dataDir = path.join(cacheDir, 'data');
+    if (!fs.existsSync(dataDir)) return;
+
+    let attemptedCount = 0;
+    let restoredCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+    const errors: string[] = [];
+
+    const modelMap: Record<string, any> = {
+      roles: this.prisma.role,
+      departments: this.prisma.department,
+      users: this.prisma.user,
+      clients: this.prisma.client,
+      leads: this.prisma.lead,
+      lead_assignments: this.prisma.leadAssignment,
+      lead_followups: this.prisma.leadFollowup,
+      portal_user_audit: this.prisma.portalUserAudit,
+      projects: this.prisma.project,
+      milestones: this.prisma.milestone,
+      project_members: this.prisma.projectMember,
+      project_activity_logs: this.prisma.projectActivityLog,
+      task_types: this.prisma.taskType,
+      tasks: this.prisma.task,
+      task_assignments: this.prisma.taskAssignment,
+      task_progress: this.prisma.taskProgress,
+      task_files: this.prisma.taskFile,
+      task_reviews: this.prisma.taskReview,
+      task_comments: this.prisma.taskComment,
+      invoices: this.prisma.invoice,
+      invoice_items: this.prisma.invoiceItem,
+      invoice_payments: this.prisma.invoicePayment,
+      proposals: this.prisma.proposal,
+      proposal_items: this.prisma.proposalItem,
+      employees: this.prisma.employee,
+      hr_documents: this.prisma.hRDocument,
+    };
+
+    for (const table of this.categoryTopologicalTables) {
+      const jsonPath = path.join(dataDir, `${table}.json`);
+      if (!fs.existsSync(jsonPath)) continue;
+
+      const delegate = modelMap[table];
+      if (!delegate) continue;
+
+      let rows: any[] = [];
+      try {
+        rows = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      } catch (err) {
+        this.logger.warn(`Failed to parse snapshot file ${table}.json: ${err.message}`);
+        continue;
+      }
+
+      for (const row of rows) {
+        attemptedCount++;
+        const cleanRow = this.stripRelationFields(row);
+
+        try {
+          const existing = await delegate.findUnique({ where: { id: cleanRow.id } });
+          if (existing) {
+            if (strategy === 'UPSERT') {
+              await delegate.update({ where: { id: cleanRow.id }, data: cleanRow });
+              restoredCount++;
+            } else {
+              skippedCount++;
+            }
+          } else {
+            await delegate.create({ data: cleanRow });
+            restoredCount++;
+          }
+        } catch (rowErr) {
+          failedCount++;
+          const errDetail = `Table ${table} row #${cleanRow.id}: ${rowErr.message}`;
+          this.logger.warn(`Category restore error: ${errDetail}`);
+          errors.push(errDetail);
+        }
+      }
+    }
+
+    this.logger.log(
+      `Category Restore Completed: Attempted=${attemptedCount}, Restored=${restoredCount}, Skipped=${skippedCount}, Failed=${failedCount}`,
+    );
+
+    if (failedCount > 0) {
+      throw new InternalServerErrorException(
+        `Category restore failed for ${failedCount} record(s):\n${errors.slice(0, 5).join('\n')}`,
+      );
+    }
+  }
+
+  /**
+   * Restore Media / File Storage Assets
+   */
+  private async restoreMediaFiles(cacheDir: string, mode: 'FULL' | 'CATEGORY'): Promise<void> {
+    const srcDir = mode === 'FULL' ? path.join(cacheDir, 'media') : path.join(cacheDir, 'documents');
+    if (!fs.existsSync(srcDir)) return;
+
+    const copyRecursive = (src: string, dest: string) => {
+      if (!fs.existsSync(src)) return;
+      const entries = fs.readdirSync(src, { withFileTypes: true });
+      this.ensureDirectoryExists(dest);
+      for (const entry of entries) {
+        const srcPath = path.join(src, entry.name);
+        const destPath = path.join(dest, entry.name);
+        if (entry.isDirectory()) {
+          copyRecursive(srcPath, destPath);
+        } else if (entry.isFile()) {
+          fs.copyFileSync(srcPath, destPath);
+        }
+      }
+    };
+
+    copyRecursive(srcDir, this.mediaRoot);
   }
 }

@@ -32,6 +32,9 @@ describe('BackupsController', () => {
     findOne: jest.fn(),
     getDownloadPath: jest.fn(),
     remove: jest.fn(),
+    previewRestore: jest.fn(),
+    executeRestore: jest.fn(),
+    cancelBackup: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -149,6 +152,57 @@ describe('BackupsController', () => {
       mockBackupsService.remove.mockResolvedValue(undefined);
       await controller.remove(1, mockAdminUser);
       expect(mockBackupsService.remove).toHaveBeenCalledWith(1);
+    });
+  });
+
+  describe('previewRestore', () => {
+    it('should delegate to service previewRestore for admin', async () => {
+      const mockResult = { backup_id: 1, confirmation_required: 'RESTORE DATABASE 1' };
+      mockBackupsService.previewRestore.mockResolvedValue(mockResult);
+
+      const res = await controller.previewRestore(1, mockAdminUser, { restoreMode: 'FULL' });
+      expect(res).toEqual(mockResult);
+      expect(mockBackupsService.previewRestore).toHaveBeenCalledWith(1, { restoreMode: 'FULL' });
+    });
+
+    it('should reject non-admin user with ForbiddenException', async () => {
+      await expect(
+        controller.previewRestore(1, mockNonAdminUser, { restoreMode: 'FULL' }),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('executeRestore', () => {
+    it('should delegate to service executeRestore for admin', async () => {
+      const dto = { restoreMode: 'FULL' as const, conflictStrategy: 'UPSERT' as const, confirmationCode: 'RESTORE DATABASE 1' };
+      const mockResult = { message: 'Restore operation completed successfully.' };
+      mockBackupsService.executeRestore.mockResolvedValue(mockResult);
+
+      const res = await controller.executeRestore(1, mockAdminUser, dto);
+      expect(res).toEqual(mockResult);
+      expect(mockBackupsService.executeRestore).toHaveBeenCalledWith(1, mockAdminUser, dto);
+    });
+
+    it('should reject non-admin user with ForbiddenException', async () => {
+      const dto = { restoreMode: 'FULL' as const, conflictStrategy: 'UPSERT' as const, confirmationCode: 'RESTORE DATABASE 1' };
+      await expect(
+        controller.executeRestore(1, mockNonAdminUser, dto),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('cancelBackup', () => {
+    it('should delegate to service cancelBackup for admin', async () => {
+      const mockResult = { message: 'Backup operation cancelled.', backup_id: 1 };
+      mockBackupsService.cancelBackup.mockResolvedValue(mockResult);
+
+      const res = await controller.cancelBackup(1, mockAdminUser);
+      expect(res).toEqual(mockResult);
+      expect(mockBackupsService.cancelBackup).toHaveBeenCalledWith(1);
+    });
+
+    it('should reject non-admin user with ForbiddenException', async () => {
+      await expect(controller.cancelBackup(1, mockNonAdminUser)).rejects.toThrow(ForbiddenException);
     });
   });
 });

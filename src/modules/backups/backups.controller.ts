@@ -16,6 +16,8 @@ import {
 import { Response } from 'express';
 import { BackupsService } from './backups.service';
 import { GenerateBackupDto } from './dto/generate-backup.dto';
+import { RestorePreviewDto } from './dto/restore-preview.dto';
+import { TriggerRestoreDto } from './dto/trigger-restore.dto';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
@@ -176,6 +178,36 @@ export class BackupsController {
     res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
     res.sendFile(filePath);
   }
+
+  // ============================================================================
+  // RESTORE ENDPOINTS
+  // ============================================================================
+
+  @Post([':id/restore/preview', ':id/restore/preview/'])
+  @HttpCode(HttpStatus.OK)
+  @Permissions('MANAGE_BACKUPS')
+  async previewRestore(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: any,
+    @Body() body: RestorePreviewDto,
+  ) {
+    this.checkAdminPermission(user);
+    return this.backupsService.previewRestore(id, body);
+  }
+
+  @Post([':id/restore', ':id/restore/'])
+  @HttpCode(HttpStatus.OK)
+  @Permissions('MANAGE_BACKUPS')
+  async executeRestore(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: any,
+    @Body() body: TriggerRestoreDto,
+  ) {
+    this.checkAdminPermission(user);
+    return this.backupsService.executeRestore(id, user, body);
+  }
+
+
 
   @Delete([':id', ':id/'])
   @HttpCode(HttpStatus.NO_CONTENT)

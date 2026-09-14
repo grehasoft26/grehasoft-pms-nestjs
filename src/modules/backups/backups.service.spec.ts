@@ -9,6 +9,7 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 
 describe('BackupsService', () => {
@@ -174,4 +175,193 @@ describe('BackupsService', () => {
       expect(mockPrismaService.backupRecord.delete).toHaveBeenCalledWith({ where: { id: 5 } });
     });
   });
+
+  describe('previewRestore', () => {
+    it('should throw BadRequestException if backup is not COMPLETED', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 1,
+        filename: 'backup.zip',
+        status: BackupStatus.PENDING,
+      });
+
+      await expect(
+        service.previewRestore(1, { restoreMode: 'FULL' }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should return preview summary and require exact confirmation code', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 1,
+        filename: 'grehasoft-backup-full-2026.zip',
+        backup_type: BackupType.FULL_SYSTEM,
+        status: BackupStatus.COMPLETED,
+      });
+
+      jest.spyOn(service as any, 'ensureExtractedCache').mockResolvedValue('/tmp/fake-cache');
+
+      const preview = await service.previewRestore(1, { restoreMode: 'FULL' });
+
+      expect(preview.backup_id).toBe(1);
+      expect(preview.confirmation_required).toBe('RESTORE DATABASE 1');
+      expect(preview.pre_restore_backup_notice).toBeDefined();
+    });
+
+    it('should throw BadRequestException for category restore on legacy backups', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 2,
+        filename: 'legacy.zip',
+        backup_type: BackupType.FULL_SYSTEM,
+        status: BackupStatus.COMPLETED,
+      });
+
+      jest.spyOn(service as any, 'ensureExtractedCache').mockResolvedValue('/tmp/fake-cache');
+
+      await expect(
+        service.previewRestore(2, { restoreMode: 'CATEGORY', categories: [BackupCategory.FINANCE] }),
+      ).rejects.toThrow(BadRequestException);
+    });
+  });
+
+  describe('executeRestore', () => {
+    it('should throw BadRequestException if confirmation code is incorrect', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 1,
+        filename: 'backup.zip',
+        status: BackupStatus.COMPLETED,
+      });
+
+      await expect(
+        service.executeRestore(1, mockAdminUser, {
+          restoreMode: 'FULL',
+          conflictStrategy: 'UPSERT',
+          confirmationCode: 'WRONG_CODE',
+        }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should throw ForbiddenException in production if ALLOW_PRODUCTION_RESTORE is not true', async () => {
+      const origEnv = process.env.NODE_ENV;
+      const origAllow = process.env.ALLOW_PRODUCTION_RESTORE;
+
+      process.env.NODE_ENV = 'production';
+      delete process.env.ALLOW_PRODUCTION_RESTORE;
+
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 1,
+        filename: 'backup.zip',
+        status: BackupStatus.COMPLETED,
+      });
+
+      await expect(
+        service.executeRestore(1, mockAdminUser, {
+          restoreMode: 'FULL',
+          conflictStrategy: 'UPSERT',
+          confirmationCode: 'RESTORE DATABASE 1',
+        }),
+      ).rejects.toThrow(ForbiddenException);
+
+      process.env.NODE_ENV = origEnv;
+      process.env.ALLOW_PRODUCTION_RESTORE = origAllow;
+    });
+
+    it('should throw ConflictException if a backup or restore job is running', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 1,
+        filename: 'backup.zip',
+        status: BackupStatus.COMPLETED,
+      });
+
+      mockPrismaService.backupRecord.findFirst.mockResolvedValue({
+        id: 99,
+        status: BackupStatus.RUNNING,
+      });
+
+      await expect(
+        service.executeRestore(1, mockAdminUser, {
+          restoreMode: 'FULL',
+          conflictStrategy: 'UPSERT',
+          confirmationCode: 'RESTORE DATABASE 1',
+        }),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('should abort restore if pre-restore safety backup fails', async () => {
+      mockPrismaService.backupRecord.findUnique.mockImplementation(async (args: any) => {
+        if (args.where.id === 1) {
+          return { id: 1, filename: 'backup.zip', status: BackupStatus.COMPLETED };
+        }
+        if (args.where.id === 100) {
+          return { id: 100, filename: 'pre-restore.zip', status: BackupStatus.FAILED };
+        }
+        return null;
+      });
+
+      mockPrismaService.backupRecord.findFirst.mockResolvedValue(null);
+
+      jest.spyOn(service, 'generateBackup').mockResolvedValue({
+        id: 100,
+        filename: 'pre-restore.zip',
+        status: BackupStatus.PENDING,
+      } as any);
+
+      jest.spyOn(service as any, 'ensureExtractedCache').mockResolvedValue('/tmp/fake-cache');
+
+      await expect(
+        service.executeRestore(1, mockAdminUser, {
+          restoreMode: 'FULL',
+          conflictStrategy: 'UPSERT',
+          confirmationCode: 'RESTORE DATABASE 1',
+        }),
+      ).rejects.toThrow(InternalServerErrorException);
+    });
+  });
+
+  describe('cancelBackup', () => {
+    it('should throw BadRequestException when trying to cancel COMPLETED backup', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 1,
+        filename: 'backup.zip',
+        status: BackupStatus.COMPLETED,
+      });
+
+      await expect(service.cancelBackup(1)).rejects.toThrow(BadRequestException);
+    });
+
+    it('should update PENDING/RUNNING backup to FAILED with cancellation message', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 2,
+        filename: 'backup.zip',
+        status: BackupStatus.RUNNING,
+      });
+      mockPrismaService.backupRecord.update.mockResolvedValue({
+        id: 2,
+        status: BackupStatus.FAILED,
+        error_message: 'Operation cancelled by administrator.',
+      });
+
+      const res = await service.cancelBackup(2);
+      expect(res.message).toBe('Backup operation cancelled.');
+      expect(res.backup_id).toBe(2);
+      expect(mockPrismaService.backupRecord.update).toHaveBeenCalledWith({
+        where: { id: 2 },
+        data: expect.objectContaining({
+          status: BackupStatus.FAILED,
+          error_message: 'Operation cancelled by administrator.',
+        }),
+      });
+    });
+
+    it('should handle idempotency when cancelling an already cancelled backup', async () => {
+      mockPrismaService.backupRecord.findUnique.mockResolvedValue({
+        id: 3,
+        filename: 'backup.zip',
+        status: BackupStatus.FAILED,
+        error_message: 'Operation cancelled by administrator.',
+      });
+
+      const res = await service.cancelBackup(3);
+      expect(res.message).toBe('Backup operation is already cancelled.');
+    });
+  });
 });
+
