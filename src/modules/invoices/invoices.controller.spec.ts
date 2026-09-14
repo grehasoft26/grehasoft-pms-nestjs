@@ -16,6 +16,12 @@ describe('InvoicesController', () => {
     update: jest.fn(),
     remove: jest.fn(),
     generatePdfStream: jest.fn().mockResolvedValue(Buffer.from('%PDF-1.4 ... mock pdf content')),
+    generateSecureLink: jest.fn().mockResolvedValue({ secure_pdf_link: 'http://localhost:3000/api/v1/invoices/public/17.12345.abc/download/' }),
+    generatePdfStreamFromPublicToken: jest.fn().mockResolvedValue({
+      pdfBuffer: Buffer.from('%PDF-1.4 ... mock pdf content'),
+      filename: 'invoice_GSI_2026-27_001.pdf',
+    }),
+    previewPdf: jest.fn().mockResolvedValue(Buffer.from('%PDF-1.4 ... mock pdf content')),
     sendEmail: jest.fn(),
   };
 
@@ -61,10 +67,37 @@ describe('InvoicesController', () => {
     });
   });
 
+  describe('downloadPublicPdf', () => {
+    it('should stream PDF without requiring authentication when given valid public token', async () => {
+      const res = mockResponse();
+      await controller.downloadPublicPdf('17.12345.abc', res);
+
+      expect(invoicesService.generatePdfStreamFromPublicToken).toHaveBeenCalledWith('17.12345.abc');
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/pdf');
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Disposition', 'attachment; filename="invoice_GSI_2026-27_001.pdf"');
+      expect(res.send).toHaveBeenCalledWith(expect.any(Buffer));
+    });
+  });
+
+  describe('previewPdf', () => {
+    it('should generate and stream PDF for unsaved invoice form data', async () => {
+      const res = mockResponse();
+      const body = { invoice_number: 'GSI/2026-27/099', items: [{ description: 'Test', quantity: 1, rate: 100 }] };
+      await controller.previewPdf(body, res);
+
+      expect(invoicesService.previewPdf).toHaveBeenCalledWith(body);
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/pdf');
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Disposition', 'inline; filename="invoice_preview.pdf"');
+      expect(res.send).toHaveBeenCalledWith(expect.any(Buffer));
+    });
+  });
+
   describe('getSecureLink', () => {
-    it('should return secure PDF download URL with trailing slash', async () => {
-      const result = await controller.getSecureLink(17);
-      expect(result).toEqual({ secure_pdf_link: '/api/v1/invoices/17/download/' });
+    it('should return absolute secure PDF download URL with signed token', async () => {
+      const req = { get: () => 'localhost:3000', protocol: 'http' };
+      const result = await controller.getSecureLink(17, req);
+      expect(invoicesService.generateSecureLink).toHaveBeenCalledWith(17, req);
+      expect(result).toEqual({ secure_pdf_link: 'http://localhost:3000/api/v1/invoices/public/17.12345.abc/download/' });
     });
   });
 

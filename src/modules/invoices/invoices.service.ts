@@ -1,7 +1,58 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, InternalServerErrorException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
+
+export class InvoiceSigning {
+  static generateToken(invoiceId: number, secret: string, expiresInSeconds: number = 172800): string {
+    const expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds;
+    const payload = `${invoiceId}:${expiresAt}`;
+    const hmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    return `${invoiceId}.${expiresAt}.${hmac}`;
+  }
+
+  static verifyToken(token: string, secret: string): { valid: boolean; invoiceId?: number; error?: string } {
+    if (!token) {
+      return { valid: false, error: 'Token is required.' };
+    }
+
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      return { valid: false, error: 'Invalid signature token.' };
+    }
+
+    const [idStr, expiresAtStr, hmacStr] = parts;
+    const invoiceId = parseInt(idStr, 10);
+    const expiresAt = parseInt(expiresAtStr, 10);
+
+    if (isNaN(invoiceId) || isNaN(expiresAt)) {
+      return { valid: false, error: 'Invalid signature token.' };
+    }
+
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    if (currentTimestamp > expiresAt) {
+      return { valid: false, error: 'This secure link has expired.' };
+    }
+
+    const payload = `${invoiceId}:${expiresAt}`;
+    const expectedHmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+
+    try {
+      const hmacBuffer = Buffer.from(hmacStr, 'hex');
+      const expectedBuffer = Buffer.from(expectedHmac, 'hex');
+
+      if (hmacBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(hmacBuffer, expectedBuffer)) {
+        return { valid: false, error: 'Invalid signature token.' };
+      }
+    } catch {
+      return { valid: false, error: 'Invalid signature token.' };
+    }
+
+    return { valid: true, invoiceId };
+  }
+}
 
 @Injectable()
 export class InvoicesService {
@@ -9,6 +60,7 @@ export class InvoicesService {
     private readonly prisma: PrismaService,
     private readonly pdfService: PdfService,
     private readonly mailerService: MailerService,
+    private readonly configService: ConfigService,
   ) {}
 
   generateNextInvoiceNumber(): string {
@@ -114,7 +166,18 @@ export class InvoicesService {
       client: i.client_id,
       client_name: i.client ? i.client.name : null,
       client_phone: i.client ? i.client.phone : null,
-      client_address: i.client_address !== null && i.client_address !== undefined ? i.client_address : (i.client ? i.client.address : null),
+      client_address: (i.client_address !== null && i.client_address !== undefined && String(i.client_address).trim() !== '')
+        ? String(i.client_address).trim()
+        : (i.client && i.client.address && String(i.client.address).trim() !== '' ? String(i.client.address).trim() : null),
+      client_details: i.client ? {
+        id: i.client.id,
+        name: i.client.name,
+        company_name: i.client.company_name,
+        address: i.client.address,
+        email: i.client.email,
+        phone: i.client.phone,
+        gst_number: i.client.gst_no,
+      } : null,
       project_name: null,
       issue_date: i.issue_date ? i.issue_date.toISOString().split('T')[0] : null,
       due_date: dueDateStr,
@@ -148,11 +211,14 @@ export class InvoicesService {
     const where: any = {};
 
     if (query.search) {
-      where.OR = [
-        { invoice_number: { contains: query.search } },
-        { client: { name: { contains: query.search } } },
-        { client: { company_name: { contains: query.search } } },
-      ];
+      const searchStr = query.search.trim();
+      if (searchStr !== '') {
+        where.OR = [
+          { invoice_number: { contains: searchStr } },
+          { client: { name: { contains: searchStr } } },
+          { client: { company_name: { contains: searchStr } } },
+        ];
+      }
     }
 
     if (query.client) {
@@ -412,7 +478,7 @@ export class InvoicesService {
     }
 
     const pdfBuffer = await this.pdfService.generateInvoicePdf(invoice);
-    await this.mailerService.sendMail({
+    const mailSent = await this.mailerService.sendMail({
       to: client.email,
       subject: `Invoice ${invoice.invoice_number} from Grehasoft`,
       text: `Hello ${client.name || 'Client'},\n\nPlease find attached invoice ${invoice.invoice_number}.\n\nRegards,\nGrehasoft Smart IT Solutions`,
@@ -424,6 +490,147 @@ export class InvoicesService {
       ],
     });
 
+    if (!mailSent) {
+      throw new InternalServerErrorException('Failed to send invoice email. Please check server email configuration.');
+    }
+
     return { message: 'Email sent' };
+  }
+
+  private getSigningSecret(): string {
+    return (
+      this.configService?.get<string>('INVOICE_LINK_SECRET') ||
+      this.configService?.get<string>('SECRET_KEY') ||
+      this.configService?.get<string>('JWT_SECRET') ||
+      'grehasoft-invoice-link-signing-secret-default'
+    );
+  }
+
+  private getBaseUrl(req?: any): string {
+    if (req) {
+      const host = req.get ? req.get('host') : req.headers?.host;
+      const protocol = req.protocol || (req.connection?.encrypted ? 'https' : 'http');
+      if (host) {
+        return `${protocol}://${host}`;
+      }
+    }
+    const configuredUrl =
+      this.configService?.get<string>('API_BASE_URL') ||
+      this.configService?.get<string>('SITE_URL');
+    if (configuredUrl) {
+      return configuredUrl.replace(/\/$/, '');
+    }
+    return 'http://localhost:3000';
+  }
+
+  async generateSecureLink(id: number, req?: any) {
+    const invoice = await this.prisma.invoice.findUnique({ where: { id } });
+    if (!invoice) throw new NotFoundException('Invoice not found');
+
+    const secret = this.getSigningSecret();
+    const token = InvoiceSigning.generateToken(id, secret, 172800);
+    const baseUrl = this.getBaseUrl(req);
+    const securePdfLink = `${baseUrl}/api/v1/invoices/public/${encodeURIComponent(token)}/download/`;
+
+    return { secure_pdf_link: securePdfLink };
+  }
+
+  async generatePdfStreamFromPublicToken(token: string): Promise<{ pdfBuffer: Buffer; filename: string }> {
+    const secret = this.getSigningSecret();
+    const verification = InvoiceSigning.verifyToken(token, secret);
+
+    if (!verification.valid || !verification.invoiceId) {
+      throw new ForbiddenException(verification.error || 'Invalid or expired signature token.');
+    }
+
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: verification.invoiceId },
+      include: {
+        client: true,
+        items: true,
+        payments: true,
+      },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException('Invoice not found');
+    }
+
+    const formattedInvoice = this.formatInvoice(invoice);
+    const pdfBuffer = await this.pdfService.generateInvoicePdf(formattedInvoice);
+    const filename = `invoice_${(formattedInvoice.invoice_number || 'INV').replace(/\//g, '_')}.pdf`;
+
+    return { pdfBuffer, filename };
+  }
+
+  async previewPdf(body: any): Promise<Buffer> {
+    let clientObj: any = null;
+    if (body.client) {
+      const clientId = Number(body.client);
+      if (!isNaN(clientId) && clientId > 0) {
+        clientObj = await this.prisma.client.findUnique({ where: { id: clientId } });
+      }
+    }
+
+    const itemsData = body.items || [];
+    let subtotal = 0;
+    const formattedItems = [];
+
+    for (const item of itemsData) {
+      const qty = Number(item.quantity || 1);
+      const rate = Number(item.rate || 0);
+      const amount = qty * rate;
+      subtotal += amount;
+      formattedItems.push({
+        description: item.description || '',
+        quantity: qty,
+        rate,
+        amount,
+      });
+    }
+
+    const tax = Number(body.tax || 0);
+    const discount = Number(body.discount || 0);
+    const total = Math.max(subtotal + tax - discount, 0);
+    const advance = Number(body.advance || 0);
+    const balance = Math.max(total - advance, 0);
+
+    const rawDueDate = body.due_date !== undefined ? body.due_date : body.dueDate;
+    const dueDateStr = rawDueDate && String(rawDueDate).trim() !== '' && String(rawDueDate).trim().toLowerCase() !== 'null'
+      ? String(rawDueDate).trim()
+      : null;
+
+    const previewInvoiceData = {
+      invoice_number: body.invoice_number || body.invoiceNumber || 'PREVIEW',
+      issue_date: body.issue_date || body.issueDate || new Date().toISOString().split('T')[0],
+      due_date: dueDateStr,
+      status: advance >= total && total > 0 ? 'paid' : advance > 0 ? 'partial' : 'unpaid',
+      subtotal,
+      tax,
+      total,
+      advance,
+      total_paid: advance,
+      balance,
+      notes: body.notes || '',
+      client: {
+        name: clientObj?.name || (typeof body.client === 'string' ? body.client : ''),
+        company_name: clientObj?.company_name || '',
+        email: clientObj?.email || '',
+        phone: clientObj?.phone || '',
+        address: (body.client_address !== undefined && body.client_address !== null && String(body.client_address).trim() !== '')
+          ? String(body.client_address).trim()
+          : (clientObj?.address || ''),
+        gst_no: clientObj?.gst_no || '',
+      },
+      items: formattedItems,
+      payments: advance > 0 ? [{
+        amount: advance,
+        payment_date: body.issue_date || new Date().toISOString().split('T')[0],
+        payment_mode: 'advance',
+        notes: 'Advance Received',
+      }] : [],
+    };
+
+    return this.pdfService.generateInvoicePdf(previewInvoiceData);
   }
 }

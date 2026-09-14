@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Put, Patch, Delete, Param, Query, Body, UseGuards, ParseIntPipe, HttpCode, HttpStatus, Res } from '@nestjs/common';
+import { Controller, Get, Post, Put, Patch, Delete, Param, Query, Body, UseGuards, ParseIntPipe, HttpCode, HttpStatus, Res, Req } from '@nestjs/common';
 import { Response } from 'express';
 import { InvoicesService } from './invoices.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
+import { Public } from '../../core/decorators/public.decorator';
 
 @Controller('api/v1/invoices')
 @UseGuards(JwtAuthGuard)
@@ -25,9 +26,22 @@ export class InvoicesController {
     return this.invoicesService.getAnalytics(user);
   }
 
+  @Public()
+  @Get(['public/:token/download', 'public/:token/download/'])
+  async downloadPublicPdf(
+    @Param('token') token: string,
+    @Res() res: Response,
+  ) {
+    const { pdfBuffer, filename } = await this.invoicesService.generatePdfStreamFromPublicToken(token);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(pdfBuffer);
+  }
+
   @Get([':id/secure-link', ':id/secure-link/'])
-  async getSecureLink(@Param('id', ParseIntPipe) id: number) {
-    return { secure_pdf_link: `/api/v1/invoices/${id}/download/` };
+  async getSecureLink(@Param('id', ParseIntPipe) id: number, @Req() req: any) {
+    return this.invoicesService.generateSecureLink(id, req);
   }
 
   @Get([':id/download', ':id/download/'])
@@ -42,6 +56,14 @@ export class InvoicesController {
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(pdfBuffer);
+  }
+
+  @Post(['preview', 'preview/'])
+  async previewPdf(@Body() body: any, @Res() res: Response) {
+    const pdfBuffer = await this.invoicesService.previewPdf(body);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="invoice_preview.pdf"');
     res.send(pdfBuffer);
   }
 

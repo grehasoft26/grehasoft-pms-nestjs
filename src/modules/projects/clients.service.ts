@@ -122,8 +122,8 @@ export class ClientsService {
   }
 
   async create(body: any) {
-    if (!body.name || !body.name.trim()) {
-      throw new BadRequestException({ contact_person: ['Contact person name is required.'] });
+    if (!body.company_name || !body.company_name.trim()) {
+      throw new BadRequestException({ company_name: ['Company name is required.'] });
     }
 
     const emailVal = body.email ? body.email.trim() : '';
@@ -138,10 +138,10 @@ export class ClientsService {
 
     const client = await this.prisma.client.create({
       data: {
-        name: body.name.trim(),
+        name: body.name ? body.name.trim() : '',
         email: emailVal,
         phone: body.phone || '',
-        company_name: body.company_name ? body.company_name.trim() : '',
+        company_name: body.company_name.trim(),
         gst_no: body.gst_number || body.gst_no || null,
         address: body.address || '',
         status: body.status || 'active',
@@ -168,11 +168,14 @@ export class ClientsService {
     }
 
     const data: any = {};
-    if (body.name !== undefined) {
-      if (!body.name || !body.name.trim()) {
-        throw new BadRequestException({ contact_person: ['Contact person name is required.'] });
+    if (body.company_name !== undefined) {
+      if (!body.company_name || !body.company_name.trim()) {
+        throw new BadRequestException({ company_name: ['Company name is required.'] });
       }
-      data.name = body.name.trim();
+      data.company_name = body.company_name.trim();
+    }
+    if (body.name !== undefined) {
+      data.name = body.name ? body.name.trim() : '';
     }
     if (body.email !== undefined) {
       const emailVal = body.email ? body.email.trim() : '';
@@ -187,7 +190,6 @@ export class ClientsService {
       data.email = emailVal;
     }
     if (body.phone !== undefined) data.phone = body.phone;
-    if (body.company_name !== undefined) data.company_name = body.company_name ? body.company_name.trim() : '';
     if (body.gst_number !== undefined || body.gst_no !== undefined) {
       data.gst_no = body.gst_number || body.gst_no || null;
     }
