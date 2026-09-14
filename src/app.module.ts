@@ -18,6 +18,7 @@ import { TrackingModule } from './modules/tracking/tracking.module';
 import { RemindersModule } from './modules/reminders/reminders.module';
 import { ClientPortalModule } from './modules/client-portal/client-portal.module';
 import { ReportsModule } from './modules/reports/reports.module';
+import { BackupsModule } from './modules/backups/backups.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { ReportsModule } from './modules/reports/reports.module';
     RemindersModule,
     ClientPortalModule,
     ReportsModule,
+    BackupsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

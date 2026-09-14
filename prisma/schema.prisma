@@ -190,6 +190,18 @@ enum TrackingActivityType {
   offline
 }
 
+enum BackupType {
+  FULL_SYSTEM
+  CATEGORY
+}
+
+enum BackupStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
 // ------------------------------------------------------------------------------
 // MODELS / TABLES (49 TABLES MATCHING ALL 49 DJANGO MODELS)
 // ------------------------------------------------------------------------------
@@ -304,6 +316,7 @@ model User {
 
   reminders            Reminder[]
   client_notifications ClientNotification[]
+  created_backups      BackupRecord[]       @relation("CreatedBackups")
 
   @@map("users")
 }
@@ -1188,3 +1201,23 @@ model ClientNotification {
 
   @@map("client_notifications")
 }
+
+model BackupRecord {
+  id                  Int          @id @default(autoincrement())
+  filename            String       @db.VarChar(255)
+  backup_type         BackupType
+  selected_categories Json?
+  status              BackupStatus @default(PENDING)
+  size_bytes          BigInt?
+  created_by_id       Int
+  created_at          DateTime     @default(now()) @db.DateTime(3)
+  completed_at        DateTime?    @db.DateTime(3)
+  error_message       String?      @db.Text
+
+  created_by User @relation("CreatedBackups", fields: [created_by_id], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@index([created_at])
+  @@map("backup_records")
+}
+

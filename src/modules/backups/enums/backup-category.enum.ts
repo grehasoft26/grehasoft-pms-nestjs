@@ -1,0 +1,8 @@
+export enum BackupCategory {
+  FINANCE = 'FINANCE',
+  CLIENTS = 'CLIENTS',
+  OPERATIONS = 'OPERATIONS',
+  HR = 'HR',
+  DOCUMENTS = 'DOCUMENTS',
+  CUSTOM = 'CUSTOM',
+}
