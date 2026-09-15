@@ -739,6 +739,41 @@ describe('InvoicesService', () => {
     });
   });
 
+  describe('getInvoicePdfFilename', () => {
+    it('should format filename with sanitized company_name when company_name is present', () => {
+      const inv = {
+        invoice_number: 'GSI/2026-27/008',
+        client_details: { company_name: 'Qwerty' },
+      };
+      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_Qwerty_GSI_2026-27_008.pdf');
+    });
+
+    it('should convert spaces and special characters in company_name to underscores', () => {
+      const inv = {
+        invoice_number: 'GSI/2026-27/112',
+        client_details: { company_name: 'ABC Company' },
+      };
+      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_ABC_Company_GSI_2026-27_112.pdf');
+    });
+
+    it('should truncate company_name to 30 characters maximum', () => {
+      const inv = {
+        invoice_number: 'GSI/2026-27/115',
+        client_details: { company_name: 'Forum Business Center LLC & International Traders' },
+      };
+      const res = service.getInvoicePdfFilename(inv);
+      expect(res).toBe('invoice_Forum_Business_Center_LLC_Inte_GSI_2026-27_115.pdf');
+    });
+
+    it('should fall back to invoice_{invoice_number}.pdf if company_name is missing', () => {
+      const inv = {
+        invoice_number: 'GSI/2026-27/001',
+        client_details: { company_name: '' },
+      };
+      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_GSI_2026-27_001.pdf');
+    });
+  });
+
   describe('previewPdf for unsaved invoices', () => {
     it('1. should generate PDF buffer for single item invoice without database persistence', async () => {
       mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Client Preview', address: 'Master Addr' });

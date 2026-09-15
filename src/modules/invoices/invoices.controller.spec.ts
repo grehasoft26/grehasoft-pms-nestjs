@@ -21,6 +21,15 @@ describe('InvoicesController', () => {
       pdfBuffer: Buffer.from('%PDF-1.4 ... mock pdf content'),
       filename: 'invoice_GSI_2026-27_001.pdf',
     }),
+    getInvoicePdfFilename: jest.fn().mockImplementation((inv: any) => {
+      const safeInvoiceNum = (inv?.invoice_number || 'INV').replace(/\//g, '_');
+      const companyName = inv?.client_details?.company_name || inv?.client?.company_name || inv?.company_name || '';
+      if (companyName) {
+        const sanitized = String(companyName).trim().replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+        return `invoice_${sanitized}_${safeInvoiceNum}.pdf`;
+      }
+      return `invoice_${safeInvoiceNum}.pdf`;
+    }),
     previewPdf: jest.fn().mockResolvedValue(Buffer.from('%PDF-1.4 ... mock pdf content')),
     sendEmail: jest.fn(),
   };

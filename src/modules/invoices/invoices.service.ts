@@ -535,6 +535,38 @@ export class InvoicesService {
     return { secure_pdf_link: securePdfLink };
   }
 
+  getInvoicePdfFilename(invoice: any): string {
+    const safeInvoiceNum = (invoice?.invoice_number || 'INV').replace(/\//g, '_');
+
+    const rawCompanyName =
+      invoice?.client_details?.company_name ||
+      invoice?.client?.company_name ||
+      (typeof invoice?.client === 'object' && invoice?.client?.company_name) ||
+      invoice?.company_name ||
+      '';
+
+    const companyNameStr = String(rawCompanyName).trim();
+
+    if (!companyNameStr) {
+      return `invoice_${safeInvoiceNum}.pdf`;
+    }
+
+    let sanitizedCompany = companyNameStr
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '');
+
+    if (sanitizedCompany.length > 30) {
+      sanitizedCompany = sanitizedCompany.substring(0, 30).replace(/_+$/g, '');
+    }
+
+    if (!sanitizedCompany) {
+      return `invoice_${safeInvoiceNum}.pdf`;
+    }
+
+    return `invoice_${sanitizedCompany}_${safeInvoiceNum}.pdf`;
+  }
+
   async generatePdfStreamFromPublicToken(token: string): Promise<{ pdfBuffer: Buffer; filename: string }> {
     const secret = this.getSigningSecret();
     const verification = InvoiceSigning.verifyToken(token, secret);
@@ -558,7 +590,7 @@ export class InvoicesService {
 
     const formattedInvoice = this.formatInvoice(invoice);
     const pdfBuffer = await this.pdfService.generateInvoicePdf(formattedInvoice);
-    const filename = `invoice_${(formattedInvoice.invoice_number || 'INV').replace(/\//g, '_')}.pdf`;
+    const filename = this.getInvoicePdfFilename(formattedInvoice);
 
     return { pdfBuffer, filename };
   }

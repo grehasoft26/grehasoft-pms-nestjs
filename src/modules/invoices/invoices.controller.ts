@@ -52,7 +52,7 @@ export class InvoicesController {
   ) {
     const invoice = await this.invoicesService.findOne(id, user);
     const pdfBuffer = await this.invoicesService.generatePdfStream(id, user);
-    const filename = `invoice_${(invoice.invoice_number || 'INV').replace(/\//g, '_')}.pdf`;
+    const filename = this.invoicesService.getInvoicePdfFilename(invoice);
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
