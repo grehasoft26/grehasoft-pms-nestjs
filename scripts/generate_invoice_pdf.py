@@ -207,10 +207,26 @@ def generate_invoice_pdf(invoice, media_root=""):
     p.setFont("Poppins", 10)
     p.drawString(65, y, f"Invoice No : {invoice.invoice_number}")
     
-    right_x = 350
-    p.drawString(right_x, y, f"Issue Date : {invoice.issue_date}")
+    date_table_data = [
+        ["Issue Date", ":", str(invoice.issue_date)]
+    ]
     if invoice.due_date:
-        p.drawString(right_x, y - 16, f"Due Date : {invoice.due_date}")
+        date_table_data.append(["Due Date", ":", str(invoice.due_date)])
+
+    date_table = Table(date_table_data, colWidths=[58, 8, 70])
+    date_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'Poppins'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+        ('TOPPADDING', (0, 0), (-1, -1), 1),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    dw, dh = date_table.wrap(136, height)
+    date_table.drawOn(p, width - 65 - dw, y - dh + 9)
+    if invoice.due_date:
         y -= 32
     else:
         y -= 16
