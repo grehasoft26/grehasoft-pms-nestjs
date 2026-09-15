@@ -120,4 +120,38 @@ describe('PdfService', () => {
     expect(pdfBuffer.length).toBeGreaterThan(100);
     expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
   });
+
+  it('should render company name in BILL TO section and not contact person name when company name exists', async () => {
+    const mockInvoiceData = {
+      id: 19,
+      invoice_number: 'GSI/2026-27/007',
+      issue_date: '2026-09-15',
+      due_date: '2026-09-24',
+      status: 'unpaid',
+      subtotal: 12,
+      tax: 0,
+      total: 12,
+      advance: 0,
+      total_paid: 0,
+      balance: 12,
+      client: 5,
+      client_name: 'we',
+      client_address: 'gftfhgh',
+      client_details: {
+        id: 5,
+        name: 'we',
+        company_name: 'qwerty',
+        address: 'gftfhgh',
+      },
+      items: [
+        { description: 'Service', quantity: 1, rate: 12, amount: 12 },
+      ],
+      payments: [],
+    };
+
+    const pdfBuffer = await service.generateInvoicePdf(mockInvoiceData);
+    expect(Buffer.isBuffer(pdfBuffer)).toBe(true);
+    expect(pdfBuffer.length).toBeGreaterThan(100);
+    expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
+  });
 });

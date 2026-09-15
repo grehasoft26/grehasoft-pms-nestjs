@@ -29,6 +29,13 @@ def setup_poppins_fonts():
     if os.path.exists(bold_path):
         pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
 
+    if os.path.exists(reg_path) and os.path.exists(bold_path):
+        from reportlab.pdfbase.pdfmetrics import registerFontFamily
+        try:
+            registerFontFamily("Poppins", normal="Poppins", bold="Poppins-Bold", italic="Poppins", boldItalic="Poppins-Bold")
+        except Exception:
+            pass
+
 def find_asset(media_root, filename):
     paths = [
         os.path.join(media_root, filename),
@@ -109,7 +116,11 @@ class MockInvoice:
         
         client_data = data.get('client') or {}
         if not isinstance(client_data, dict):
-            client_data = {}
+            client_data = data.get('client_details') or {}
+            if not isinstance(client_data, dict):
+                client_data = {}
+        if not client_data.get('company_name') and data.get('company_name'):
+            client_data['company_name'] = data.get('company_name')
         if not client_data.get('name') and data.get('client_name'):
             client_data['name'] = data.get('client_name')
         if not client_data.get('phone') and data.get('client_phone'):
@@ -195,12 +206,14 @@ def generate_invoice_pdf(invoice, media_root=""):
     # -----------------------------
     p.setFont("Poppins", 10)
     p.drawString(65, y, f"Invoice No : {invoice.invoice_number}")
-    p.drawString(65, y - 16, f"Issue Date : {invoice.issue_date}")
+    
+    right_x = 350
+    p.drawString(right_x, y, f"Issue Date : {invoice.issue_date}")
     if invoice.due_date:
-        p.drawString(65, y - 32, f"Due Date : {invoice.due_date}")
-        y -= 48
-    else:
+        p.drawString(right_x, y - 16, f"Due Date : {invoice.due_date}")
         y -= 32
+    else:
+        y -= 16
 
     # Top separator line
     p.setStrokeColor(colors.HexColor("#e2e8f0"))
@@ -222,17 +235,15 @@ def generate_invoice_pdf(invoice, media_root=""):
 
     client = invoice.client
     bill_to_lines = []
-    if client.company_name and client.company_name.strip() != (client.name or "").strip():
-        bill_to_lines.append(f"<b>{client.company_name}</b>")
-    if client.name:
-        bill_to_lines.append(f"{client.name}")
-    if client.email:
-        bill_to_lines.append(f"Email: {client.email}")
+    display_name = (client.company_name or "").strip()
+    if not display_name:
+        display_name = (client.name or "").strip()
+
+    if display_name:
+        bill_to_lines.append(f"<b>{display_name}</b>")
     if client.address:
         addr_clean = client.address.replace("\n", "<br/>").replace("\r", "")
         bill_to_lines.append(f"{addr_clean}")
-    if client.gst_no:
-        bill_to_lines.append(f"GSTIN: {client.gst_no}")
 
     bill_to_html = "<br/>".join(bill_to_lines) if bill_to_lines else "Valued Client"
 
