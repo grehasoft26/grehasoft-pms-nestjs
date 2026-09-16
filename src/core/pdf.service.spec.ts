@@ -56,7 +56,7 @@ describe('PdfService', () => {
     );
   });
 
-  it('should generate invoice PDF buffer with discount and advance received', async () => {
+  it('should generate invoice PDF buffer with discount and amount received', async () => {
     const mockInvoiceData = {
       id: 17,
       invoice_number: 'GSI/2026-27/001',

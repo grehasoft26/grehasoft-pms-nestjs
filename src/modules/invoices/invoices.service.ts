@@ -659,7 +659,7 @@ export class InvoicesService {
         amount: advance,
         payment_date: body.issue_date || new Date().toISOString().split('T')[0],
         payment_mode: 'advance',
-        notes: 'Advance Received',
+        notes: 'Amount Received',
       }] : [],
     };
 

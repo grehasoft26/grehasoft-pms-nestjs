@@ -355,7 +355,7 @@ def generate_invoice_pdf(invoice, media_root=""):
             has_subsequent_payments = len(payments_prop or []) > 0
 
         if advance_val > 0 and not has_subsequent_payments:
-            payment_label = "Advance Received"
+            payment_label = "Amount Received"
         else:
             payment_label = "Amount Paid"
 
