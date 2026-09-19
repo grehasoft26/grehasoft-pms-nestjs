@@ -133,6 +133,7 @@ export class InvoicesService {
     const payments = (i.payments || []).map((p: any) => ({
       id: p.id,
       invoice: p.invoice_id,
+      receipt_number: p.receipt_number || null,
       amount: p.amount ? Number(p.amount) : 0,
       payment_date: p.payment_date ? p.payment_date.toISOString().split('T')[0] : null,
       payment_mode: p.payment_mode || 'cash',

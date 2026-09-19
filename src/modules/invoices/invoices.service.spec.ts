@@ -134,6 +134,30 @@ describe('InvoicesService', () => {
       expect(result.status).toBe('partial');
     });
 
+    it('3b. Should include receipt_number in payments mapped by findOne', async () => {
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        id: 33,
+        invoice_number: 'GSI/2026-27/033',
+        client_id: 1,
+        subtotal: 2000,
+        tax: 0,
+        total: 2000,
+        advance: 0,
+        due_date: futureDueDate,
+        payments: [
+          { id: 101, invoice_id: 33, receipt_number: 'RCT/2026-27/001', amount: 500, payment_date: new Date() },
+          { id: 102, invoice_id: 33, receipt_number: null, amount: 500, payment_date: new Date() },
+        ],
+        items: [],
+      });
+
+      const result = await service.findOne(33, adminUser);
+
+      expect(result.payments).toHaveLength(2);
+      expect(result.payments[0].receipt_number).toBe('RCT/2026-27/001');
+      expect(result.payments[1].receipt_number).toBeNull();
+    });
+
     it('4. Advance equal to total: total_paid = total, balance = 0, status = paid', async () => {
       mockPrismaService.invoice.findUnique.mockResolvedValue({
         id: 4,
