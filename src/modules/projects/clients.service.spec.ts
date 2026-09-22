@@ -63,6 +63,50 @@ describe('ClientsService', () => {
         mockClientsDb[where.id] = updated;
         return updated;
       }),
+
+      findMany: jest.fn().mockImplementation(async ({ where, skip, take }) => {
+        let clients = Object.values(mockClientsDb).filter((c: any) => c.deleted_at === null);
+        if (where?.OR && Array.isArray(where.OR)) {
+          clients = clients.filter((c: any) => {
+            return where.OR.some((condition: any) => {
+              for (const field of Object.keys(condition)) {
+                const val = c[field];
+                const searchStr = condition[field]?.contains;
+                if (val && searchStr && String(val).toLowerCase().includes(String(searchStr).toLowerCase())) {
+                  return true;
+                }
+              }
+              return false;
+            });
+          });
+        }
+        clients.sort((a: any, b: any) => b.id - a.id);
+        if (skip !== undefined || take !== undefined) {
+          const start = skip || 0;
+          const end = take ? start + take : undefined;
+          clients = clients.slice(start, end);
+        }
+        return clients;
+      }),
+
+      count: jest.fn().mockImplementation(async ({ where }) => {
+        let clients = Object.values(mockClientsDb).filter((c: any) => c.deleted_at === null);
+        if (where?.OR && Array.isArray(where.OR)) {
+          clients = clients.filter((c: any) => {
+            return where.OR.some((condition: any) => {
+              for (const field of Object.keys(condition)) {
+                const val = c[field];
+                const searchStr = condition[field]?.contains;
+                if (val && searchStr && String(val).toLowerCase().includes(String(searchStr).toLowerCase())) {
+                  return true;
+                }
+              }
+              return false;
+            });
+          });
+        }
+        return clients.length;
+      }),
     },
   };
 
@@ -80,6 +124,52 @@ describe('ClientsService', () => {
 
     service = module.get<ClientsService>(ClientsService);
     prisma = module.get(PrismaService);
+  });
+
+  describe('findAll', () => {
+    const adminUser = { id: 1, is_superuser: true, role: { name: 'SUPER_ADMIN' } };
+
+    beforeEach(async () => {
+      await service.create({ name: 'Rahul Nair', company_name: 'KSFE D H ROAD ERNAKULAM', email: 'ksfe@example.com', phone: '9847012345', gst_number: '32AAAAA0000A1Z5', address: 'MG Road Ernakulam' });
+      await service.create({ name: 'Anil Kumar', company_name: 'Tech Solutions', email: 'anil@tech.com', phone: '9847054321', gst_number: '32BBBBB1111B1Z6', address: 'Kaloor Kochi' });
+      await service.create({ name: 'Suresh Mani', company_name: 'Global Corp', email: 'suresh@global.com', phone: '9847099999', gst_number: '32CCCCC2222C1Z7', address: 'KSFE Building Thrissur' });
+    });
+
+    it('should search case-insensitively across company_name, name, email, phone, gst_no, and address', async () => {
+      // Search by company_name partial case-insensitive match
+      const res1: any = await service.findAll(adminUser, { search: 'ksfe' });
+      expect(res1.count).toBe(2); // Match KSFE D H ROAD ERNAKULAM and KSFE Building Thrissur
+      expect(res1.results.length).toBe(2);
+
+      // Search by GST number
+      const res2: any = await service.findAll(adminUser, { search: '32AAAAA' });
+      expect(res2.count).toBe(1);
+      expect(res2.results[0].company_name).toBe('KSFE D H ROAD ERNAKULAM');
+
+      // Search by Phone
+      const res3: any = await service.findAll(adminUser, { search: '54321' });
+      expect(res3.count).toBe(1);
+      expect(res3.results[0].name).toBe('Anil Kumar');
+
+      // Search by Address
+      const res4: any = await service.findAll(adminUser, { search: 'MG Road' });
+      expect(res4.count).toBe(1);
+      expect(res4.results[0].email).toBe('ksfe@example.com');
+    });
+
+    it('should return correct filtered count and paginated results for search', async () => {
+      const res: any = await service.findAll(adminUser, { search: 'ksfe', page: '1', limit: '1' });
+      expect(res.count).toBe(2);
+      expect(res.results.length).toBe(1);
+      expect(res.next).toContain('page=2');
+      expect(res.next).toContain('search=ksfe');
+    });
+
+    it('should return full list and total count when search is empty', async () => {
+      const res: any = await service.findAll(adminUser, { search: '', page: '1', limit: '10' });
+      expect(res.count).toBe(3);
+      expect(res.results.length).toBe(3);
+    });
   });
 
   describe('create', () => {

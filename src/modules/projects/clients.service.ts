@@ -32,15 +32,19 @@ export class ClientsService {
     };
   }
 
-  async findAll(user: any, query: { all?: string; search?: string; page?: string; limit?: string }) {
+  async findAll(user: any, query: { all?: string; search?: string; page?: string; limit?: string; page_size?: string }) {
     const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
-    if (query.search) {
+    if (query.search && query.search.trim() !== '') {
+      const searchTerm = query.search.trim();
       where.OR = [
-        { company_name: { contains: query.search, mode: 'insensitive' } },
-        { name: { contains: query.search, mode: 'insensitive' } },
-        { email: { contains: query.search, mode: 'insensitive' } },
+        { company_name: { contains: searchTerm } },
+        { name: { contains: searchTerm } },
+        { email: { contains: searchTerm } },
+        { phone: { contains: searchTerm } },
+        { gst_no: { contains: searchTerm } },
+        { address: { contains: searchTerm } },
       ];
     }
 
@@ -80,7 +84,7 @@ export class ClientsService {
     }
 
     const pageNum = Math.max(1, Number(query.page) || 1);
-    const limitNum = Math.max(1, Number(query.limit) || 5);
+    const limitNum = Math.max(1, Number(query.limit) || Number(query.page_size) || 5);
     const skip = (pageNum - 1) * limitNum;
 
     const count = await this.prisma.client.count({ where });
@@ -94,10 +98,11 @@ export class ClientsService {
     });
 
     const formatted = clients.map((c) => this.formatClient(c));
+    const searchParam = query.search && query.search.trim() !== '' ? `&search=${encodeURIComponent(query.search.trim())}` : '';
     return {
       count,
-      next: pageNum * limitNum < count ? `/api/clients?page=${pageNum + 1}` : null,
-      previous: pageNum > 1 ? `/api/clients?page=${pageNum - 1}` : null,
+      next: pageNum * limitNum < count ? `/api/clients?page=${pageNum + 1}${searchParam}` : null,
+      previous: pageNum > 1 ? `/api/clients?page=${pageNum - 1}${searchParam}` : null,
       results: formatted,
     };
   }
