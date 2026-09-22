@@ -273,6 +273,40 @@ describe('InvoicesService', () => {
       expect(result.balance).toBe(0); // Math.max(0, 2000 - 2200) = 0
       expect(result.status).toBe('paid');
     });
+
+    it('8. Should allow updating a fully paid invoice without throwing errors', async () => {
+      const paidInvoice = {
+        id: 99,
+        invoice_number: 'GSI/2026-27/099',
+        client_id: 1,
+        subtotal: 2000,
+        tax: 0,
+        total: 2000,
+        advance: 2000,
+        due_date: futureDueDate,
+        items: [],
+        payments: [],
+      };
+
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(paidInvoice)
+        .mockResolvedValueOnce({
+          ...paidInvoice,
+          notes: 'Updated notes for paid invoice',
+          client: { id: 1, name: 'Client A' },
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue({ ...paidInvoice, notes: 'Updated notes for paid invoice' });
+
+      const result = await service.update(99, adminUser, { notes: 'Updated notes for paid invoice' });
+
+      expect(mockPrismaService.invoice.update).toHaveBeenCalledWith({
+        where: { id: 99 },
+        data: expect.objectContaining({ notes: 'Updated notes for paid invoice' }),
+      });
+      expect(result.notes).toBe('Updated notes for paid invoice');
+      expect(result.status).toBe('paid');
+    });
   });
 
   describe('update client logic', () => {
