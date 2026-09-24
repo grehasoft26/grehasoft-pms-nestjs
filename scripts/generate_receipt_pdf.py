@@ -129,25 +129,24 @@ def generate_receipt_pdf(receipt, media_root=""):
     badge_color = colors.HexColor("#28a745")
     badge_width = 65
     badge_x = width - 50 - badge_width
-    badge_y = y - 3
+    badge_y = y - 10
 
     # -----------------------------
-    # RECEIPT & INVOICE META INFO
+    # RECEIPT META INFO
     # -----------------------------
     p.setFont("Poppins", 9.0)
     p.drawString(50, y, f"Receipt No : {receipt.receipt_number}")
-    p.drawString(195, y, f"Payment Date : {receipt.payment_date}")
-    p.drawString(335, y, f"Invoice No : {receipt.invoice_number}")
+    p.drawString(50, y - 16, f"Payment Date : {receipt.payment_date}")
 
     p.saveState()
     p.setFillColor(badge_color)
-    p.roundRect(badge_x, badge_y, badge_width, 16, 3, fill=1, stroke=0)
+    p.roundRect(badge_x, badge_y, badge_width, 18, 3, fill=1, stroke=0)
     p.setFillColor(colors.white)
-    p.setFont("Poppins-Bold", 8)
-    p.drawCentredString(badge_x + badge_width/2, badge_y + 4, status_display)
+    p.setFont("Poppins-Bold", 8.5)
+    p.drawCentredString(badge_x + badge_width/2, badge_y + 5, status_display)
     p.restoreState()
 
-    y -= 15
+    y -= 32
 
     # Top separator line
     p.setStrokeColor(colors.HexColor("#e2e8f0"))
@@ -218,19 +217,30 @@ def generate_receipt_pdf(receipt, media_root=""):
     # -----------------------------
     # SERVICE / PAYMENT TABLE
     # -----------------------------
+    desc_style = ParagraphStyle(
+        'ReceiptItemDescription',
+        parent=styles['Normal'],
+        fontName='Poppins',
+        fontSize=9,
+        leading=12,
+        textColor=colors.black
+    )
+
     table_data = [
         ["Description of Service", "Amount"]
     ]
 
     if receipt.items and len(receipt.items) > 0:
         for item in receipt.items:
+            clean_desc = str(item.description or '').replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
             table_data.append([
-                f"{item.description} (Qty: {item.quantity} @ Rs {item.rate:,.2f})",
+                Paragraph(clean_desc, desc_style) if clean_desc else "",
                 f"Rs {item.amount:,.2f}"
             ])
     else:
+        clean_desc = str(receipt.service_description or '').replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
         table_data.append([
-            receipt.service_description,
+            Paragraph(clean_desc, desc_style) if clean_desc else "",
             f"Rs {receipt.payment_amount:,.2f}"
         ])
 
@@ -241,10 +251,11 @@ def generate_receipt_pdf(receipt, media_root=""):
     received_row_idx = len(table_data)
     table_data.append(["Amount Received (Current Payment)", f"Rs {receipt.payment_amount:,.2f}"])
 
-    table = Table(table_data, colWidths=[350, 150])
+    table = Table(table_data, colWidths=[345, 150])
 
     items_count = len(receipt.items) if receipt.items else 1
     table_styles = [
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("GRID", (0, 0), (-1, items_count), 1, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),

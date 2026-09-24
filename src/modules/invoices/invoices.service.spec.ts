@@ -9,6 +9,7 @@ describe('InvoicesService', () => {
   let service: InvoicesService;
 
   const mockPrismaService = {
+    $transaction: jest.fn((cb: any) => cb(mockPrismaService)),
     invoice: {
       findFirst: jest.fn(),
       findMany: jest.fn(),
@@ -24,6 +25,9 @@ describe('InvoicesService', () => {
     invoiceItem: {
       create: jest.fn(),
       deleteMany: jest.fn(),
+    },
+    invoicePayment: {
+      create: jest.fn(),
     },
   };
 
@@ -803,7 +807,7 @@ describe('InvoicesService', () => {
         invoice_number: 'GSI/2026-27/008',
         client_details: { company_name: 'Qwerty' },
       };
-      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_Qwerty_GSI_2026-27_008.pdf');
+      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_GSI_2026-27_008_Qwerty.pdf');
     });
 
     it('should convert spaces and special characters in company_name to underscores', () => {
@@ -811,7 +815,7 @@ describe('InvoicesService', () => {
         invoice_number: 'GSI/2026-27/112',
         client_details: { company_name: 'ABC Company' },
       };
-      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_ABC_Company_GSI_2026-27_112.pdf');
+      expect(service.getInvoicePdfFilename(inv)).toBe('invoice_GSI_2026-27_112_ABC_Company.pdf');
     });
 
     it('should truncate company_name to 30 characters maximum', () => {
@@ -820,7 +824,7 @@ describe('InvoicesService', () => {
         client_details: { company_name: 'Forum Business Center LLC & International Traders' },
       };
       const res = service.getInvoicePdfFilename(inv);
-      expect(res).toBe('invoice_Forum_Business_Center_LLC_Inte_GSI_2026-27_115.pdf');
+      expect(res).toBe('invoice_GSI_2026-27_115_Forum_Business_Center_LLC_Inte.pdf');
     });
 
     it('should fall back to invoice_{invoice_number}.pdf if company_name is missing', () => {
@@ -958,6 +962,526 @@ describe('InvoicesService', () => {
 
       await expect(service.remove(999, adminUser)).rejects.toThrow('Invoice not found');
       expect(mockPrismaService.invoice.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Create and Edit Invoice Payment flows', () => {
+    beforeEach(() => {
+      mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Test Client' });
+    });
+
+    it('1. Create invoice with no payment (payment_amount = 0)', async () => {
+      const createdInvoice = {
+        id: 10,
+        invoice_number: 'GSI/2026-27/010',
+        client_id: 1,
+        subtotal: 5000,
+        tax: 0,
+        total: 5000,
+        advance: 0,
+        due_date: futureDueDate,
+      };
+
+      mockPrismaService.invoice.create.mockResolvedValue(createdInvoice);
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        ...createdInvoice,
+        client: { id: 1, name: 'Test Client' },
+        items: [],
+        payments: [],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        items: [{ description: 'Web Dev', quantity: 1, rate: 5000 }],
+        payment_amount: 0,
+      });
+
+      expect(mockPrismaService.invoice.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ advance: 0 }),
+      });
+      expect(mockPrismaService.invoicePayment.create).not.toHaveBeenCalled();
+      expect(result.advance).toBe(0);
+      expect(result.total_paid).toBe(0);
+      expect(result.balance).toBe(5000);
+      expect(result.status).toBe('unpaid');
+    });
+
+    it('2. Create invoice with partial payment (payment_amount = 2000, mode = UPI, date = 2026-09-20)', async () => {
+      const createdInvoice = {
+        id: 11,
+        invoice_number: 'GSI/2026-27/011',
+        client_id: 1,
+        subtotal: 5000,
+        tax: 0,
+        total: 5000,
+        advance: 0,
+        due_date: futureDueDate,
+      };
+
+      mockPrismaService.invoice.create.mockResolvedValue(createdInvoice);
+      mockPrismaService.invoicePayment.create.mockResolvedValue({
+        id: 1,
+        invoice_id: 11,
+        amount: 2000,
+        payment_mode: 'UPI',
+        payment_date: new Date('2026-09-20'),
+      });
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        ...createdInvoice,
+        client: { id: 1, name: 'Test Client' },
+        items: [],
+        payments: [
+          {
+            id: 1,
+            invoice_id: 11,
+            amount: 2000,
+            payment_mode: 'UPI',
+            payment_date: new Date('2026-09-20'),
+            receipt_number: null,
+          },
+        ],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        items: [{ description: 'Web Dev', quantity: 1, rate: 5000 }],
+        payment_amount: 2000,
+        payment_mode: 'UPI',
+        payment_date: '2026-09-20',
+      });
+
+      expect(mockPrismaService.invoice.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ advance: 0 }),
+      });
+      expect(mockPrismaService.invoicePayment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          invoice_id: 11,
+          amount: 2000,
+          payment_mode: 'UPI',
+          payment_date: new Date('2026-09-20'),
+          notes: 'Initial payment received on invoice creation',
+        }),
+      });
+      expect(result.advance).toBe(0);
+      expect(result.total_paid).toBe(2000);
+      expect(result.balance).toBe(3000);
+      expect(result.status).toBe('partial');
+    });
+
+    it('3. Create invoice with full payment (payment_amount = 5000)', async () => {
+      const createdInvoice = {
+        id: 12,
+        invoice_number: 'GSI/2026-27/012',
+        client_id: 1,
+        subtotal: 5000,
+        tax: 0,
+        total: 5000,
+        advance: 0,
+        due_date: futureDueDate,
+      };
+
+      mockPrismaService.invoice.create.mockResolvedValue(createdInvoice);
+      mockPrismaService.invoicePayment.create.mockResolvedValue({
+        id: 2,
+        invoice_id: 12,
+        amount: 5000,
+        payment_mode: 'Bank Transfer',
+        payment_date: new Date('2026-09-21'),
+      });
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        ...createdInvoice,
+        client: { id: 1, name: 'Test Client' },
+        items: [],
+        payments: [
+          {
+            id: 2,
+            invoice_id: 12,
+            amount: 5000,
+            payment_mode: 'Bank Transfer',
+            payment_date: new Date('2026-09-21'),
+            receipt_number: null,
+          },
+        ],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        items: [{ description: 'Web Dev', quantity: 1, rate: 5000 }],
+        payment_amount: 5000,
+        payment_mode: 'Bank Transfer',
+        payment_date: '2026-09-21',
+      });
+
+      expect(mockPrismaService.invoicePayment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          invoice_id: 12,
+          amount: 5000,
+          payment_mode: 'Bank Transfer',
+        }),
+      });
+      expect(result.total_paid).toBe(5000);
+      expect(result.balance).toBe(0);
+      expect(result.status).toBe('paid');
+    });
+
+    it('4. Edit invoice with no new payment (new_payment_amount = 0)', async () => {
+      const existingInvoice = {
+        id: 20,
+        invoice_number: 'GSI/2026-27/020',
+        client_id: 1,
+        subtotal: 5000,
+        tax: 0,
+        total: 5000,
+        advance: 0,
+        due_date: futureDueDate,
+        items: [],
+        payments: [],
+      };
+
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          notes: 'Updated note',
+          client: { id: 1, name: 'Test Client' },
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue({
+        ...existingInvoice,
+        notes: 'Updated note',
+      });
+
+      const result = await service.update(20, adminUser, {
+        notes: 'Updated note',
+        new_payment_amount: 0,
+      });
+
+      expect(mockPrismaService.invoicePayment.create).not.toHaveBeenCalled();
+      expect(result.notes).toBe('Updated note');
+    });
+
+    it('5. Edit invoice with new partial payment (new_payment_amount = 1500, mode = Cash, date = 2026-09-22)', async () => {
+      const existingInvoice = {
+        id: 21,
+        invoice_number: 'GSI/2026-27/021',
+        client_id: 1,
+        subtotal: 5000,
+        tax: 0,
+        total: 5000,
+        advance: 1000, // Legacy advance
+        due_date: futureDueDate,
+        items: [],
+        payments: [
+          { id: 100, invoice_id: 21, amount: 1000, payment_mode: 'UPI', payment_date: new Date('2026-09-15') },
+        ],
+      };
+
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          client: { id: 1, name: 'Test Client' },
+          payments: [
+            { id: 100, invoice_id: 21, amount: 1000, payment_mode: 'UPI', payment_date: new Date('2026-09-15') },
+            { id: 101, invoice_id: 21, amount: 1500, payment_mode: 'Cash', payment_date: new Date('2026-09-22') },
+          ],
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue({
+        ...existingInvoice,
+      });
+
+      mockPrismaService.invoicePayment.create.mockResolvedValue({
+        id: 101,
+        invoice_id: 21,
+        amount: 1500,
+        payment_mode: 'Cash',
+        payment_date: new Date('2026-09-22'),
+      });
+
+      const result = await service.update(21, adminUser, {
+        new_payment_amount: 1500,
+        new_payment_mode: 'Cash',
+        new_payment_date: '2026-09-22',
+      });
+
+      expect(mockPrismaService.invoice.update).toHaveBeenCalledWith({
+        where: { id: 21 },
+        data: expect.not.objectContaining({ advance: expect.anything() }),
+      });
+      expect(mockPrismaService.invoicePayment.create).toHaveBeenCalledTimes(1);
+      expect(mockPrismaService.invoicePayment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          invoice_id: 21,
+          amount: 1500,
+          payment_mode: 'Cash',
+          payment_date: new Date('2026-09-22'),
+          notes: 'Payment received during invoice update',
+        }),
+      });
+      // Legacy advance (1000) + Payment 1 (1000) + Payment 2 (1500) = 3500 paid
+      expect(result.advance).toBe(1000);
+      expect(result.total_paid).toBe(3500);
+      expect(result.balance).toBe(1500);
+      expect(result.status).toBe('partial');
+    });
+
+    it('6. Edit invoice with Full Amount (new_payment_amount = balance due)', async () => {
+      const existingInvoice = {
+        id: 22,
+        invoice_number: 'GSI/2026-27/022',
+        client_id: 1,
+        subtotal: 5000,
+        tax: 0,
+        total: 5000,
+        advance: 1000,
+        due_date: futureDueDate,
+        items: [],
+        payments: [
+          { id: 100, invoice_id: 22, amount: 1000 }, // Balance due was 3000
+        ],
+      };
+
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          client: { id: 1, name: 'Test Client' },
+          payments: [
+            { id: 100, invoice_id: 22, amount: 1000 },
+            { id: 102, invoice_id: 22, amount: 3000 },
+          ],
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue(existingInvoice);
+      mockPrismaService.invoicePayment.create.mockResolvedValue({
+        id: 102,
+        invoice_id: 22,
+        amount: 3000,
+      });
+
+      const result = await service.update(22, adminUser, {
+        new_payment_amount: 3000, // Current balance due
+      });
+
+      expect(mockPrismaService.invoicePayment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          invoice_id: 22,
+          amount: 3000,
+        }),
+      });
+      expect(result.total_paid).toBe(5000);
+      expect(result.balance).toBe(0);
+      expect(result.status).toBe('paid');
+    });
+
+    it('7. Legacy advance + existing payments + new payment without double-counting', async () => {
+      const existingInvoice = {
+        id: 23,
+        invoice_number: 'GSI/2026-27/023',
+        client_id: 1,
+        subtotal: 10000,
+        tax: 0,
+        total: 10000,
+        advance: 2000,
+        due_date: futureDueDate,
+        items: [],
+        payments: [
+          { id: 200, invoice_id: 23, amount: 3000 },
+        ],
+      };
+
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          client: { id: 1, name: 'Test Client' },
+          payments: [
+            { id: 200, invoice_id: 23, amount: 3000 },
+            { id: 201, invoice_id: 23, amount: 1500 },
+          ],
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue(existingInvoice);
+
+      const result = await service.update(23, adminUser, {
+        new_payment_amount: 1500,
+      });
+
+      // advance (2000) + payment 1 (3000) + payment 2 (1500) = 6500 total paid
+      expect(result.advance).toBe(2000);
+      expect(result.total_paid).toBe(6500);
+      expect(result.balance).toBe(3500);
+    });
+
+    it('8. Database transaction wraps invoice and payment creation atomically', async () => {
+      const createdInvoice = {
+        id: 30,
+        invoice_number: 'GSI/2026-27/030',
+        client_id: 1,
+        total: 5000,
+        advance: 0,
+      };
+
+      mockPrismaService.invoice.create.mockResolvedValue(createdInvoice);
+      mockPrismaService.invoicePayment.create.mockRejectedValue(new Error('DB Payment Insert Failed'));
+
+      await expect(
+        service.create(adminUser, {
+          client: 1,
+          items: [{ description: 'Service', quantity: 1, rate: 5000 }],
+          payment_amount: 1000,
+        }),
+      ).rejects.toThrow('DB Payment Insert Failed');
+
+      expect(mockPrismaService.$transaction).toHaveBeenCalled();
+    });
+  });
+
+  describe('Create Invoice initial payment creation', () => {
+    it('creates invoice with advance = 0 and an InvoicePayment record when payment_amount = 150', async () => {
+      mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Test Client' });
+      mockPrismaService.invoice.create.mockResolvedValue({
+        id: 50,
+        invoice_number: 'GSI/2026-27/050',
+        client_id: 1,
+        subtotal: 200,
+        tax: 0,
+        total: 200,
+        advance: 0,
+        due_date: futureDueDate,
+      });
+
+      mockPrismaService.invoicePayment.create.mockResolvedValue({
+        id: 1,
+        invoice_id: 50,
+        amount: 150,
+        payment_date: new Date(),
+        payment_mode: 'cash',
+      });
+
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        id: 50,
+        invoice_number: 'GSI/2026-27/050',
+        client_id: 1,
+        client: { id: 1, name: 'Test Client' },
+        subtotal: 200,
+        tax: 0,
+        total: 200,
+        advance: 0,
+        due_date: futureDueDate,
+        items: [],
+        payments: [
+          {
+            id: 1,
+            invoice_id: 50,
+            amount: 150,
+            payment_date: new Date(),
+            payment_mode: 'cash',
+          },
+        ],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        items: [{ description: 'Test Item', quantity: 1, rate: 200 }],
+        payment_amount: 150,
+      });
+
+      expect(mockPrismaService.invoice.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ advance: 0 }),
+      });
+      expect(mockPrismaService.invoicePayment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          invoice_id: 50,
+          amount: 150,
+        }),
+      });
+      expect(result.advance).toBe(0);
+      expect(result.payments).toHaveLength(1);
+      expect(result.payments[0].amount).toBe(150);
+      expect(result.total_paid).toBe(150);
+      expect(result.balance).toBe(50);
+    });
+
+    it('does not create an InvoicePayment record when payment_amount = 0', async () => {
+      mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Test Client' });
+      mockPrismaService.invoice.create.mockResolvedValue({
+        id: 51,
+        invoice_number: 'GSI/2026-27/051',
+        client_id: 1,
+        subtotal: 200,
+        tax: 0,
+        total: 200,
+        advance: 0,
+        due_date: futureDueDate,
+      });
+
+      mockPrismaService.invoice.findUnique.mockResolvedValue({
+        id: 51,
+        invoice_number: 'GSI/2026-27/051',
+        client_id: 1,
+        client: { id: 1, name: 'Test Client' },
+        subtotal: 200,
+        tax: 0,
+        total: 200,
+        advance: 0,
+        due_date: futureDueDate,
+        items: [],
+        payments: [],
+      });
+
+      const result = await service.create(adminUser, {
+        client: 1,
+        items: [{ description: 'Test Item', quantity: 1, rate: 200 }],
+        payment_amount: 0,
+      });
+
+      expect(mockPrismaService.invoicePayment.create).not.toHaveBeenCalled();
+      expect(result.advance).toBe(0);
+      expect(result.payments).toHaveLength(0);
+      expect(result.total_paid).toBe(0);
+      expect(result.balance).toBe(200);
+    });
+
+    it('updating advance on edit invoice updates invoice.advance without creating an InvoicePayment record', async () => {
+      const existingInvoice = {
+        id: 52,
+        invoice_number: 'GSI/2026-27/052',
+        client_id: 1,
+        subtotal: 500,
+        tax: 0,
+        total: 500,
+        advance: 100,
+        due_date: futureDueDate,
+        items: [],
+        payments: [],
+      };
+
+      mockPrismaService.invoice.findUnique
+        .mockResolvedValueOnce(existingInvoice)
+        .mockResolvedValueOnce({
+          ...existingInvoice,
+          advance: 150,
+          client: { id: 1, name: 'Test Client' },
+        });
+
+      mockPrismaService.invoice.update.mockResolvedValue({
+        ...existingInvoice,
+        advance: 150,
+      });
+
+      const result = await service.update(52, adminUser, {
+        advance: 150,
+      });
+
+      expect(mockPrismaService.invoice.update).toHaveBeenCalledWith({
+        where: { id: 52 },
+        data: expect.objectContaining({ advance: 150 }),
+      });
+      expect(mockPrismaService.invoicePayment.create).not.toHaveBeenCalled();
+      expect(result.advance).toBe(150);
+      expect(result.total_paid).toBe(150);
     });
   });
 });

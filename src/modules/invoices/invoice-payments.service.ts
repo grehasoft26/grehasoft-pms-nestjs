@@ -44,29 +44,24 @@ export class InvoicePaymentsService {
     return this.acquireLock(async () => {
       const existing = await this.prisma.invoicePayment.findUnique({
         where: { id: paymentId },
-        select: { receipt_number: true, payment_date: true },
+        select: {
+          receipt_number: true,
+          payment_date: true,
+          invoice_id: true,
+          invoice: {
+            select: { invoice_number: true },
+          },
+        },
       });
       if (!existing) throw new NotFoundException('Invoice payment not found');
       if (existing.receipt_number) {
         return existing.receipt_number;
       }
 
-      const payDate = existing.payment_date || new Date();
-      const year = payDate.getFullYear();
-      const month = payDate.getMonth() + 1;
-
-      let fiscalYearStr = '';
-      if (month >= 4) {
-        const nextYr = (year + 1) % 100;
-        fiscalYearStr = `${year}-${String(nextYr).padStart(2, '0')}`;
-      } else {
-        const prevYr = year - 1;
-        const curYr = year % 100;
-        fiscalYearStr = `${prevYr}-${String(curYr).padStart(2, '0')}`;
-      }
-
-      const prefix = `RCT/${fiscalYearStr}/`;
-      const lockKey = `receipt_lock_${fiscalYearStr.replace('-', '_')}`;
+      const rawInvoiceNum = existing.invoice?.invoice_number || `INV-${existing.invoice_id}`;
+      const sanitizedInvNum = rawInvoiceNum.replace(/\//g, '-');
+      const prefix = `RCT/${sanitizedInvNum}/`;
+      const lockKey = `receipt_lock_inv_${existing.invoice_id}`;
 
       let mysqlLockAcquired = false;
       try {
@@ -91,6 +86,7 @@ export class InvoicePaymentsService {
 
         const existingPayments = await this.prisma.invoicePayment.findMany({
           where: {
+            invoice_id: existing.invoice_id,
             receipt_number: { startsWith: prefix },
           },
           select: { receipt_number: true },
@@ -98,19 +94,17 @@ export class InvoicePaymentsService {
 
         let maxNum = 0;
         for (const ep of existingPayments) {
-          if (ep.receipt_number) {
-            const parts = ep.receipt_number.split('/');
-            if (parts.length === 3) {
-              const num = parseInt(parts[2], 10);
-              if (!isNaN(num) && num > maxNum) {
-                maxNum = num;
-              }
+          if (ep.receipt_number && ep.receipt_number.startsWith(prefix)) {
+            const seqStr = ep.receipt_number.slice(prefix.length);
+            const num = parseInt(seqStr, 10);
+            if (!isNaN(num) && num > maxNum) {
+              maxNum = num;
             }
           }
         }
 
         const nextNum = maxNum + 1;
-        const candidateReceiptNumber = `${prefix}${String(nextNum).padStart(3, '0')}`;
+        const candidateReceiptNumber = `${prefix}${String(nextNum).padStart(2, '0')}`;
 
         const updated = await this.prisma.invoicePayment.update({
           where: { id: paymentId },
@@ -185,10 +179,41 @@ export class InvoicePaymentsService {
     };
 
     const pdfBuffer = await this.pdfService.generateReceiptPdf(receiptData);
-    const safeNumber = (receiptNumber || 'RCT-001').replace(/\//g, '-');
-    const filename = `receipt_${safeNumber}.pdf`;
+    const filename = this.getReceiptPdfFilename(receiptNumber, payment);
 
     return { buffer: pdfBuffer, filename };
+  }
+
+  getReceiptPdfFilename(receiptNumber: string, payment: any): string {
+    const safeReceiptNum = (receiptNumber || 'RCT').replace(/\//g, '_');
+
+    const rawCompanyName =
+      payment?.invoice?.client?.company_name ||
+      payment?.invoice?.client_details?.company_name ||
+      payment?.client?.company_name ||
+      payment?.client_details?.company_name ||
+      '';
+
+    const companyNameStr = String(rawCompanyName).trim();
+
+    if (!companyNameStr) {
+      return `receipt_${safeReceiptNum}.pdf`;
+    }
+
+    let sanitizedCompany = companyNameStr
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '');
+
+    if (sanitizedCompany.length > 30) {
+      sanitizedCompany = sanitizedCompany.substring(0, 30).replace(/_+$/g, '');
+    }
+
+    if (!sanitizedCompany) {
+      return `receipt_${safeReceiptNum}.pdf`;
+    }
+
+    return `receipt_${safeReceiptNum}_${sanitizedCompany}.pdf`;
   }
 
   async findAll(user: any, query: { invoice?: string; invoice_id?: string }) {

@@ -333,36 +333,57 @@ export class InvoicesService {
     const tax = Number(body.tax || 0);
     const total = body.total !== undefined ? Number(body.total) : subtotal + tax;
 
-    const created = await this.prisma.invoice.create({
-      data: {
-        invoice_number: invoiceNumber,
-        client_id: clientId,
-        client_address: body.client_address !== undefined ? body.client_address : (client.address || ''),
-        issue_date: new Date(body.issue_date || new Date()),
-        due_date: body.due_date ? new Date(body.due_date) : null,
-        advance: Number(body.advance || 0),
-        subtotal,
-        tax,
-        total,
-        notes: body.notes || '',
-      },
-    });
+    const initialPaymentAmount = Number(body.payment_amount ?? body.advance ?? 0);
+    const issueDateObj = new Date(body.issue_date || new Date());
+    const paymentDateObj = body.payment_date ? new Date(body.payment_date) : issueDateObj;
+    const paymentMode = body.payment_mode || 'cash';
 
-    for (const item of itemsData) {
-      const qty = item.quantity || 1;
-      const rate = Number(item.rate || 0);
-      await this.prisma.invoiceItem.create({
+    const createdId = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.invoice.create({
         data: {
-          invoice_id: created.id,
-          description: item.description || '',
-          quantity: qty,
-          rate,
-          amount: qty * rate,
+          invoice_number: invoiceNumber,
+          client_id: clientId,
+          client_address: body.client_address !== undefined ? body.client_address : (client.address || ''),
+          issue_date: issueDateObj,
+          due_date: body.due_date ? new Date(body.due_date) : null,
+          advance: 0,
+          subtotal,
+          tax,
+          total,
+          notes: body.notes || '',
         },
       });
-    }
 
-    return this.findOne(created.id, user);
+      for (const item of itemsData) {
+        const qty = item.quantity || 1;
+        const rate = Number(item.rate || 0);
+        await tx.invoiceItem.create({
+          data: {
+            invoice_id: created.id,
+            description: item.description || '',
+            quantity: qty,
+            rate,
+            amount: qty * rate,
+          },
+        });
+      }
+
+      if (initialPaymentAmount > 0) {
+        await tx.invoicePayment.create({
+          data: {
+            invoice_id: created.id,
+            amount: initialPaymentAmount,
+            payment_date: paymentDateObj,
+            payment_mode: paymentMode,
+            notes: 'Initial payment received on invoice creation',
+          },
+        });
+      }
+
+      return created.id;
+    });
+
+    return this.findOne(createdId, user);
   }
 
   async update(id: number, user: any, body: any) {
@@ -388,7 +409,17 @@ export class InvoicesService {
     if (body.invoice_number !== undefined) data.invoice_number = body.invoice_number;
     if (body.issue_date !== undefined) data.issue_date = new Date(body.issue_date);
     if (body.due_date !== undefined) data.due_date = body.due_date ? new Date(body.due_date) : null;
-    if (body.advance !== undefined) data.advance = Number(body.advance);
+
+    const newPaymentAmount = Number(body.new_payment_amount || 0);
+    const paymentMode = body.payment_mode || body.new_payment_mode || 'cash';
+    const paymentDateStr = body.payment_date || body.new_payment_date;
+    const paymentDateObj = paymentDateStr ? new Date(paymentDateStr) : (body.issue_date ? new Date(body.issue_date) : new Date());
+
+    // Only update advance if explicitly provided and no new_payment_amount is being processed
+    if (body.advance !== undefined && newPaymentAmount === 0 && body.new_payment_amount === undefined) {
+      data.advance = Number(body.advance);
+    }
+
     if (body.client_address !== undefined) data.client_address = body.client_address;
     if (body.notes !== undefined) data.notes = body.notes;
 
@@ -423,10 +454,29 @@ export class InvoicesService {
       data.total = body.total !== undefined ? Number(body.total) : Number(existing.subtotal) + (data.tax ?? Number(existing.tax));
     }
 
-    await this.prisma.invoice.update({
-      where: { id },
-      data,
-    });
+    if (newPaymentAmount > 0) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.invoice.update({
+          where: { id },
+          data,
+        });
+
+        await tx.invoicePayment.create({
+          data: {
+            invoice_id: id,
+            amount: newPaymentAmount,
+            payment_date: paymentDateObj,
+            payment_mode: paymentMode,
+            notes: 'Payment received during invoice update',
+          },
+        });
+      });
+    } else {
+      await this.prisma.invoice.update({
+        where: { id },
+        data,
+      });
+    }
 
     return this.findOne(id, user);
   }
@@ -565,7 +615,7 @@ export class InvoicesService {
       return `invoice_${safeInvoiceNum}.pdf`;
     }
 
-    return `invoice_${sanitizedCompany}_${safeInvoiceNum}.pdf`;
+    return `invoice_${safeInvoiceNum}_${sanitizedCompany}.pdf`;
   }
 
   async generatePdfStreamFromPublicToken(token: string): Promise<{ pdfBuffer: Buffer; filename: string }> {

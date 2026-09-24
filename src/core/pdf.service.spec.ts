@@ -154,4 +154,39 @@ describe('PdfService', () => {
     expect(pdfBuffer.length).toBeGreaterThan(100);
     expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
   });
+
+  it('should generate receipt PDF buffer cleanly when service description is long and wraps onto multiple lines', async () => {
+    const mockReceiptData = {
+      receipt_number: 'RCT/2026-27/001',
+      payment_date: '2026-09-23',
+      payment_amount: 1500,
+      payment_mode: 'upi',
+      notes: 'Advance installment',
+      invoice_number: 'GSI/2026-27/001',
+      invoice_date: '2026-09-10',
+      invoice_total: 5000,
+      service_description: 'FB & Insta Page Management+ Meta Ads Lead Campaign Setup & Optimization for Q4 Promotion Phase',
+      client: {
+        name: 'John Doe',
+        company_name: 'Acme Corp',
+        email: 'john@acme.com',
+        phone: '9876543210',
+        address: 'Kochi, Kerala',
+        gst_no: '32ABCDE1234F1Z5',
+      },
+      items: [
+        {
+          description: 'FB & Insta Page Management+ Meta Ads Lead Campaign Setup & Optimization for Q4 Promotion Phase',
+          quantity: 1,
+          rate: 1500,
+          amount: 1500,
+        },
+      ],
+    };
+
+    const pdfBuffer = await service.generateReceiptPdf(mockReceiptData);
+    expect(Buffer.isBuffer(pdfBuffer)).toBe(true);
+    expect(pdfBuffer.length).toBeGreaterThan(100);
+    expect(pdfBuffer.toString('utf-8', 0, 4)).toBe('%PDF');
+  });
 });
