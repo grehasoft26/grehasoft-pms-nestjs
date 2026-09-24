@@ -19,6 +19,7 @@ import { RemindersModule } from './modules/reminders/reminders.module';
 import { ClientPortalModule } from './modules/client-portal/client-portal.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { BackupsModule } from './modules/backups/backups.module';
+import { InvoiceTemplatesModule } from './modules/invoice-templates/invoice-templates.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { BackupsModule } from './modules/backups/backups.module';
     CrmModule,
     ProposalsModule,
     InvoicesModule,
+    InvoiceTemplatesModule,
     SeoModule,
     InfrastructureModule,
     HrModule,
