@@ -81,9 +81,31 @@ const ENTITY_DISPLAY_NAMES: Record<string, string> = {
 export class BackupsService {
   private readonly logger = new Logger(BackupsService.name);
   private readonly mediaRoot = path.resolve(process.cwd(), 'media');
-  private readonly backupStorageDir = path.resolve(process.cwd(), 'private_storage', 'backups');
-  private readonly tmpDir = path.resolve(process.cwd(), 'private_storage', 'tmp');
-  private readonly cacheRootDir = path.resolve(process.cwd(), 'private_storage', 'cache', 'backups');
+
+  private getBackupStorageDir(): string {
+    const customDir = process.env.BACKUP_STORAGE_DIR;
+    if (customDir && customDir.trim() !== '') {
+      return path.resolve(customDir.trim());
+    }
+    return path.resolve(process.cwd(), 'private_storage', 'backups');
+  }
+
+  private getTmpDir(): string {
+    const customDir = process.env.BACKUP_STORAGE_DIR;
+    if (customDir && customDir.trim() !== '') {
+      return path.resolve(customDir.trim(), '../tmp');
+    }
+    return path.resolve(process.cwd(), 'private_storage', 'tmp');
+  }
+
+  private getCacheRootDir(): string {
+    const customDir = process.env.BACKUP_STORAGE_DIR;
+    if (customDir && customDir.trim() !== '') {
+      return path.resolve(customDir.trim(), '../cache', 'backups');
+    }
+    return path.resolve(process.cwd(), 'private_storage', 'cache', 'backups');
+  }
+
   private readonly activeBackupProcesses = new Map<
     number,
     { childProcess?: any; workDir?: string; isCancelled?: boolean }
@@ -122,9 +144,9 @@ export class BackupsService {
     private readonly prisma: PrismaService,
     private readonly pdfService: PdfService,
   ) {
-    this.ensureDirectoryExists(this.backupStorageDir);
-    this.ensureDirectoryExists(this.tmpDir);
-    this.ensureDirectoryExists(this.cacheRootDir);
+    this.ensureDirectoryExists(this.getBackupStorageDir());
+    this.ensureDirectoryExists(this.getTmpDir());
+    this.ensureDirectoryExists(this.getCacheRootDir());
   }
 
   private ensureDirectoryExists(dirPath: string): void {
@@ -300,7 +322,7 @@ export class BackupsService {
    * Background Backup Execution Engine (Dual-Purpose Archive Generator)
    */
   private async executeBackupJob(recordId: number, dto: GenerateBackupDto): Promise<void> {
-    const workDir = path.join(this.tmpDir, `backup_job_${recordId}_${Date.now()}`);
+    const workDir = path.join(this.getTmpDir(), `backup_job_${recordId}_${Date.now()}`);
     this.ensureDirectoryExists(workDir);
 
     const jobInfo = { workDir, isCancelled: false, childProcess: null as any };
@@ -383,7 +405,7 @@ export class BackupsService {
 
       // Create ZIP Archive
       const record = await this.prisma.backupRecord.findUnique({ where: { id: recordId } });
-      const archivePath = path.join(this.backupStorageDir, record.filename);
+      const archivePath = path.join(this.getBackupStorageDir(), record.filename);
       const archiveSize = await this.createZipArchive(workDir, archivePath);
 
       if (jobInfo.isCancelled) {
@@ -472,7 +494,7 @@ export class BackupsService {
     });
 
     // Delete incomplete archive ZIP if created
-    const archivePath = path.join(this.backupStorageDir, record.filename);
+    const archivePath = path.join(this.getBackupStorageDir(), record.filename);
     if (fs.existsSync(archivePath)) {
       try {
         fs.rmSync(archivePath, { force: true });
@@ -1225,14 +1247,15 @@ export class BackupsService {
       throw new BadRequestException(`Backup #${id} is not ready for download (status: ${record.status}).`);
     }
 
-    const filePath = path.resolve(this.backupStorageDir, record.filename);
+    const storageDir = this.getBackupStorageDir();
+    const filePath = path.resolve(storageDir, record.filename);
 
-    if (!filePath.startsWith(this.backupStorageDir)) {
+    if (!filePath.startsWith(storageDir)) {
       throw new ForbiddenException('Invalid backup file path traversal attempt.');
     }
 
     if (!fs.existsSync(filePath)) {
-      throw new NotFoundException(`Backup archive file "${record.filename}" was not found on disk.`);
+      throw new NotFoundException(`Backup archive file "${record.filename}" is missing from server storage.`);
     }
 
     return { filePath, filename: record.filename };
@@ -1243,9 +1266,10 @@ export class BackupsService {
    */
   async remove(id: number): Promise<void> {
     const record = await this.findOne(id);
-    const filePath = path.resolve(this.backupStorageDir, record.filename);
+    const storageDir = this.getBackupStorageDir();
+    const filePath = path.resolve(storageDir, record.filename);
 
-    if (filePath.startsWith(this.backupStorageDir) && fs.existsSync(filePath)) {
+    if (filePath.startsWith(storageDir) && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
       } catch (err) {
@@ -1253,7 +1277,7 @@ export class BackupsService {
       }
     }
 
-    const cacheDir = path.join(this.cacheRootDir, `backup_${id}`);
+    const cacheDir = path.join(this.getCacheRootDir(), `backup_${id}`);
     if (fs.existsSync(cacheDir)) {
       try {
         fs.rmSync(cacheDir, { recursive: true, force: true });
@@ -1277,14 +1301,15 @@ export class BackupsService {
       throw new BadRequestException(`Backup #${id} is not COMPLETED (status: ${record.status}).`);
     }
 
-    const zipPath = path.resolve(this.backupStorageDir, record.filename);
-    if (!zipPath.startsWith(this.backupStorageDir) || !fs.existsSync(zipPath)) {
-      throw new NotFoundException(`Archive file "${record.filename}" was not found on disk.`);
+    const storageDir = this.getBackupStorageDir();
+    const zipPath = path.resolve(storageDir, record.filename);
+    if (!zipPath.startsWith(storageDir) || !fs.existsSync(zipPath)) {
+      throw new NotFoundException(`Backup archive file "${record.filename}" is missing from server storage.`);
     }
 
     this.cleanExpiredCaches();
 
-    const targetCacheDir = path.join(this.cacheRootDir, `backup_${id}`);
+    const targetCacheDir = path.join(this.getCacheRootDir(), `backup_${id}`);
     const manifestPath = path.join(targetCacheDir, 'manifest.json');
 
     if (fs.existsSync(manifestPath)) {
@@ -1311,15 +1336,16 @@ export class BackupsService {
    * Fast inline eviction of expired explorer cache folders (>30 min)
    */
   private cleanExpiredCaches(): void {
-    if (!fs.existsSync(this.cacheRootDir)) return;
+    const cacheRootDir = this.getCacheRootDir();
+    if (!fs.existsSync(cacheRootDir)) return;
     const now = Date.now();
     const ttlMs = 30 * 60 * 1000;
 
     try {
-      const entries = fs.readdirSync(this.cacheRootDir, { withFileTypes: true });
+      const entries = fs.readdirSync(cacheRootDir, { withFileTypes: true });
       for (const entry of entries) {
         if (entry.isDirectory()) {
-          const dirPath = path.join(this.cacheRootDir, entry.name);
+          const dirPath = path.join(cacheRootDir, entry.name);
           const stat = fs.statSync(dirPath);
           if (now - stat.mtimeMs > ttlMs) {
             fs.rmSync(dirPath, { recursive: true, force: true });
