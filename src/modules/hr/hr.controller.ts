@@ -96,7 +96,12 @@ export class HrDocumentsController {
   // ---------------- GENERATION ENDPOINTS ----------------
 
   @Public()
-  @Get(['public/offer-letter/:token/download', 'public/offer-letter/:token/download/'])
+  @Get([
+    'public/offer-letter/:token',
+    'public/offer-letter/:token/',
+    'public/offer-letter/:token/download',
+    'public/offer-letter/:token/download/',
+  ])
   async downloadPublicOfferLetter(
     @Param('token') token: string,
     @Res() res: Response,
