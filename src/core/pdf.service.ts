@@ -343,5 +343,37 @@ export class PdfService {
       'HR Document PDF Generator',
     );
   }
+
+  /**
+   * Render SEO Report PDF using Python ReportLab generator
+   */
+  async generateSeoReportPdf(reportPayload: any): Promise<Buffer> {
+    const tempDir = os.tmpdir();
+    const inputPath = path.join(
+      tempDir,
+      `seo_rep_in_${Date.now()}_${Math.random().toString(36).substring(7)}.json`,
+    );
+    const outputPath = path.join(
+      tempDir,
+      `seo_rep_out_${Date.now()}_${Math.random().toString(36).substring(7)}.pdf`,
+    );
+
+    const mediaRoot = this.resolveMediaRoot();
+    const payload = {
+      report: reportPayload,
+      media_root: mediaRoot,
+    };
+
+    fs.writeFileSync(inputPath, JSON.stringify(payload), 'utf-8');
+
+    const scriptPath = this.resolveScriptPath('generate_seo_report_pdf.py');
+
+    return this.runPythonScript(
+      scriptPath,
+      inputPath,
+      outputPath,
+      'SEO Report PDF Generator',
+    );
+  }
 }
 

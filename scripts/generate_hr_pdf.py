@@ -28,6 +28,11 @@ def setup_poppins_fonts():
     if os.path.exists(bold_path):
         pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
 
+    try:
+        pdfmetrics.registerFontFamily('Poppins', normal='Poppins', bold='Poppins-Bold')
+    except Exception:
+        pass
+
 # ---------------- MONEY FORMAT ----------------
 def _money(value: Any) -> str:
     try:
@@ -235,69 +240,350 @@ def build_experience_certificate_pdf(context, media_root):
     return buf.getvalue()
 
 # ---------------- OFFER LETTER ----------------
-def build_offer_letter_pdf(context, media_root):
-    buf = BytesIO()
-    p = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-    draw_hr_document_template(p, width, height, media_root)
+DEFAULT_OFFER_SECTIONS = [
+    {
+        "id": 1,
+        "title": "1. Commencement of Employment",
+        "content": "Your scheduled joining date will be {joining_date}."
+    },
+    {
+        "id": 2,
+        "title": "2. Compensation",
+        "content": "Your monthly gross salary will be INR {salary_monthly} ({salary_in_words}). Any applicable statutory deductions and taxes will be withheld as per government regulations."
+    },
+    {
+        "id": 3,
+        "title": "3. Working Hours and Location",
+        "content": "This is a Work from Office position at our Infopark, Kochi office. Standard hours are 9:00 AM to 6:00 PM, Monday through Saturday (excluding your designated one Saturday off per month and national holidays)."
+    },
+    {
+        "id": 4,
+        "title": "4. Probation and Notice Period",
+        "content": "• Probation: You will be on probation for three months from your date of joining. Upon successful completion, your employment will be confirmed based on your performance.\n\n• Resignation: After confirmation, you are required to provide a 45-day notice period or salary in lieu of notice, subject to management approval, to ensure a smooth handover of projects/works/clients and responsibilities."
+    },
+    {
+        "id": 5,
+        "title": "5. Intellectual Property (IP) & Work Ownership",
+        "content": "All works, deliverables, or outputs created, developed, designed, or conceived by you during your employment—including but not limited to software code, website designs, branding materials, logos, marketing content, graphics, digital assets, strategies, and any other intellectual property—are \"works made for hire\" and shall be the sole and exclusive property of Grehasoft. You shall have no right, title, or interest in any such work and are prohibited from using, copying, reproducing, or claiming ownership of these materials for personal, external, or competitive use."
+    },
+    {
+        "id": 6,
+        "title": "6. Professional Accountability & Quality Standards",
+        "content": "You are responsible for maintaining high standards of accuracy, quality, and professionalism in all work assigned to you.\n\n• Quality Assurance: You must ensure all deliverables meet company standards and client requirements before submission.\n\n• Accuracy & Correctness: You are expected to verify all information, data, content, and technical work for accuracy and compliance.\n\n• Liability for Negligence: Any loss, damage, financial liability, or client complaint arising from gross negligence, willful misconduct, carelessness, or unauthorized errors in your work—including but not limited to incorrect information in social media posts, development code, strategies, or any other deliverables—will be your professional responsibility. You acknowledge that such failures may result in disciplinary action, including termination, and potential recovery of losses."
+    },
+    {
+        "id": 7,
+        "title": "7. Leave and Holiday Policy",
+        "content": "• Weekly Off: One Saturday per month will be granted as an additional off day. Regular Sundays remain as weekly offs.\n\n• National & Statutory Holidays: All national holidays and statutory holidays as declared by the Government will be observed."
+    },
+    {
+        "id": 8,
+        "title": "8. Confidentiality and Non-Disclosure",
+        "content": "You shall not disclose any proprietary information, client data, business strategies, trade secrets, or confidential materials of Grehasoft to any third party during or after your employment, without prior written consent from management. This obligation continues even after termination of employment."
+    },
+    {
+        "id": 9,
+        "title": "9. Non-Competition",
+        "content": "During your employment and for a period of one year following your departure, you agree not to directly or indirectly solicit, contact, or provide similar or competing services to any clients of Grehasoft that you handled, worked with, or had knowledge of during your tenure."
+    },
+    {
+        "id": 10,
+        "title": "10. Code of Conduct & Professional Ethics",
+        "content": "You are expected to maintain professional conduct at all times, including:\n\n• Punctuality and regular attendance as per scheduled working hours.\n\n• Professional behavior and respectful communication with colleagues and clients.\n\n• Adherence to company policies and management directives.\n\n• Prohibition of harassment, discrimination, or unethical conduct.\n\n• Maintaining professional standards in all client interactions and deliverables. Violation of conduct standards may result in disciplinary action up to and including termination."
+    },
+    {
+        "id": 11,
+        "title": "11. Attendance & Leave Rules",
+        "content": "• Punctuality: Repeated tardiness or early departures without authorization may result in salary deduction or disciplinary action.\n\n• Absence: Any unplanned absence must be reported to your manager immediately. Unauthorized absences for more than three consecutive days may be treated as abandonment of employment.\n\n• Leave Application: All leave requests must be submitted in advance through the designated approval process, except in case of medical emergencies."
+    },
+    {
+        "id": 12,
+        "title": "12. Data Protection & Privacy Compliance",
+        "content": "You are required to:\n\n• Handle all client data, personal information, and confidential business information with utmost care and security.\n\n• Comply with all data protection regulations, including applicable privacy laws and industry standards.\n\n• Never share, store, or transmit client data through unauthorized channels.\n\n• Report any data breaches or security incidents to management immediately. Failure to comply may result in legal action and termination of employment."
+    },
+    {
+        "id": 13,
+        "title": "13. Company Assets & Equipment",
+        "content": "• All company-provided equipment (laptop, mobile device, access cards, software licenses, etc.) remains the property of Grehasoft.\n\n• You are responsible for safeguarding these assets and using them only for authorized business purposes.\n\n• Upon termination or on request, all company assets must be returned in good condition. Damage due to negligence or theft will be deducted from your final settlement.\n\n• Unauthorized use or loss of company assets may result in disciplinary action or legal proceedings."
+    },
+    {
+        "id": 14,
+        "title": "14. Conflict of Interest",
+        "content": "You are prohibited from:\n\n• Engaging in any side business, freelancing, or consulting work during office hours is not allowed.\n\n• Providing services to competitors or clients that conflict with Grehasoft's business interests.\n\n• Using company resources, time, or intellectual knowledge for personal or external projects.\n\n• Accepting gifts, favors, or commissions from clients that could compromise your objectivity. Violation may result in termination and recovery of losses incurred by Grehasoft."
+    },
+    {
+        "id": 15,
+        "title": "15. Remote Work Policy",
+        "content": "Remote or work-from-home arrangements are not part of this offer unless explicitly approved by management. Any future remote work shall be subject to company policy and management discretion, and may be revoked at any time."
+    },
+    {
+        "id": 16,
+        "title": "16. Performance Review & Increment Policy",
+        "content": "• Performance Reviews: Formal performance reviews will be conducted [quarterly/semi-annually/annually] to assess your contribution, skills, and professional development.\n\n• Salary Increments: Increments, bonuses, or benefits are not guaranteed and are contingent upon satisfactory performance, company financial health, and management discretion.\n\n• Probation Review: At the end of your probation period, your performance will be evaluated to determine confirmation of employment."
+    },
+    {
+        "id": 17,
+        "title": "17. Termination of Employment",
+        "content": "a) Termination by Grehasoft: Grehasoft may terminate your employment under the following circumstances:\n\n• Completion of probation period with unsatisfactory performance.\n\n• Gross misconduct, theft, or violation of confidentiality.\n\n• Repeated negligence or failures affecting client relationships.\n\n• Breach of code of conduct or company policies.\n\n• Redundancy or business closure (notice or severance as per applicable law).\n\nb) Immediate Termination: Grehasoft reserves the right to terminate employment immediately without notice or severance pay in cases of:\n\n• Theft or dishonesty.\n\n• Breach of confidentiality or IP theft.\n\n• Gross insubordination or misconduct.\n\n• Legal or criminal violations.\n\nc) Termination by Employee: You may terminate employment by providing the 45-day notice period as stated in Section 4, or by paying salary in lieu of notice, subject to management approval and completion of project handover."
+    },
+    {
+        "id": 18,
+        "title": "18. Compliance and Regulatory Adherence",
+        "content": "You are expected to adhere to all company policies, code of conduct, and operational guidelines as laid out in the company handbook and management directives. You acknowledge that your work must comply with all applicable laws, industry standards, and client contractual obligations."
+    },
+    {
+        "id": 19,
+        "title": "19. Amendments to Terms",
+        "content": "Grehasoft reserves the right to amend, modify, or update any terms and conditions of this offer letter with prior written notice to the employee. Continuance of employment after such amendments constitutes acceptance of the revised terms."
+    },
+    {
+        "id": 20,
+        "title": "20. Governing Law and Jurisdiction",
+        "content": "This offer letter and all terms of employment shall be governed by the laws of the Republic of India, specifically the laws of the State of Kerala. Any disputes arising out of this employment shall be subject to the jurisdiction of courts in Kochi, Kerala."
+    },
+    {
+        "id": 21,
+        "title": "21. Acknowledgment of Receipt",
+        "content": "By signing this offer letter, you confirm that you have received a complete copy, read and understood all terms, and agree to be bound by them. You also confirm that you have disclosed all relevant information about your background and qualifications, and that any false or misleading information may result in immediate termination."
+    }
+]
 
-    LEFT = 70
-    CONTENT_WIDTH = width - 140
-    y = height - 200
+def replace_offer_placeholders(text: str, context: dict) -> str:
+    if not text:
+        return ""
+    sal_monthly = float(context.get("salary_monthly", 0) or 0)
+    emp_name = str(context.get("employee_name", ""))
+    address = str(context.get("address", ""))
+    position = str(context.get("position", ""))
+    dept = str(context.get("department", ""))
+    joining = str(context.get("joining_date", ""))
+    sal_words = str(context.get("salary_in_words", ""))
+    sal_annual = _money(sal_monthly * 12)
+    sal_str = _money(sal_monthly)
+    dt = str(context.get("date", ""))
+    issue_dt = str(context.get("date") or context.get("issue_date") or "")
+    hr = str(context.get("hr_name", "HR Manager"))
+    comp = str(context.get("company_name", "GREHASOFT"))
+
+    replacements = {
+        "{employee_name}": emp_name,
+        "{{employee_name}}": emp_name,
+        "[Employee Name]": emp_name,
+
+        "{address}": address,
+        "{{address}}": address,
+        "[Employee Address]": address,
+
+        "{position}": position,
+        "{{position}}": position,
+        "[Position Title]": position,
+
+        "{department}": dept,
+        "{{department}}": dept,
+
+        "{joining_date}": joining,
+        "{{joining_date}}": joining,
+        "[Joining Date]": joining,
+
+        "{salary_monthly}": sal_str,
+        "{{salary_monthly}}": sal_str,
+        "[Amount]": sal_str,
+
+        "{salary_in_words}": sal_words,
+        "{{salary_in_words}}": sal_words,
+        "[Amount in Words Only]": sal_words,
+
+        "{salary_annual}": sal_annual,
+        "{{salary_annual}}": sal_annual,
+
+        "{date}": dt,
+        "{{date}}": dt,
+        "[Date]": dt,
+
+        "{issue_date}": issue_dt,
+        "{{issue_date}}": issue_dt,
+
+        "{hr_name}": hr,
+        "{{hr_name}}": hr,
+
+        "{company_name}": comp,
+        "{{company_name}}": comp,
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text
+
+def build_custom_offer_letter_pdf(context, media_root, custom_sections):
+    setup_poppins_fonts()
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, KeepTogether, Table, TableStyle, Image, PageBreak
+    from reportlab.lib.styles import ParagraphStyle
+    buf = BytesIO()
+    width, height = A4
+
+    def on_page(canvas_obj, doc_obj):
+        draw_hr_document_template(canvas_obj, width, height, media_root)
+
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=50,
+        rightMargin=50,
+        topMargin=95,
+        bottomMargin=75
+    )
 
     styles = getSampleStyleSheet()
-    style = styles["Normal"]
-    style.fontName = "Poppins"
-    style.fontSize = 12
-    style.leading = 18
 
-    p.setFillColor(HexColor("#000000"))
-    # Title
-    p.setFont("Poppins-Bold", 16)
-    p.drawString(LEFT, y, "Job Offer Letter")
-    y -= 30
+    title_style = ParagraphStyle(
+        "TitleStyle",
+        parent=styles["Normal"],
+        fontName="Poppins-Bold",
+        fontSize=16,
+        leading=22,
+        textColor=HexColor("#05044A"),
+        spaceAfter=12
+    )
 
-    # Date
-    p.setFont("Poppins", 11)
-    p.drawString(LEFT, y, f"Date: {context.get('date', '')}")
-    y -= 25
+    sub_style = ParagraphStyle(
+        "SubStyle",
+        parent=styles["Normal"],
+        fontName="Poppins",
+        fontSize=10,
+        leading=14,
+        textColor=HexColor("#333333"),
+        spaceAfter=12
+    )
 
-    # To Address
-    p.setFont("Poppins-Bold", 11)
-    p.drawString(LEFT, y, f"To, {context.get('employee_name', '')}")
-    y -= 15
-    p.setFont("Poppins", 11)
-    p.drawString(LEFT, y, f"Address: {context.get('address', '')}")
-    y -= 25
+    sec_title_style = ParagraphStyle(
+        "SecTitleStyle",
+        parent=styles["Normal"],
+        fontName="Poppins-Bold",
+        fontSize=11,
+        leading=16,
+        textColor=HexColor("#05044A"),
+        spaceBefore=10,
+        spaceAfter=4,
+        keepWithNext=True
+    )
 
-    # Subject
-    p.setFont("Poppins-Bold", 11)
-    p.drawString(LEFT, y, "Subject: Offer of Employment")
-    y -= 25
+    sec_body_style = ParagraphStyle(
+        "SecBodyStyle",
+        parent=styles["Normal"],
+        fontName="Poppins",
+        fontSize=10,
+        leading=15,
+        textColor=HexColor("#222222"),
+        spaceAfter=8
+    )
 
-    # Body
-    body_text = f"""
+    story = []
+
+    header_info = f"""
+    <b>Date:</b> {context.get('date', '')}<br/><br/>
+    <b>To:</b> {context.get('employee_name', '')} {context.get('address', '')}<br/><br/>
+    <b>Subject: Offer of Employment – {context.get('position', '')}</b><br/><br/>
     Dear {context.get('employee_name', '')},<br/><br/>
+    We are pleased to offer you the position of <b>{context.get('position', '')}</b> at Grehasoft. This letter outlines the terms and conditions of your employment.
+    """
+    story.append(Paragraph(replace_offer_placeholders(header_info, context), sub_style))
+    story.append(Spacer(1, 10))
 
-    We are pleased to offer you the position of <b>{context.get('position', '')}</b> in the 
-    <b>{context.get('department', '')}</b> department at <b>GREHASOFT</b>.<br/><br/>
+    is_customized = False
+    if custom_sections and isinstance(custom_sections, list) and len(custom_sections) > 0:
+        if len(custom_sections) != len(DEFAULT_OFFER_SECTIONS):
+            is_customized = True
+        else:
+            for s1, s2 in zip(custom_sections, DEFAULT_OFFER_SECTIONS):
+                if s1.get("title", "").strip() != s2.get("title", "").strip() or s1.get("content", "").strip() != s2.get("content", "").strip():
+                    is_customized = True
+                    break
 
-    Your joining date will be <b>{context.get('joining_date', '')}</b> and your monthly salary 
-    will be <b>INR {_money(context.get('salary_monthly'))}</b>.<br/><br/>
+    sections_to_render = custom_sections if is_customized else DEFAULT_OFFER_SECTIONS
 
-    We look forward to working with you and wish you a successful career with GREHASOFT.
+    for sec in sections_to_render:
+        t_raw = sec.get("title", "")
+        c_raw = sec.get("content", "")
+        t_proc = replace_offer_placeholders(t_raw, context)
+        c_proc = replace_offer_placeholders(c_raw, context).replace("\n", "<br/>")
+
+        sec_flowables = []
+        if t_proc:
+            sec_flowables.append(Paragraph(t_proc, sec_title_style))
+        if c_proc:
+            sec_flowables.append(Paragraph(c_proc, sec_body_style))
+
+        if sec_flowables:
+            story.append(KeepTogether(sec_flowables))
+
+    story.append(Spacer(1, 15))
+
+    acc_title_style = ParagraphStyle(
+        "AccTitleStyle",
+        parent=title_style,
+        fontSize=14,
+        leading=18,
+        spaceBefore=15,
+        spaceAfter=10,
+        keepWithNext=True
+    )
+
+    acceptance_flowables = [
+        Paragraph("Acceptance of Terms", acc_title_style),
+        Spacer(1, 6),
+        Paragraph(
+            "By signing below, you confirm that you have read, understood, and agree to all the terms and conditions outlined in this offer letter.",
+            sub_style
+        ),
+        Spacer(1, 15),
+    ]
+
+    grehasoft_sig_text = f"""
+    <b>For Grehasoft,</b><br/><br/><br/>
+    <b>Raji T Skariah</b><br/>
+    Founder & CEO<br/>
+    Grehasoft, Infopark, Kochi
     """
 
-    para = Paragraph(body_text, style)
-    para.wrapOn(p, CONTENT_WIDTH, height)
-    para.drawOn(p, LEFT, y - para.height)
+    seal_path = os.path.join(media_root, 'icons', 'seal.png')
+    if os.path.exists(seal_path):
+        seal_img = Image(seal_path, width=110, height=90)
+        table_data = [[Paragraph(grehasoft_sig_text, sub_style), seal_img]]
+        sig_table = Table(table_data, colWidths=[280, 150])
+        sig_table.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ]))
+        acceptance_flowables.append(sig_table)
+    else:
+        acceptance_flowables.append(Paragraph(grehasoft_sig_text, sub_style))
 
-    draw_signature_block(p, context, width, media_root)
+    acceptance_flowables.append(Spacer(1, 15))
 
-    p.showPage()
-    p.save()
+    emp_name = str(context.get('employee_name', '_________________________'))
+    emp_pos = str(context.get('position', '_________________________'))
+
+    emp_acceptance_text = f"""
+    <b>Employee Acceptance:</b><br/><br/>
+    I, <b>{emp_name}</b>, accept the offer of employment for the position of <b>{emp_pos}</b> under the terms and conditions mentioned above. I confirm that I have read and understood all clauses and agree to be bound by them.<br/><br/><br/>
+
+    <b>Employee Signature:</b> _________________________<br/><br/>
+    <b>Date:</b> _________________________<br/><br/>
+    <b>Contact Number:</b> _________________________
+    """
+    acceptance_flowables.append(Paragraph(emp_acceptance_text, sub_style))
+
+    story.append(KeepTogether(acceptance_flowables))
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
     buf.seek(0)
     return buf.getvalue()
+
+
+def build_offer_letter_pdf(context, media_root):
+    custom_sections = context.get('custom_sections')
+    return build_custom_offer_letter_pdf(context, media_root, custom_sections)
+
 
 # ---------------- SALARY CERTIFICATE ----------------
 def build_salary_certificate_pdf(context, media_root):

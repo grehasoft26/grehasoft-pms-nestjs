@@ -117,6 +117,52 @@ export class HrService {
     return this.prisma.hRDocument.delete({ where: { id } });
   }
 
+  private numToWordsInr(num: any): string {
+    try {
+      const n = Math.round(Number(num) || 0);
+      if (n <= 0) return 'Zero Rupees Only';
+
+      const units = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten',
+                     'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
+      const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
+
+      const convertBelowThousand = (val: number): string => {
+        let res = '';
+        if (val >= 100) {
+          res += units[Math.floor(val / 100)] + ' Hundred ';
+          val %= 100;
+        }
+        if (val >= 20) {
+          res += tens[Math.floor(val / 10)] + ' ';
+          val %= 10;
+        }
+        if (val > 0) {
+          res += units[val] + ' ';
+        }
+        return res;
+      };
+
+      let val = n;
+      const crore = Math.floor(val / 10000000);
+      val %= 10000000;
+      const lakh = Math.floor(val / 100000);
+      val %= 100000;
+      const thousand = Math.floor(val / 1000);
+      val %= 1000;
+      const hundreds = val;
+
+      let words = '';
+      if (crore > 0) words += convertBelowThousand(crore).trim() + ' Crore ';
+      if (lakh > 0) words += convertBelowThousand(lakh).trim() + ' Lakh ';
+      if (thousand > 0) words += convertBelowThousand(thousand).trim() + ' Thousand ';
+      if (hundreds > 0) words += convertBelowThousand(hundreds).trim();
+
+      return words.trim() + ' Rupees Only';
+    } catch {
+      return '';
+    }
+  }
+
   // -------------------------------------------------------------
   // 3. GENERATE OFFER LETTER PDF
   // -------------------------------------------------------------
@@ -133,14 +179,19 @@ export class HrService {
       }
     }
 
+    const salMonthly = Number(data.salary_monthly || 0);
+
     const ctx = {
       date: new Date().toISOString().split('T')[0],
       employee_name: employeeName,
       address,
       position: data.position,
       joining_date: data.joining_date,
-      salary_monthly: data.salary_monthly,
+      salary_monthly: salMonthly,
+      salary_in_words: this.numToWordsInr(salMonthly),
+      salary_annual: salMonthly * 12,
       department: data.department,
+      custom_sections: Array.isArray(data.custom_sections) && data.custom_sections.length > 0 ? data.custom_sections : undefined,
     };
 
     return this.pdfService.generateHrDocumentPdf('Offer Letter', ctx);
