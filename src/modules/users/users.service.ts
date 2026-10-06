@@ -136,7 +136,13 @@ export class UsersService {
         orderBy: { name: 'asc' },
       });
 
-      const formatted = users.map((u) => formatUserResponse(u));
+      const userIds = users.map(u => u.id);
+      const employees = await this.prisma.employee.findMany({
+        where: { user_id: { in: userIds } },
+      });
+      const empMap = new Map(employees.map(e => [e.user_id, e]));
+
+      const formatted = users.map((u) => formatUserResponse({ ...u, employee: empMap.get(u.id) }));
       return formatted;
     }
 
@@ -154,7 +160,13 @@ export class UsersService {
       take: limitNum,
     });
 
-    const formatted = users.map((u) => formatUserResponse(u));
+    const userIds = users.map(u => u.id);
+    const employees = await this.prisma.employee.findMany({
+      where: { user_id: { in: userIds } },
+    });
+    const empMap = new Map(employees.map(e => [e.user_id, e]));
+
+    const formatted = users.map((u) => formatUserResponse({ ...u, employee: empMap.get(u.id) }));
 
     return {
       count,
@@ -170,7 +182,8 @@ export class UsersService {
       include: { role: true, department: true, client: true },
     });
     if (!user) throw new NotFoundException('User not found');
-    return formatUserResponse(user);
+    const emp = await this.prisma.employee.findUnique({ where: { user_id: id } });
+    return formatUserResponse({ ...user, employee: emp });
   }
 
   async create(reqUser: any, body: any) {
@@ -207,6 +220,32 @@ export class UsersService {
       },
       include: { role: true, department: true, client: true },
     });
+
+    const phoneVal = body.phone !== undefined ? body.phone : body.mobile;
+    if (phoneVal !== undefined || body.position || body.joining_date || body.salary_monthly || body.address) {
+      const empPhone = phoneVal ? String(phoneVal).trim() : null;
+      await this.prisma.employee.upsert({
+        where: { user_id: created.id },
+        create: {
+          user_id: created.id,
+          phone: empPhone,
+          position: body.position || 'Employee',
+          joining_date: body.joining_date ? new Date(body.joining_date) : new Date(),
+          salary_monthly: body.salary_monthly ? Number(body.salary_monthly) : 0,
+          address: body.address || '',
+          department_id: body.department ? Number(body.department) : null,
+        },
+        update: {
+          phone: empPhone !== null ? empPhone : undefined,
+          position: body.position || undefined,
+          joining_date: body.joining_date ? new Date(body.joining_date) : undefined,
+          salary_monthly: body.salary_monthly ? Number(body.salary_monthly) : undefined,
+          address: body.address || undefined,
+          department_id: body.department ? Number(body.department) : undefined,
+        },
+      });
+      return this.findOne(created.id);
+    }
 
     return formatUserResponse(created);
   }
@@ -249,6 +288,37 @@ export class UsersService {
       data,
       include: { role: true, department: true, client: true },
     });
+
+    const phoneVal = body.phone !== undefined ? body.phone : body.mobile;
+    if (phoneVal !== undefined || body.position !== undefined || body.joining_date !== undefined || body.salary_monthly !== undefined || body.address !== undefined) {
+      const empPhone = phoneVal ? String(phoneVal).trim() : null;
+      const existingEmp = await this.prisma.employee.findUnique({ where: { user_id: id } });
+      if (existingEmp) {
+        await this.prisma.employee.update({
+          where: { user_id: id },
+          data: {
+            phone: phoneVal !== undefined ? empPhone : undefined,
+            position: body.position || undefined,
+            joining_date: body.joining_date ? new Date(body.joining_date) : undefined,
+            salary_monthly: body.salary_monthly !== undefined && body.salary_monthly !== '' ? Number(body.salary_monthly) : undefined,
+            address: body.address !== undefined ? body.address : undefined,
+          },
+        });
+      } else if (phoneVal) {
+        await this.prisma.employee.create({
+          data: {
+            user_id: id,
+            phone: empPhone,
+            position: body.position || 'Employee',
+            joining_date: body.joining_date ? new Date(body.joining_date) : new Date(),
+            salary_monthly: body.salary_monthly ? Number(body.salary_monthly) : 0,
+            address: body.address || '',
+            department_id: body.department ? Number(body.department) : null,
+          },
+        });
+      }
+      return this.findOne(id);
+    }
 
     return formatUserResponse(updated);
   }

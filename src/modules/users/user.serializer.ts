@@ -19,6 +19,8 @@ export function formatUserResponse(user: any) {
     joining_date: user.joining_date ? user.joining_date.toISOString().split('T')[0] : null,
     salary_monthly: user.salary_monthly ? String(user.salary_monthly) : null,
     address: user.address || null,
+    employee_phone: user.employee ? user.employee.phone : null,
+    employee_id: user.employee ? user.employee.id : null,
     is_superuser: user.is_superuser || false,
     client: user.client_id || (user.client ? user.client.id : null),
     client_name: user.client ? user.client.name : null,
