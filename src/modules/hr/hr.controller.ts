@@ -9,6 +9,7 @@ import {
   Body,
   UseGuards,
   Request,
+  Req,
   Res,
   ParseIntPipe,
   HttpCode,
@@ -18,6 +19,7 @@ import { Response } from 'express';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { Public } from '../../core/decorators/public.decorator';
 import { HrService } from './hr.service';
 
 // -------------------------------------------------------------
@@ -93,6 +95,19 @@ export class HrDocumentsController {
 
   // ---------------- GENERATION ENDPOINTS ----------------
 
+  @Public()
+  @Get(['public/offer-letter/:token/download', 'public/offer-letter/:token/download/'])
+  async downloadPublicOfferLetter(
+    @Param('token') token: string,
+    @Res() res: Response,
+  ) {
+    const { pdfBuffer, filename } = await this.hrService.generateOfferLetterPdfFromPublicToken(token);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(pdfBuffer);
+  }
+
   @Post('offer-letter')
   @HttpCode(200)
   async generateOfferLetter(@Body() body: any, @Res() res: Response) {
@@ -102,6 +117,18 @@ export class HrDocumentsController {
       'Content-Disposition': 'attachment; filename="offer_letter.pdf"',
     });
     res.send(pdfBuffer);
+  }
+
+  @Post(['offer-letter/secure-link', 'offer-letter/secure-link/'])
+  @HttpCode(200)
+  async generateOfferLetterSecureLink(@Body() body: any, @Req() req: any) {
+    return this.hrService.generateOfferLetterSecureLink(body, req);
+  }
+
+  @Post(['offer-letter/send-email', 'offer-letter/send-email/'])
+  @HttpCode(200)
+  async sendOfferLetterEmail(@Body() body: any) {
+    return this.hrService.sendOfferLetterEmail(body);
   }
 
   @Post('appraisal-letter')

@@ -1,12 +1,69 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, InternalServerErrorException, ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
+import { MailerService } from '../../core/mailer.service';
+
+export class OfferLetterSigning {
+  static generateToken(payloadObj: any, secret: string, expiresInSeconds: number = 172800): string {
+    const expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds;
+    const jsonStr = JSON.stringify(payloadObj || {});
+    const base64Payload = Buffer.from(jsonStr).toString('base64url');
+    const signaturePayload = `${base64Payload}:${expiresAt}`;
+    const hmac = crypto.createHmac('sha256', secret).update(signaturePayload).digest('hex');
+    return `${base64Payload}.${expiresAt}.${hmac}`;
+  }
+
+  static verifyToken(token: string, secret: string): { valid: boolean; payload?: any; error?: string } {
+    if (!token) {
+      return { valid: false, error: 'Token is required.' };
+    }
+
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      return { valid: false, error: 'Invalid signature token.' };
+    }
+
+    const [base64Payload, expiresAtStr, hmacStr] = parts;
+    const expiresAt = parseInt(expiresAtStr, 10);
+
+    if (isNaN(expiresAt)) {
+      return { valid: false, error: 'Invalid signature token.' };
+    }
+
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    if (currentTimestamp > expiresAt) {
+      return { valid: false, error: 'This secure link has expired.' };
+    }
+
+    const signaturePayload = `${base64Payload}:${expiresAt}`;
+    const expectedHmac = crypto.createHmac('sha256', secret).update(signaturePayload).digest('hex');
+
+    try {
+      const hmacBuffer = Buffer.from(hmacStr, 'hex');
+      const expectedBuffer = Buffer.from(expectedHmac, 'hex');
+
+      if (hmacBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(hmacBuffer, expectedBuffer)) {
+        return { valid: false, error: 'Invalid signature token.' };
+      }
+
+      const jsonStr = Buffer.from(base64Payload, 'base64url').toString('utf8');
+      const payload = JSON.parse(jsonStr);
+      return { valid: true, payload };
+    } catch {
+      return { valid: false, error: 'Invalid signature token.' };
+    }
+  }
+}
 
 @Injectable()
 export class HrService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly pdfService: PdfService,
+    private readonly mailerService: MailerService,
+    private readonly configService: ConfigService,
   ) {}
 
   // -------------------------------------------------------------
@@ -195,6 +252,98 @@ export class HrService {
     };
 
     return this.pdfService.generateHrDocumentPdf('Offer Letter', ctx);
+  }
+
+  private getSigningSecret(): string {
+    return (
+      this.configService?.get<string>('HR_LINK_SECRET') ||
+      this.configService?.get<string>('SECRET_KEY') ||
+      this.configService?.get<string>('JWT_SECRET') ||
+      'grehasoft-hr-link-signing-secret-default'
+    );
+  }
+
+  private getBaseUrl(req?: any): string {
+    if (req) {
+      const host = req.get ? req.get('host') : req.headers?.host;
+      const protocol = req.protocol || (req.connection?.encrypted ? 'https' : 'http');
+      if (host) {
+        return `${protocol}://${host}`;
+      }
+    }
+    const configuredUrl =
+      this.configService?.get<string>('API_BASE_URL') ||
+      this.configService?.get<string>('SITE_URL');
+    if (configuredUrl) {
+      return configuredUrl.replace(/\/$/, '');
+    }
+    return 'http://localhost:3000';
+  }
+
+  async generateOfferLetterSecureLink(data: any, req?: any): Promise<{ secure_pdf_link: string }> {
+    const secret = this.getSigningSecret();
+    const token = OfferLetterSigning.generateToken(data, secret, 172800);
+    const baseUrl = this.getBaseUrl(req);
+    const securePdfLink = `${baseUrl}/api/v1/hr-documents/public/offer-letter/${encodeURIComponent(token)}/download/`;
+
+    return { secure_pdf_link: securePdfLink };
+  }
+
+  async generateOfferLetterPdfFromPublicToken(token: string): Promise<{ pdfBuffer: Buffer; filename: string }> {
+    const secret = this.getSigningSecret();
+    const verification = OfferLetterSigning.verifyToken(token, secret);
+
+    if (!verification.valid || !verification.payload) {
+      throw new ForbiddenException(verification.error || 'Invalid or expired signature token.');
+    }
+
+    const pdfBuffer = await this.generateOfferLetterPdf(verification.payload);
+    const employeeName = verification.payload.employee_name || 'Employee';
+    const safeName = String(employeeName).replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '') || 'Employee';
+    const filename = `Offer_Letter_${safeName}.pdf`;
+
+    return { pdfBuffer, filename };
+  }
+
+  async sendOfferLetterEmail(data: any): Promise<{ message: string }> {
+    let employeeName = data.employee_name || '';
+    let email = data.email || '';
+
+    if (data.employee_id) {
+      const u = await this.prisma.user.findUnique({
+        where: { id: Number(data.employee_id) },
+      });
+      if (u) {
+        employeeName = employeeName || u.name || u.username;
+        email = email || u.email;
+      }
+    }
+
+    if (!email || !String(email).trim()) {
+      throw new BadRequestException('Email address is not available for this employee.');
+    }
+
+    const pdfBuffer = await this.generateOfferLetterPdf(data);
+    const safeName = String(employeeName).replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '') || 'Employee';
+    const filename = `Offer_Letter_${safeName}.pdf`;
+
+    const mailSent = await this.mailerService.sendMail({
+      to: String(email).trim(),
+      subject: 'Your Job Offer Letter – Grehasoft',
+      text: `Dear ${employeeName || 'Employee'},\n\nPlease find attached your Job Offer Letter from Grehasoft.\n\nKindly review the terms and conditions outlined in the offer letter.\n\nIf you have any questions, please contact the HR team.\n\nRegards,\n\nGrehasoft HR`,
+      attachments: [
+        {
+          filename,
+          content: pdfBuffer,
+        },
+      ],
+    });
+
+    if (!mailSent) {
+      throw new InternalServerErrorException('Failed to send offer letter email. Please check server email configuration.');
+    }
+
+    return { message: 'Email sent successfully' };
   }
 
   // -------------------------------------------------------------
