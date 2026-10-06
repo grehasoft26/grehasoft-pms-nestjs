@@ -6,7 +6,6 @@ export function formatUserResponse(user: any) {
     name: user.name,
     username: user.username,
     email: user.email,
-    phone: user.phone || null,
     role: user.role_id || (user.role ? user.role.id : null),
     role_name: user.role ? user.role.name : '',
     role_permissions: user.role && user.role.permissions ? user.role.permissions : [],

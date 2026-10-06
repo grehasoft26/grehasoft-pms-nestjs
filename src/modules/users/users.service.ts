@@ -126,7 +126,6 @@ export class UsersService {
         { name: { contains: query.search, mode: 'insensitive' } },
         { username: { contains: query.search, mode: 'insensitive' } },
         { email: { contains: query.search, mode: 'insensitive' } },
-        { phone: { contains: query.search, mode: 'insensitive' } },
       ];
     }
 
@@ -194,7 +193,6 @@ export class UsersService {
       data: {
         username: body.username,
         email: body.email,
-        phone: body.phone || body.mobile || null,
         password: hashedPassword,
         name: body.name || body.username,
         address: body.address || null,
@@ -231,8 +229,6 @@ export class UsersService {
     if (body.name !== undefined) data.name = body.name;
     if (body.username !== undefined) data.username = body.username;
     if (body.email !== undefined) data.email = body.email;
-    if (body.phone !== undefined) data.phone = body.phone || null;
-    else if (body.mobile !== undefined) data.phone = body.mobile || null;
     if (body.address !== undefined) data.address = body.address;
     if (body.position !== undefined) data.position = body.position;
     if (body.joining_date !== undefined) data.joining_date = body.joining_date ? new Date(body.joining_date) : null;
