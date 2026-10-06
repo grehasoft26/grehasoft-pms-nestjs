@@ -202,6 +202,23 @@ enum BackupStatus {
   FAILED
 }
 
+enum SEOReportStatus {
+  draft
+  under_review
+  approved
+  generated
+  published
+}
+
+enum SEODataSource {
+  manual
+  imported
+  gsc_api
+  ga4_api
+  gbp_api
+  hybrid
+}
+
 // ------------------------------------------------------------------------------
 // MODELS / TABLES (49 TABLES MATCHING ALL 49 DJANGO MODELS)
 // ------------------------------------------------------------------------------
@@ -221,12 +238,12 @@ model Role {
 }
 
 model Department {
-  id          Int       @id @default(autoincrement())
-  name        String    @db.VarChar(100)
-  parent_id   Int?
-  created_at  DateTime  @default(now()) @db.DateTime(3)
-  updated_at  DateTime  @updatedAt @db.DateTime(3)
-  deleted_at  DateTime? @db.DateTime(3)
+  id         Int       @id @default(autoincrement())
+  name       String    @db.VarChar(100)
+  parent_id  Int?
+  created_at DateTime  @default(now()) @db.DateTime(3)
+  updated_at DateTime  @updatedAt @db.DateTime(3)
+  deleted_at DateTime? @db.DateTime(3)
 
   parent          Department?  @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: SetNull)
   sub_departments Department[] @relation("DepartmentParent")
@@ -273,20 +290,20 @@ model User {
   project_members       ProjectMember[]
   project_activity_logs ProjectActivityLog[]
 
-  lead_assignments LeadAssignment[]
+  lead_assignments  LeadAssignment[]
   created_followups LeadFollowup[]
 
-  created_tasks              Task[]             @relation("CreatedTasks")
-  task_assignments_employee  TaskAssignment[]   @relation("TaskAssignmentsEmployee")
-  task_assignments_assigner  TaskAssignment[]   @relation("TaskAssignmentsAssigner")
-  task_progress_updates      TaskProgress[]
-  uploaded_task_files        TaskFile[]
-  task_reviews               TaskReview[]
-  task_comments              TaskComment[]
+  created_tasks             Task[]           @relation("CreatedTasks")
+  task_assignments_employee TaskAssignment[] @relation("TaskAssignmentsEmployee")
+  task_assignments_assigner TaskAssignment[] @relation("TaskAssignmentsAssigner")
+  task_progress_updates     TaskProgress[]
+  uploaded_task_files       TaskFile[]
+  task_reviews              TaskReview[]
+  task_comments             TaskComment[]
 
   global_activity_logs GlobalActivityLog[]
 
-  assigned_seo_websites SEOWebsite[] @relation("AssignedSEOWebsites")
+  assigned_seo_websites    SEOWebsite[] @relation("AssignedSEOWebsites")
   assigned_by_seo_websites SEOWebsite[] @relation("AssignedBySEOWebsites")
 
   executive_seo_logs SEODailyWorkLog[] @relation("ExecutiveSEOLogs")
@@ -305,13 +322,17 @@ model User {
 
   seo_task_timelines SEOTaskTimeline[]
 
+  created_seo_reports  SEOReport[]     @relation("CreatedSEOReports")
+  approved_seo_reports SEOReport[]     @relation("ApprovedSEOReports")
+  uploaded_seo_files   SEOReportFile[] @relation("UploadedSEOReportFiles")
+
   employee_profile Employee?
   created_hr_docs  HRDocument[]
 
-  tracking_profile TrackingUserProfile?
-  work_sessions    WorkSession[]
-  app_activities   AppActivity[]
-  screenshots      Screenshot[]
+  tracking_profile       TrackingUserProfile?
+  work_sessions          WorkSession[]
+  app_activities         AppActivity[]
+  screenshots            Screenshot[]
   tracking_activity_logs TrackingActivityLog[]
 
   reminders            Reminder[]
@@ -341,6 +362,7 @@ model Client {
   seo_websites SEOWebsite[]
   invoices     Invoice[]
   proposals    Proposal[]
+  seo_reports  SEOReport[]       @relation("ClientSEOReports")
 
   @@map("clients")
 }
@@ -354,9 +376,9 @@ model PortalUserAudit {
   timestamp       DateTime @default(now()) @db.DateTime(3)
   remarks         String?  @db.Text
 
-  portal_user  User?   @relation("PortalUserAudits", fields: [portal_user_id], references: [id], onDelete: SetNull)
-  client       Client  @relation(fields: [client_id], references: [id], onDelete: Cascade)
-  performed_by User?   @relation("PerformedAudits", fields: [performed_by_id], references: [id], onDelete: SetNull)
+  portal_user  User?  @relation("PortalUserAudits", fields: [portal_user_id], references: [id], onDelete: SetNull)
+  client       Client @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  performed_by User?  @relation("PerformedAudits", fields: [performed_by_id], references: [id], onDelete: SetNull)
 
   @@map("portal_user_audit")
 }
@@ -681,9 +703,9 @@ model SEOWebsite {
   created_at               DateTime      @default(now()) @db.DateTime(3)
   updated_at               DateTime      @updatedAt @db.DateTime(3)
 
-  client             Client  @relation(fields: [client_id], references: [id], onDelete: Cascade)
-  assigned_executive User?   @relation("AssignedSEOWebsites", fields: [assigned_executive_id], references: [id], onDelete: SetNull)
-  assigned_by        User?   @relation("AssignedBySEOWebsites", fields: [assigned_by_id], references: [id], onDelete: SetNull)
+  client             Client @relation(fields: [client_id], references: [id], onDelete: Cascade)
+  assigned_executive User?  @relation("AssignedSEOWebsites", fields: [assigned_executive_id], references: [id], onDelete: SetNull)
+  assigned_by        User?  @relation("AssignedBySEOWebsites", fields: [assigned_by_id], references: [id], onDelete: SetNull)
 
   target_keywords SEOKeyword[]
   daily_logs      SEODailyWorkLog[]
@@ -691,6 +713,7 @@ model SEOWebsite {
   seo_tasks       SEOTask[]
   seo_reminders   SEOReminder[]
   seo_credentials SEOCredential[]
+  seo_reports     SEOReport[]        @relation("WebsiteSEOReports")
 
   @@map("seo_website")
 }
@@ -867,24 +890,24 @@ model SEOTaskTimeline {
   remarks    String?  @db.Text
 
   task SEOTask @relation(fields: [task_id], references: [id], onDelete: Cascade)
-  user User?    @relation(fields: [user_id], references: [id], onDelete: SetNull)
+  user User?   @relation(fields: [user_id], references: [id], onDelete: SetNull)
 
   @@map("seo_task_timeline")
 }
 
 model Invoice {
-  id             Int      @id @default(autoincrement())
-  invoice_number String   @unique @db.VarChar(50)
+  id             Int       @id @default(autoincrement())
+  invoice_number String    @unique @db.VarChar(50)
   client_id      Int
-  client_address String?  @db.Text
+  client_address String?   @db.Text
   issue_date     DateTime  @db.Date
   due_date       DateTime? @db.Date
-  advance        Decimal  @default(0.00) @db.Decimal(10, 2)
-  subtotal       Decimal  @db.Decimal(10, 2)
-  tax            Decimal  @db.Decimal(10, 2)
-  total          Decimal  @db.Decimal(10, 2)
-  notes          String?  @db.Text
-  created_at     DateTime @default(now()) @db.DateTime(3)
+  advance        Decimal   @default(0.00) @db.Decimal(10, 2)
+  subtotal       Decimal   @db.Decimal(10, 2)
+  tax            Decimal   @db.Decimal(10, 2)
+  total          Decimal   @db.Decimal(10, 2)
+  notes          String?   @db.Text
+  created_at     DateTime  @default(now()) @db.DateTime(3)
 
   client   Client           @relation(fields: [client_id], references: [id], onDelete: Cascade)
   items    InvoiceItem[]
@@ -1043,6 +1066,7 @@ model Employee {
   id             Int      @id @default(autoincrement())
   user_id        Int      @unique
   address        String?  @db.Text
+  phone          String?  @db.VarChar(20)
   position       String   @db.VarChar(120)
   joining_date   DateTime @db.Date
   salary_monthly Decimal  @db.Decimal(12, 2)
@@ -1222,33 +1246,200 @@ model BackupRecord {
 }
 
 model InvoiceDescriptionTemplate {
-  id          Int              @id @default(autoincrement())
-  name        String           @unique @db.VarChar(150)
-  description String           @db.Text
-  rate        Decimal          @default(0.00) @db.Decimal(10, 2)
-  is_active   Boolean          @default(true)
-  created_at  DateTime         @default(now()) @db.DateTime(3)
-  updated_at  DateTime         @updatedAt @db.DateTime(3)
+  id          Int      @id @default(autoincrement())
+  name        String   @unique @db.VarChar(150)
+  description String   @db.Text
+  rate        Decimal  @default(0.00) @db.Decimal(10, 2)
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.DateTime(3)
+  updated_at  DateTime @updatedAt @db.DateTime(3)
 
-  services    InvoiceService[]
+  services InvoiceService[]
 
   @@map("invoice_description_templates")
 }
 
 model InvoiceService {
-  id          Int                        @id @default(autoincrement())
+  id          Int      @id @default(autoincrement())
   template_id Int
-  name        String                     @db.VarChar(200)
-  description String?                    @db.Text
-  rate        Decimal                    @default(0.00) @db.Decimal(10, 2)
-  is_active   Boolean                    @default(true)
-  created_at  DateTime                   @default(now()) @db.DateTime(3)
-  updated_at  DateTime                   @updatedAt @db.DateTime(3)
+  name        String   @db.VarChar(200)
+  description String?  @db.Text
+  rate        Decimal  @default(0.00) @db.Decimal(10, 2)
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.DateTime(3)
+  updated_at  DateTime @updatedAt @db.DateTime(3)
 
-  template    InvoiceDescriptionTemplate @relation(fields: [template_id], references: [id], onDelete: Cascade)
+  template InvoiceDescriptionTemplate @relation(fields: [template_id], references: [id], onDelete: Cascade)
 
   @@index([template_id])
   @@map("invoice_services")
 }
 
+// ==============================================================================
+// SEO REPORTS MODULE (INDEPENDENT CLIENT-FACING MONTHLY REPORTING ENGINE)
+// ==============================================================================
 
+model SEOReport {
+  id                Int             @id @default(autoincrement())
+  client_id         Int
+  website_id        Int
+  report_title      String          @db.VarChar(255)
+  report_month      String          @db.VarChar(7)
+  period_start_date DateTime        @db.Date
+  period_end_date   DateTime        @db.Date
+  status            SEOReportStatus @default(draft)
+  data_source       SEODataSource   @default(manual)
+
+  // Executive Summary & Manager Narrative
+  executive_summary String? @db.Text
+  key_achievements  Json?
+  challenges_notes  String? @db.Text
+  recommendations   Json?
+  next_month_plan   Json?
+
+  // Domain Authority & Health Snapshot
+  domain_authority    Int? @default(0)
+  previous_da         Int? @default(0)
+  page_authority      Int? @default(0)
+  spam_score          Int? @default(0)
+  health_score        Int? @default(100)
+  total_indexed_pages Int? @default(0)
+  total_backlinks     Int? @default(0)
+
+  // Google Search Console Snapshot
+  gsc_clicks            Int?   @default(0)
+  gsc_prev_clicks       Int?   @default(0)
+  gsc_impressions       Int?   @default(0)
+  gsc_prev_impressions  Int?   @default(0)
+  gsc_avg_ctr           Float? @default(0.0)
+  gsc_prev_avg_ctr      Float? @default(0.0)
+  gsc_avg_position      Float? @default(0.0)
+  gsc_prev_avg_position Float? @default(0.0)
+
+  // Google Analytics 4 Snapshot
+  ga4_organic_users        Int?    @default(0)
+  ga4_prev_users           Int?    @default(0)
+  ga4_new_users            Int?    @default(0)
+  ga4_sessions             Int?    @default(0)
+  ga4_prev_sessions        Int?    @default(0)
+  ga4_engagement_rate      Float?  @default(0.0)
+  ga4_avg_session_duration String? @db.VarChar(20)
+
+  // Google Business Profile Snapshot
+  gbp_profile_views      Int? @default(0)
+  gbp_prev_views         Int? @default(0)
+  gbp_interactions       Int? @default(0)
+  gbp_phone_calls        Int? @default(0)
+  gbp_direction_requests Int? @default(0)
+  gbp_website_clicks     Int? @default(0)
+
+  // Provenance / Future API Support
+  last_synced_at  DateTime? @db.DateTime(3)
+  manually_edited Boolean   @default(false)
+
+  // PDF Artifact Metadata
+  pdf_file_path    String?   @db.VarChar(255)
+  pdf_filename     String?   @db.VarChar(255)
+  pdf_file_size    Int?      @default(0)
+  pdf_generated_at DateTime? @db.DateTime(3)
+
+  // Audit / Ownership
+  created_by_id  Int
+  approved_by_id Int?
+  approved_at    DateTime? @db.DateTime(3)
+  published_at   DateTime? @db.DateTime(3)
+  created_at     DateTime  @default(now()) @db.DateTime(3)
+  updated_at     DateTime  @updatedAt @db.DateTime(3)
+
+  // Relations
+  client      Client     @relation("ClientSEOReports", fields: [client_id], references: [id], onDelete: Cascade)
+  website     SEOWebsite @relation("WebsiteSEOReports", fields: [website_id], references: [id], onDelete: Cascade)
+  created_by  User       @relation("CreatedSEOReports", fields: [created_by_id], references: [id], onDelete: Cascade)
+  approved_by User?      @relation("ApprovedSEOReports", fields: [approved_by_id], references: [id], onDelete: SetNull)
+
+  keywords           SEOReportKeyword[]
+  top_queries        SEOReportTopQuery[]
+  traffic_sources    SEOReportTrafficSource[]
+  activity_summaries SEOReportActivitySummary[]
+  evidence_files     SEOReportFile[]
+
+  @@unique([website_id, report_month])
+  @@index([client_id, report_month])
+  @@index([status])
+  @@map("seo_report")
+}
+
+model SEOReportKeyword {
+  id            Int     @id @default(autoincrement())
+  report_id     Int
+  keyword       String  @db.VarChar(255)
+  target_url    String? @db.VarChar(255)
+  search_engine String  @default("Google") @db.VarChar(50)
+  initial_rank  Int?    @default(0)
+  previous_rank Int?    @default(0)
+  current_rank  Int?    @default(0)
+  target_rank   Int?    @default(1)
+  rank_change   Int     @default(0)
+
+  report SEOReport @relation(fields: [report_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_report_keyword")
+}
+
+model SEOReportTopQuery {
+  id               Int    @id @default(autoincrement())
+  report_id        Int
+  query_text       String @db.VarChar(255)
+  clicks           Int    @default(0)
+  impressions      Int    @default(0)
+  ctr              Float  @default(0.0)
+  average_position Float  @default(0.0)
+
+  report SEOReport @relation(fields: [report_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_report_top_query")
+}
+
+model SEOReportTrafficSource {
+  id            Int    @id @default(autoincrement())
+  report_id     Int
+  channel_group String @db.VarChar(100)
+  users_count   Int    @default(0)
+  percentage    Float  @default(0.0)
+
+  report SEOReport @relation(fields: [report_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_report_traffic_source")
+}
+
+model SEOReportActivitySummary {
+  id              Int     @id @default(autoincrement())
+  report_id       Int
+  activity_name   String  @db.VarChar(150)
+  completed_count Int     @default(0)
+  notes           String? @db.VarChar(255)
+
+  report SEOReport @relation(fields: [report_id], references: [id], onDelete: Cascade)
+
+  @@map("seo_report_activity_summary")
+}
+
+model SEOReportFile {
+  id                Int      @id @default(autoincrement())
+  report_id         Int
+  section_name      String   @db.VarChar(50)
+  file_path         String   @db.VarChar(255)
+  original_filename String   @db.VarChar(255)
+  mime_type         String   @db.VarChar(100)
+  file_size         Int      @default(0)
+  caption           String?  @db.VarChar(255)
+  display_order     Int      @default(0)
+  uploaded_by_id    Int
+  created_at        DateTime @default(now()) @db.DateTime(3)
+
+  report      SEOReport @relation(fields: [report_id], references: [id], onDelete: Cascade)
+  uploaded_by User      @relation("UploadedSEOReportFiles", fields: [uploaded_by_id], references: [id], onDelete: Cascade)
+
+  @@index([report_id, section_name])
+  @@map("seo_report_file")
+}
