@@ -325,8 +325,14 @@ export class InvoicesService {
     const itemsData = body.items || [];
     let subtotal = 0;
     for (const item of itemsData) {
-      const qty = item.quantity || 1;
-      const rate = Number(item.rate || 0);
+      if (item.quantity !== undefined && item.quantity !== null && item.quantity !== '' && Number(item.quantity) < 1) {
+        throw new BadRequestException('Invoice item quantity must be at least 1.');
+      }
+      if (item.rate !== undefined && item.rate !== null && item.rate !== '' && Number(item.rate) < 0) {
+        throw new BadRequestException('Invoice item rate cannot be negative.');
+      }
+      const qty = Number(item.quantity || 1);
+      const rate = Number(item.rate ?? 0);
       subtotal += qty * rate;
     }
 
@@ -426,8 +432,14 @@ export class InvoicesService {
     if (body.items !== undefined && Array.isArray(body.items)) {
       let subtotal = 0;
       for (const item of body.items) {
-        const qty = item.quantity || 1;
-        const rate = Number(item.rate || 0);
+        if (item.quantity !== undefined && item.quantity !== null && item.quantity !== '' && Number(item.quantity) < 1) {
+          throw new BadRequestException('Invoice item quantity must be at least 1.');
+        }
+        if (item.rate !== undefined && item.rate !== null && item.rate !== '' && Number(item.rate) < 0) {
+          throw new BadRequestException('Invoice item rate cannot be negative.');
+        }
+        const qty = Number(item.quantity || 1);
+        const rate = Number(item.rate ?? 0);
         subtotal += qty * rate;
       }
       data.subtotal = subtotal;
@@ -660,8 +672,14 @@ export class InvoicesService {
     const formattedItems = [];
 
     for (const item of itemsData) {
+      if (item.quantity !== undefined && item.quantity !== null && item.quantity !== '' && Number(item.quantity) < 1) {
+        throw new BadRequestException('Invoice item quantity must be at least 1.');
+      }
+      if (item.rate !== undefined && item.rate !== null && item.rate !== '' && Number(item.rate) < 0) {
+        throw new BadRequestException('Invoice item rate cannot be negative.');
+      }
       const qty = Number(item.quantity || 1);
-      const rate = Number(item.rate || 0);
+      const rate = Number(item.rate ?? 0);
       const amount = qty * rate;
       subtotal += amount;
       formattedItems.push({
