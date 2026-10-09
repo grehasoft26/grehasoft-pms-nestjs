@@ -243,108 +243,88 @@ def build_experience_certificate_pdf(context, media_root):
 DEFAULT_OFFER_SECTIONS = [
     {
         "id": 1,
-        "title": "1. Commencement of Employment",
-        "content": "Your scheduled joining date will be {joining_date}."
+        "title": "1. Joining and Place of Work",
+        "content": "Your initial place of work will be Grehasoft’s office at Infopark, Kakkanad, Ernakulam, Kerala.\n\nThis is a full-time, work-from-office position. Your normal working hours will be 9:00 AM to 6:00 PM, Monday to Saturday, with one Saturday off per month, together with Sundays and applicable holidays, subject to the internal policies and business requirements."
     },
     {
         "id": 2,
         "title": "2. Compensation",
-        "content": "Your monthly gross salary will be INR {salary_monthly} ({salary_in_words}). Any applicable statutory deductions and taxes will be withheld as per government regulations."
+        "content": "Your monthly gross salary will be INR {salary_monthly}/- ({salary_in_words}). Statutory deductions, taxes and other deductions, wherever applicable, will be made in accordance with applicable law and internal policy of Grehasoft."
     },
     {
         "id": 3,
-        "title": "3. Working Hours and Location",
-        "content": "This is a Work from Office position at our Infopark, Kochi office. Standard hours are 9:00 AM to 6:00 PM, Monday through Saturday (excluding your designated one Saturday off per month and national holidays)."
+        "title": "3. Probation and Confirmation",
+        "content": "You will be on probation for three (3) months from your date of joining. Based on your performance and suitability, Grehasoft may confirm your employment or extend the probation period at its discretion.\n\nDuring probation, Grehasoft reserves the right to terminate your employment, with or without notice, subject to applicable law."
     },
     {
         "id": 4,
-        "title": "4. Probation and Notice Period",
-        "content": "• Probation: You will be on probation for three months from your date of joining. Upon successful completion, your employment will be confirmed based on your performance.\n\n• Resignation: After confirmation, you are required to provide a 45-day notice period or salary in lieu of notice, subject to management approval, to ensure a smooth handover of projects/works/clients and responsibilities."
+        "title": "4. Notice Period and Separation",
+        "content": "Following confirmation, either party may initiate separation from employment by giving 45 days’ written notice, subject to applicable internal policies and completion of a proper handover of assigned work, projects, clients and responsibilities."
     },
     {
         "id": 5,
-        "title": "5. Intellectual Property (IP) & Work Ownership",
-        "content": "All works, deliverables, or outputs created, developed, designed, or conceived by you during your employment—including but not limited to software code, website designs, branding materials, logos, marketing content, graphics, digital assets, strategies, and any other intellectual property—are \"works made for hire\" and shall be the sole and exclusive property of Grehasoft. You shall have no right, title, or interest in any such work and are prohibited from using, copying, reproducing, or claiming ownership of these materials for personal, external, or competitive use."
+        "title": "5. Duties, Conduct and Outside Engagements",
+        "content": "You shall diligently and professionally perform the duties assigned to you and comply with the internal policies, reasonable management instructions, applicable laws and applicable client requirements.\n\nDuring your employment, you shall devote your working time and attention to you work related engagements and shall not undertake any other employment, freelance, consultancy or business activity which conflicts with your duties or the interests of Grehasoft, without prior written approval."
     },
     {
         "id": 6,
-        "title": "6. Professional Accountability & Quality Standards",
-        "content": "You are responsible for maintaining high standards of accuracy, quality, and professionalism in all work assigned to you.\n\n• Quality Assurance: You must ensure all deliverables meet company standards and client requirements before submission.\n\n• Accuracy & Correctness: You are expected to verify all information, data, content, and technical work for accuracy and compliance.\n\n• Liability for Negligence: Any loss, damage, financial liability, or client complaint arising from gross negligence, willful misconduct, carelessness, or unauthorized errors in your work—including but not limited to incorrect information in social media posts, development code, strategies, or any other deliverables—will be your professional responsibility. You acknowledge that such failures may result in disciplinary action, including termination, and potential recovery of losses."
-    },
-    {
-        "id": 7,
-        "title": "7. Leave and Holiday Policy",
-        "content": "• Weekly Off: One Saturday per month will be granted as an additional off day. Regular Sundays remain as weekly offs.\n\n• National & Statutory Holidays: All national holidays and statutory holidays as declared by the Government will be observed."
-    },
-    {
-        "id": 8,
-        "title": "8. Confidentiality and Non-Disclosure",
+        "title": "6. Confidentiality",
         "content": "You shall not disclose any proprietary information, client data, business strategies, trade secrets, or confidential materials of Grehasoft to any third party during or after your employment, without prior written consent from management. This obligation continues even after termination of employment."
     },
     {
+        "id": 7,
+        "title": "7. Intellectual Property and Work Product",
+        "content": "All software, source code, designs, content, graphics, documents, strategies, processes, materials, inventions, developments and other work products created, developed or contributed to by you in the course of your employment or using Grehasoft resources shall, to the extent permitted by law, belong exclusively to Grehasoft.\n\nYou shall promptly disclose and hand over such work products to Grehasoft and shall not use or reproduce them for personal, external or competing purposes without prior written authorisation."
+    },
+    {
+        "id": 8,
+        "title": "8. Data Protection & Privacy Compliance",
+        "content": "All Grehasoft equipment, documents, records, software, access credentials and other assets provided to you shall remain the property of Grehasoft and shall be used only for authorised purposes.\n\nYou shall safeguard Grehasoft and client data and comply with Grehasoft’s information-security and data-protection requirements, including compliance with all data protection regulations, applicable privacy laws and industry standards. Upon request or cessation of employment, all properties, records, data and materials of Grehasoft in your possession or control shall be immediately returned or handed over, and you shall not retain unauthorised copies."
+    },
+    {
         "id": 9,
-        "title": "9. Non-Competition",
-        "content": "During your employment and for a period of one year following your departure, you agree not to directly or indirectly solicit, contact, or provide similar or competing services to any clients of Grehasoft that you handled, worked with, or had knowledge of during your tenure."
+        "title": "9. Performance and Responsibilities",
+        "content": "You are expected to maintain appropriate standards of accuracy, quality, professionalism and accountability in your work. Any wilful misconduct, material breach of duty, serious negligence, unauthorised act or violation of internal policies may result in appropriate disciplinary action, including termination, in accordance with applicable law.\n\nWhere any loss is caused to Grehasoft by proven fraud, wilful misconduct, unauthorised acts or other actionable conduct on your part, Grehasoft reserves its rights to take appropriate action and seek recovery in accordance with applicable law."
     },
     {
         "id": 10,
-        "title": "10. Code of Conduct & Professional Ethics",
-        "content": "You are expected to maintain professional conduct at all times, including:\n\n• Punctuality and regular attendance as per scheduled working hours.\n\n• Professional behavior and respectful communication with colleagues and clients.\n\n• Adherence to company policies and management directives.\n\n• Prohibition of harassment, discrimination, or unethical conduct.\n\n• Maintaining professional standards in all client interactions and deliverables. Violation of conduct standards may result in disciplinary action up to and including termination."
+        "title": "10. Background Information",
+        "content": "This offer is based on the information and documents provided by you. Any material misrepresentation, falsification or wilful suppression of relevant information may result in withdrawal of the offer or appropriate disciplinary action, including termination, subject to applicable law."
     },
     {
         "id": 11,
-        "title": "11. Attendance & Leave Rules",
-        "content": "• Punctuality: Repeated tardiness or early departures without authorization may result in salary deduction or disciplinary action.\n\n• Absence: Any unplanned absence must be reported to your manager immediately. Unauthorized absences for more than three consecutive days may be treated as abandonment of employment.\n\n• Leave Application: All leave requests must be submitted in advance through the designated approval process, except in case of medical emergencies."
+        "title": "11. Conflict of Interest and Client Non-Solicitation",
+        "content": "You shall not use Grehasoft resources, confidential information or business relationships for any unauthorised personal or external purpose or engage in activities that create a conflict of interest with Grehasoft.\n\nDuring your employment and for a period of one year following your departure, you agree not to directly or indirectly solicit, contact, or provide similar or competing services to any clients of Grehasoft that you handled, worked with, or had knowledge of during your tenure."
     },
     {
         "id": 12,
-        "title": "12. Data Protection & Privacy Compliance",
-        "content": "You are required to:\n\n• Handle all client data, personal information, and confidential business information with utmost care and security.\n\n• Comply with all data protection regulations, including applicable privacy laws and industry standards.\n\n• Never share, store, or transmit client data through unauthorized channels.\n\n• Report any data breaches or security incidents to management immediately. Failure to comply may result in legal action and termination of employment."
+        "title": "12. Leave and Holidays",
+        "content": "Leave, weekly offs and holidays will be governed by the internal policies and applicable law."
     },
     {
         "id": 13,
-        "title": "13. Company Assets & Equipment",
-        "content": "• All company-provided equipment (laptop, mobile device, access cards, software licenses, etc.) remains the property of Grehasoft.\n\n• You are responsible for safeguarding these assets and using them only for authorized business purposes.\n\n• Upon termination or on request, all company assets must be returned in good condition. Damage due to negligence or theft will be deducted from your final settlement.\n\n• Unauthorized use or loss of company assets may result in disciplinary action or legal proceedings."
+        "title": "13. Performance Review and Compensation",
+        "content": "Your performance may be reviewed periodically. Any salary revision or other compensatory benefits will be subject to your performance, internal policy, business conditions and management discretion and shall not be deemed automatic."
     },
     {
         "id": 14,
-        "title": "14. Conflict of Interest",
-        "content": "You are prohibited from:\n\n• Engaging in any side business, freelancing, or consulting work during office hours is not allowed.\n\n• Providing services to competitors or clients that conflict with Grehasoft's business interests.\n\n• Using company resources, time, or intellectual knowledge for personal or external projects.\n\n• Accepting gifts, favors, or commissions from clients that could compromise your objectivity. Violation may result in termination and recovery of losses incurred by Grehasoft."
+        "title": "14. Termination",
+        "content": "Grehasoft may terminate your employment for unsatisfactory performance, misconduct, material breach of internal policies or obligations, or other legitimate grounds, subject to applicable law and the terms of this letter.\n\nIn cases of serious misconduct or other circumstances permitting immediate termination under applicable law, Grehasoft may terminate the employment without notice or payment in lieu thereof."
     },
     {
         "id": 15,
-        "title": "15. Remote Work Policy",
-        "content": "Remote or work-from-home arrangements are not part of this offer unless explicitly approved by management. Any future remote work shall be subject to company policy and management discretion, and may be revoked at any time."
+        "title": "15. Compliance and Regulatory Adherence",
+        "content": "You shall comply with all applicable laws, internal policies, code of conduct, information-security requirements and other reasonable operational guidelines, as amended and communicated from time to time."
     },
     {
         "id": 16,
-        "title": "16. Performance Review & Increment Policy",
-        "content": "• Performance Reviews: Formal performance reviews will be conducted [quarterly/semi-annually/annually] to assess your contribution, skills, and professional development.\n\n• Salary Increments: Increments, bonuses, or benefits are not guaranteed and are contingent upon satisfactory performance, company financial health, and management discretion.\n\n• Probation Review: At the end of your probation period, your performance will be evaluated to determine confirmation of employment."
+        "title": "16. General",
+        "content": "This offer letter, together with the internal policies, constitutes the terms governing your employment unless superseded by a subsequent written employment agreement.\n\nAny amendment to the terms of employment will be communicated to you in writing. This letter shall be governed by applicable laws of India, and courts at Kochi, Kerala shall have jurisdiction, subject to applicable law."
     },
     {
         "id": 17,
-        "title": "17. Termination of Employment",
-        "content": "a) Termination by Grehasoft: Grehasoft may terminate your employment under the following circumstances:\n\n• Completion of probation period with unsatisfactory performance.\n\n• Gross misconduct, theft, or violation of confidentiality.\n\n• Repeated negligence or failures affecting client relationships.\n\n• Breach of code of conduct or company policies.\n\n• Redundancy or business closure (notice or severance as per applicable law).\n\nb) Immediate Termination: Grehasoft reserves the right to terminate employment immediately without notice or severance pay in cases of:\n\n• Theft or dishonesty.\n\n• Breach of confidentiality or IP theft.\n\n• Gross insubordination or misconduct.\n\n• Legal or criminal violations.\n\nc) Termination by Employee: You may terminate employment by providing the 45-day notice period as stated in Section 4, or by paying salary in lieu of notice, subject to management approval and completion of project handover."
-    },
-    {
-        "id": 18,
-        "title": "18. Compliance and Regulatory Adherence",
-        "content": "You are expected to adhere to all company policies, code of conduct, and operational guidelines as laid out in the company handbook and management directives. You acknowledge that your work must comply with all applicable laws, industry standards, and client contractual obligations."
-    },
-    {
-        "id": 19,
-        "title": "19. Amendments to Terms",
-        "content": "Grehasoft reserves the right to amend, modify, or update any terms and conditions of this offer letter with prior written notice to the employee. Continuance of employment after such amendments constitutes acceptance of the revised terms."
-    },
-    {
-        "id": 20,
-        "title": "20. Governing Law and Jurisdiction",
-        "content": "This offer letter and all terms of employment shall be governed by the laws of the Republic of India, specifically the laws of the State of Kerala. Any disputes arising out of this employment shall be subject to the jurisdiction of courts in Kochi, Kerala."
-    },
-    {
-        "id": 21,
-        "title": "21. Acknowledgment of Receipt",
-        "content": "By signing this offer letter, you confirm that you have received a complete copy, read and understood all terms, and agree to be bound by them. You also confirm that you have disclosed all relevant information about your background and qualifications, and that any false or misleading information may result in immediate termination."
+        "title": "17. Acceptance",
+        "content": "We are pleased to have you join Grehasoft and look forward to a successful and rewarding association with you.\n\nPlease sign below as confirmation of your acceptance of this offer."
     }
 ]
 
@@ -363,7 +343,7 @@ def replace_offer_placeholders(text: str, context: dict) -> str:
     dt = str(context.get("date", ""))
     issue_dt = str(context.get("date") or context.get("issue_date") or "")
     hr = str(context.get("hr_name", "HR Manager"))
-    comp = str(context.get("company_name", "GREHASOFT"))
+    comp = str(context.get("company_name", "Grehasoft"))
 
     replacements = {
         "{employee_name}": emp_name,
@@ -384,6 +364,7 @@ def replace_offer_placeholders(text: str, context: dict) -> str:
         "{joining_date}": joining,
         "{{joining_date}}": joining,
         "[Joining Date]": joining,
+        "[Date]": joining,
 
         "{salary_monthly}": sal_str,
         "{{salary_monthly}}": sal_str,
@@ -398,7 +379,6 @@ def replace_offer_placeholders(text: str, context: dict) -> str:
 
         "{date}": dt,
         "{{date}}": dt,
-        "[Date]": dt,
 
         "{issue_date}": issue_dt,
         "{{issue_date}}": issue_dt,
@@ -408,6 +388,7 @@ def replace_offer_placeholders(text: str, context: dict) -> str:
 
         "{company_name}": comp,
         "{{company_name}}": comp,
+        "[Firm Name]": comp,
     }
     for k, v in replacements.items():
         text = text.replace(k, v)
@@ -480,10 +461,12 @@ def build_custom_offer_letter_pdf(context, media_root, custom_sections):
 
     header_info = f"""
     <b>Date:</b> {context.get('date', '')}<br/><br/>
-    <b>To:</b> {context.get('employee_name', '')} {context.get('address', '')}<br/><br/>
+    <b>To:</b><br/>
+    {context.get('employee_name', '')}<br/>
+    {context.get('address', '')}<br/><br/>
     <b>Subject: Offer of Employment – {context.get('position', '')}</b><br/><br/>
     Dear {context.get('employee_name', '')},<br/><br/>
-    We are pleased to offer you the position of <b>{context.get('position', '')}</b> at Grehasoft. This letter outlines the terms and conditions of your employment.
+    We are pleased to offer you the position of <b>{context.get('position', '')}</b> with <b>Grehasoft</b>, with effect from <b>{context.get('joining_date', '')}</b>, on the following terms and conditions:
     """
     story.append(Paragraph(replace_offer_placeholders(header_info, context), sub_style))
     story.append(Spacer(1, 10))
@@ -517,34 +500,15 @@ def build_custom_offer_letter_pdf(context, media_root, custom_sections):
 
     story.append(Spacer(1, 15))
 
-    acc_title_style = ParagraphStyle(
-        "AccTitleStyle",
-        parent=title_style,
-        fontSize=14,
-        leading=18,
-        spaceBefore=15,
-        spaceAfter=10,
-        keepWithNext=True
-    )
-
-    acceptance_flowables = [
-        Paragraph("Acceptance of Terms", acc_title_style),
-        Spacer(1, 6),
-        Paragraph(
-            "By signing below, you confirm that you have read, understood, and agree to all the terms and conditions outlined in this offer letter.",
-            sub_style
-        ),
-        Spacer(1, 15),
-    ]
-
     grehasoft_sig_text = f"""
-    <b>For Grehasoft,</b><br/><br/><br/>
-    <b>Raji T Skariah</b><br/>
+    <b>For Grehasoft</b><br/><br/><br/>
+    <b>Ms. Raji T Skariah</b><br/>
     Founder & CEO<br/>
     Grehasoft, Infopark, Kochi
     """
 
     seal_path = os.path.join(media_root, 'icons', 'seal.png')
+    sig_flowables = []
     if os.path.exists(seal_path):
         seal_img = Image(seal_path, width=110, height=90)
         table_data = [[Paragraph(grehasoft_sig_text, sub_style), seal_img]]
@@ -554,26 +518,25 @@ def build_custom_offer_letter_pdf(context, media_root, custom_sections):
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
         ]))
-        acceptance_flowables.append(sig_table)
+        sig_flowables.append(sig_table)
     else:
-        acceptance_flowables.append(Paragraph(grehasoft_sig_text, sub_style))
+        sig_flowables.append(Paragraph(grehasoft_sig_text, sub_style))
 
-    acceptance_flowables.append(Spacer(1, 15))
+    sig_flowables.append(Spacer(1, 15))
 
     emp_name = str(context.get('employee_name', '_________________________'))
-    emp_pos = str(context.get('position', '_________________________'))
+    joining_dt = str(context.get('joining_date', '________________________'))
 
     emp_acceptance_text = f"""
-    <b>Employee Acceptance:</b><br/><br/>
-    I, <b>{emp_name}</b>, accept the offer of employment for the position of <b>{emp_pos}</b> under the terms and conditions mentioned above. I confirm that I have read and understood all clauses and agree to be bound by them.<br/><br/><br/>
-
+    <b>Employee Acceptance</b><br/><br/>
+    I, <b>{emp_name}</b>, have read and understood the terms of this offer and hereby confirm my acceptance of the offer. I confirm that I will join at the offered location on <b>{joining_dt}</b>.<br/><br/><br/>
     <b>Employee Signature:</b> _________________________<br/><br/>
     <b>Date:</b> _________________________<br/><br/>
     <b>Contact Number:</b> _________________________
     """
-    acceptance_flowables.append(Paragraph(emp_acceptance_text, sub_style))
+    sig_flowables.append(Paragraph(emp_acceptance_text, sub_style))
 
-    story.append(KeepTogether(acceptance_flowables))
+    story.append(KeepTogether(sig_flowables))
 
     doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
     buf.seek(0)
