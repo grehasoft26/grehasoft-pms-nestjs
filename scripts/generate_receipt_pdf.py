@@ -57,10 +57,14 @@ def format_date_ddmmyyyy(date_str):
         return f"{parts[2]}-{parts[1]}-{parts[0]}"
     return s
 
+import re
+
 def format_receipt_number(rct_str):
     if not rct_str:
         return ""
-    s = str(rct_str).strip().replace("/", "-")
+    s = str(rct_str).strip()
+    s = re.sub(r'[-/]01$', '', s)
+    s = s.replace("/", "-")
     if s.startswith("RCT-GSI-"):
         s = "RCT-" + s[8:]
     return s
@@ -192,7 +196,7 @@ def generate_receipt_pdf(receipt, media_root=""):
    
     if client.address:
         addr_clean = client.address.replace("\n", "<br/>").replace("\r", "")
-        to_lines.append(f" {addr_clean}")
+        to_lines.append(f" {addr_clean}"),
     if getattr(client, 'country', None) and client.country:
         to_lines.append(f"Country: {client.country}")
     if client.phone:
