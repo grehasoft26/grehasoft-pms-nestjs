@@ -18,7 +18,9 @@ logs/
 .windsurf/
 
 media/test_*
+media/seo_reports/
 media/task_files/spec_doc_*
 media/icons/seal.jpeg
 private_storage/
 scratch/
+

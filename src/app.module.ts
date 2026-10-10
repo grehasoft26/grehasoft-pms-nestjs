@@ -20,6 +20,9 @@ import { ClientPortalModule } from './modules/client-portal/client-portal.module
 import { ReportsModule } from './modules/reports/reports.module';
 import { BackupsModule } from './modules/backups/backups.module';
 import { InvoiceTemplatesModule } from './modules/invoice-templates/invoice-templates.module';
+import { SeoReportsModule } from './modules/seo-reports/seo-reports.module';
+import { ExpensesModule } from './modules/expenses/expenses.module';
+import { FinancialReportsModule } from './modules/financial-reports/financial-reports.module';
 
 @Module({
   imports: [
@@ -35,6 +38,7 @@ import { InvoiceTemplatesModule } from './modules/invoice-templates/invoice-temp
     InvoicesModule,
     InvoiceTemplatesModule,
     SeoModule,
+    SeoReportsModule,
     InfrastructureModule,
     HrModule,
     TrackingModule,
@@ -42,6 +46,8 @@ import { InvoiceTemplatesModule } from './modules/invoice-templates/invoice-temp
     ClientPortalModule,
     ReportsModule,
     BackupsModule,
+    ExpensesModule,
+    FinancialReportsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
