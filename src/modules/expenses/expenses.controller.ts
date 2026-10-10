@@ -68,6 +68,17 @@ export class ExpensesController {
   }
 
   @Put([':id', ':id/'])
+  @Permissions('MANAGE_EXPENSES')
+  @UseInterceptors(FileInterceptor('receipt_file'))
+  async updatePut(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: any,
+    @Body() dto: UpdateExpenseDto,
+    @UploadedFile() file?: any,
+  ) {
+    return this.expensesService.update(id, user, dto, file);
+  }
+
   @Patch([':id', ':id/'])
   @Permissions('MANAGE_EXPENSES')
   @UseInterceptors(FileInterceptor('receipt_file'))

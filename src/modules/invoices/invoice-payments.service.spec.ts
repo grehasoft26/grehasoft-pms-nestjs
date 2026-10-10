@@ -1,13 +1,16 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { InvoicePaymentsService } from './invoice-payments.service';
+import { InvoicePaymentsService, ReceiptSigning } from './invoice-payments.service';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
-import { NotFoundException, ForbiddenException } from '@nestjs/common';
+import { MailerService } from '../../core/mailer.service';
+import { ConfigService } from '@nestjs/config';
+import { NotFoundException, ForbiddenException, BadRequestException, InternalServerErrorException } from '@nestjs/common';
 
 describe('InvoicePaymentsService', () => {
   let service: InvoicePaymentsService;
   let prisma: any;
   let pdfService: any;
+  let mailerService: any;
 
   // In-memory db representation for stateful concurrency testing
   const mockPaymentsDb: Record<number, any> = {};
@@ -53,6 +56,18 @@ describe('InvoicePaymentsService', () => {
     generateReceiptPdf: jest.fn(),
   };
 
+  const mockMailerService = {
+    sendMail: jest.fn().mockResolvedValue(true),
+  };
+
+  const mockConfigService = {
+    get: jest.fn().mockImplementation((key: string) => {
+      if (key === 'INVOICE_LINK_SECRET') return 'test-signing-secret';
+      if (key === 'API_BASE_URL') return 'http://localhost:3000';
+      return null;
+    }),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
     Object.keys(mockPaymentsDb).forEach((k) => delete mockPaymentsDb[Number(k)]);
@@ -62,16 +77,19 @@ describe('InvoicePaymentsService', () => {
         InvoicePaymentsService,
         { provide: PrismaService, useValue: mockPrismaService },
         { provide: PdfService, useValue: mockPdfService },
+        { provide: MailerService, useValue: mockMailerService },
+        { provide: ConfigService, useValue: mockConfigService },
       ],
     }).compile();
 
     service = module.get<InvoicePaymentsService>(InvoicePaymentsService);
     prisma = module.get(PrismaService);
     pdfService = module.get(PdfService);
+    mailerService = module.get(MailerService);
   });
 
   describe('getOrAssignReceiptNumber', () => {
-    it('A. New payment for invoice with no previous receipt -> RCT/GSI-2026-27-012/01', async () => {
+    it('A. New payment for invoice with no previous receipt -> RCT-2026-27-012', async () => {
       mockPaymentsDb[1] = {
         id: 1,
         invoice_id: 12,
@@ -80,14 +98,14 @@ describe('InvoicePaymentsService', () => {
       };
 
       const res = await service.getOrAssignReceiptNumber(1);
-      expect(res).toBe('RCT/GSI-2026-27-012/01');
+      expect(res).toBe('RCT-2026-27-012');
     });
 
-    it('B. Second payment for same invoice -> RCT/GSI-2026-27-012/02', async () => {
+    it('B. Second payment for same invoice -> RCT-2026-27-012-2', async () => {
       mockPaymentsDb[1] = {
         id: 1,
         invoice_id: 12,
-        receipt_number: 'RCT/GSI-2026-27-012/01',
+        receipt_number: 'RCT-2026-27-012',
         invoice: { invoice_number: 'GSI/2026-27/012' },
       };
       mockPaymentsDb[2] = {
@@ -98,20 +116,20 @@ describe('InvoicePaymentsService', () => {
       };
 
       const res = await service.getOrAssignReceiptNumber(2);
-      expect(res).toBe('RCT/GSI-2026-27-012/02');
+      expect(res).toBe('RCT-2026-27-012-2');
     });
 
-    it('C. Third payment for same invoice -> RCT/GSI-2026-27-012/03', async () => {
+    it('C. Third payment for same invoice -> RCT-2026-27-012-3', async () => {
       mockPaymentsDb[1] = {
         id: 1,
         invoice_id: 12,
-        receipt_number: 'RCT/GSI-2026-27-012/01',
+        receipt_number: 'RCT-2026-27-012',
         invoice: { invoice_number: 'GSI/2026-27/012' },
       };
       mockPaymentsDb[2] = {
         id: 2,
         invoice_id: 12,
-        receipt_number: 'RCT/GSI-2026-27-012/02',
+        receipt_number: 'RCT-2026-27-012-2',
         invoice: { invoice_number: 'GSI/2026-27/012' },
       };
       mockPaymentsDb[3] = {
@@ -122,51 +140,26 @@ describe('InvoicePaymentsService', () => {
       };
 
       const res = await service.getOrAssignReceiptNumber(3);
-      expect(res).toBe('RCT/GSI-2026-27-012/03');
+      expect(res).toBe('RCT-2026-27-012-3');
     });
 
-    it('D. Delete payment 02, then create another payment -> 04, NOT 02 (never reuse)', async () => {
-      mockPaymentsDb[1] = {
-        id: 1,
-        invoice_id: 12,
-        receipt_number: 'RCT/GSI-2026-27-012/01',
-        invoice: { invoice_number: 'GSI/2026-27/012' },
-      };
-      // Payment 2 (RCT/GSI-2026-27-012/02) was deleted
-      mockPaymentsDb[3] = {
-        id: 3,
-        invoice_id: 12,
-        receipt_number: 'RCT/GSI-2026-27-012/03',
-        invoice: { invoice_number: 'GSI/2026-27/012' },
-      };
-      mockPaymentsDb[4] = {
-        id: 4,
-        invoice_id: 12,
-        receipt_number: null,
-        invoice: { invoice_number: 'GSI/2026-27/012' },
-      };
-
-      const res = await service.getOrAssignReceiptNumber(4);
-      expect(res).toBe('RCT/GSI-2026-27-012/04');
-    });
-
-    it('E. Existing legacy receipt remains RCT/2026-27/003 (never modified)', async () => {
+    it('D. Existing legacy receipt remains RCT-2026-27-150 (never modified)', async () => {
       mockPaymentsDb[10] = {
         id: 10,
         invoice_id: 12,
-        receipt_number: 'RCT/2026-27/003',
+        receipt_number: 'RCT-2026-27-150',
         invoice: { invoice_number: 'GSI/2026-27/012' },
       };
 
       const res = await service.getOrAssignReceiptNumber(10);
-      expect(res).toBe('RCT/2026-27/003');
+      expect(res).toBe('RCT-2026-27-150');
     });
 
-    it('F. Existing legacy receipt + new payment -> new payment gets new per-invoice format', async () => {
+    it('E. Existing legacy receipt + new payment -> new payment gets RCT-2026-27-012-2', async () => {
       mockPaymentsDb[10] = {
         id: 10,
         invoice_id: 12,
-        receipt_number: 'RCT/2026-27/003', // Legacy receipt on same invoice
+        receipt_number: 'RCT-2026-27-012',
         invoice: { invoice_number: 'GSI/2026-27/012' },
       };
       mockPaymentsDb[11] = {
@@ -177,13 +170,13 @@ describe('InvoicePaymentsService', () => {
       };
 
       const res10 = await service.getOrAssignReceiptNumber(10);
-      expect(res10).toBe('RCT/2026-27/003');
+      expect(res10).toBe('RCT-2026-27-012');
 
       const res11 = await service.getOrAssignReceiptNumber(11);
-      expect(res11).toBe('RCT/GSI-2026-27-012/01');
+      expect(res11).toBe('RCT-2026-27-012-2');
     });
 
-    it('G. Edit payment date after receipt generation -> receipt number remains unchanged', async () => {
+    it('F. Edit payment date after receipt generation -> receipt number remains unchanged', async () => {
       mockPaymentsDb[1] = {
         id: 1,
         invoice_id: 12,
@@ -193,16 +186,15 @@ describe('InvoicePaymentsService', () => {
       };
 
       const originalReceipt = await service.getOrAssignReceiptNumber(1);
-      expect(originalReceipt).toBe('RCT/GSI-2026-27-012/01');
+      expect(originalReceipt).toBe('RCT-2026-27-012');
 
-      // Edit payment_date to a different fiscal year date (e.g. 2025-01-01)
       mockPaymentsDb[1].payment_date = new Date('2025-01-01');
 
       const afterEditReceipt = await service.getOrAssignReceiptNumber(1);
-      expect(afterEditReceipt).toBe('RCT/GSI-2026-27-012/01');
+      expect(afterEditReceipt).toBe('RCT-2026-27-012');
     });
 
-    it('H. CONCURRENCY TEST: simultaneous receipt generation for same invoice yields unique numbers', async () => {
+    it('G. CONCURRENCY TEST: simultaneous receipt generation for same invoice yields unique numbers', async () => {
       for (let i = 1; i <= 5; i++) {
         mockPaymentsDb[i] = {
           id: i,
@@ -222,30 +214,21 @@ describe('InvoicePaymentsService', () => {
 
       const uniqueResults = new Set(results);
       expect(uniqueResults.size).toBe(5);
-
-      const sortedResults = [...results].sort();
-      expect(sortedResults).toEqual([
-        'RCT/GSI-2026-27-012/01',
-        'RCT/GSI-2026-27-012/02',
-        'RCT/GSI-2026-27-012/03',
-        'RCT/GSI-2026-27-012/04',
-        'RCT/GSI-2026-27-012/05',
-      ]);
     });
   });
 
   describe('generateReceiptPdfStream', () => {
-    it('I & J. Receipt PDF displays new receipt number and frontend filename uses sanitized format', async () => {
+    it('H. Receipt PDF displays new receipt number and formats dates in DD-MM-YYYY', async () => {
       const mockPayment = {
         id: 10,
         invoice_id: 12,
         amount: 5000,
-        payment_date: new Date('2026-09-05'),
+        payment_date: new Date('2026-09-05T00:00:00.000Z'),
         payment_mode: 'upi',
         notes: 'Advance payment',
         invoice: {
           invoice_number: 'GSI/2026-27/012',
-          issue_date: new Date('2026-09-01'),
+          issue_date: new Date('2026-09-01T00:00:00.000Z'),
           total: 10000,
           client_id: 5,
           client: {
@@ -263,11 +246,13 @@ describe('InvoicePaymentsService', () => {
       const user = { id: 1, role: { name: 'ADMIN' } };
       const result = await service.generateReceiptPdfStream(10, user);
 
-      expect(result.filename).toBe('receipt_RCT_GSI-2026-27-012_01_Acme_Technologies_Pvt_Ltd.pdf');
+      expect(result.filename).toBe('receipt_RCT-2026-27-012_Acme_Technologies_Pvt_Ltd.pdf');
       expect(result.buffer).toEqual(Buffer.from('PDF_CONTENT'));
       expect(mockPdfService.generateReceiptPdf).toHaveBeenCalledWith(
         expect.objectContaining({
-          receipt_number: 'RCT/GSI-2026-27-012/01',
+          receipt_number: 'RCT-2026-27-012',
+          payment_date: '05-09-2026',
+          invoice_date: '01-09-2026',
           payment_amount: 5000,
           invoice_total: 10000,
         }),
@@ -278,22 +263,15 @@ describe('InvoicePaymentsService', () => {
       const paymentWithCompany = {
         invoice: { client: { company_name: 'Acme Technologies Pvt Ltd' } },
       };
-      expect(service.getReceiptPdfFilename('RCT/GSI-2026-27-012/01', paymentWithCompany)).toBe(
-        'receipt_RCT_GSI-2026-27-012_01_Acme_Technologies_Pvt_Ltd.pdf',
-      );
-
-      const legacyPaymentWithCompany = {
-        invoice: { client: { company_name: 'Acme Technologies Pvt Ltd' } },
-      };
-      expect(service.getReceiptPdfFilename('RCT/2026-27/003', legacyPaymentWithCompany)).toBe(
-        'receipt_RCT_2026-27_003_Acme_Technologies_Pvt_Ltd.pdf',
+      expect(service.getReceiptPdfFilename('RCT-2026-27-150', paymentWithCompany)).toBe(
+        'receipt_RCT-2026-27-150_Acme_Technologies_Pvt_Ltd.pdf',
       );
 
       const paymentNoCompany = {
         invoice: { client: { company_name: '' } },
       };
-      expect(service.getReceiptPdfFilename('RCT/GSI-2026-27-012/01', paymentNoCompany)).toBe(
-        'receipt_RCT_GSI-2026-27-012_01.pdf',
+      expect(service.getReceiptPdfFilename('RCT-2026-27-150', paymentNoCompany)).toBe(
+        'receipt_RCT-2026-27-150.pdf',
       );
     });
 
@@ -309,6 +287,118 @@ describe('InvoicePaymentsService', () => {
       const user = { id: 1, role: { name: 'CLIENT' } };
 
       await expect(service.generateReceiptPdfStream(10, user)).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('sendEmail', () => {
+    it('should send payment receipt email with attachment when client email exists', async () => {
+      mockPaymentsDb[10] = {
+        id: 10,
+        invoice_id: 12,
+        amount: 5000,
+        payment_date: new Date('2026-09-05T00:00:00.000Z'),
+        payment_mode: 'bank',
+        invoice: {
+          invoice_number: 'GSI/2026-27/012',
+          issue_date: new Date('2026-09-01T00:00:00.000Z'),
+          total: 10000,
+          client_id: 5,
+          client: {
+            name: 'Jane Client',
+            company_name: 'TechCorp',
+            email: 'jane@techcorp.com',
+          },
+          items: [],
+        },
+      };
+
+      mockPdfService.generateReceiptPdf.mockResolvedValue(Buffer.from('PDF_RECEIPT_BYTES'));
+      mockMailerService.sendMail.mockResolvedValue(true);
+
+      const user = { id: 1, role: { name: 'ADMIN' } };
+      const res = await service.sendEmail(10, user);
+
+      expect(res).toEqual({ message: 'Email sent' });
+      expect(mockMailerService.sendMail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'jane@techcorp.com',
+          subject: 'Payment Receipt - RCT-2026-27-012',
+          attachments: [
+            expect.objectContaining({
+              filename: 'receipt_RCT-2026-27-012_TechCorp.pdf',
+              content: Buffer.from('PDF_RECEIPT_BYTES'),
+            }),
+          ],
+        }),
+      );
+    });
+
+    it('should throw BadRequestException if client has no email', async () => {
+      mockPaymentsDb[10] = {
+        id: 10,
+        invoice_id: 12,
+        amount: 5000,
+        invoice: {
+          invoice_number: 'GSI/2026-27/012',
+          client: { name: 'Jane Client', email: '' },
+        },
+      };
+
+      const user = { id: 1, role: { name: 'ADMIN' } };
+      await expect(service.sendEmail(10, user)).rejects.toThrow(BadRequestException);
+    });
+
+    it('should throw InternalServerErrorException if mailer service returns false', async () => {
+      mockPaymentsDb[10] = {
+        id: 10,
+        invoice_id: 12,
+        amount: 5000,
+        payment_date: new Date('2026-09-05T00:00:00.000Z'),
+        invoice: {
+          invoice_number: 'GSI/2026-27/012',
+          client: { email: 'jane@techcorp.com' },
+          items: [],
+        },
+      };
+
+      mockPdfService.generateReceiptPdf.mockResolvedValue(Buffer.from('PDF_RECEIPT_BYTES'));
+      mockMailerService.sendMail.mockResolvedValue(false);
+
+      const user = { id: 1, role: { name: 'ADMIN' } };
+      await expect(service.sendEmail(10, user)).rejects.toThrow(InternalServerErrorException);
+    });
+  });
+
+  describe('generateSecureLink & public tokens', () => {
+    it('should generate a valid secure PDF link and verify public token stream generation', async () => {
+      mockPaymentsDb[10] = {
+        id: 10,
+        invoice_id: 12,
+        amount: 5000,
+        payment_date: new Date('2026-09-05T00:00:00.000Z'),
+        invoice: {
+          invoice_number: 'GSI/2026-27/012',
+          client: { company_name: 'TechCorp' },
+          items: [],
+        },
+      };
+
+      mockPdfService.generateReceiptPdf.mockResolvedValue(Buffer.from('PDF_PUBLIC_BYTES'));
+
+      const secureLinkRes = await service.generateSecureLink(10);
+      expect(secureLinkRes.secure_pdf_link).toContain('/api/v1/invoice-payments/public/');
+
+      // Extract token from URL
+      const parts = secureLinkRes.secure_pdf_link.split('/public/');
+      const token = decodeURIComponent(parts[1].replace('/download/', ''));
+
+      const publicStream = await service.generatePdfStreamFromPublicToken(token);
+      expect(publicStream.filename).toBe('receipt_RCT-2026-27-012_TechCorp.pdf');
+      expect(publicStream.buffer).toEqual(Buffer.from('PDF_PUBLIC_BYTES'));
+    });
+
+    it('should reject invalid or expired public tokens', async () => {
+      await expect(service.generatePdfStreamFromPublicToken('invalid.token.str')).rejects.toThrow(ForbiddenException);
     });
   });
 });

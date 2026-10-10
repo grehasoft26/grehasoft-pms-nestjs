@@ -8,7 +8,7 @@ from num2words import num2words
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import Paragraph, Table, TableStyle, Image
+from reportlab.platypus import Paragraph, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -46,13 +46,33 @@ def setup_poppins_fonts():
     if os.path.exists(bold_path):
         pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
 
+def format_date_ddmmyyyy(date_str):
+    if not date_str:
+        return ""
+    s = str(date_str).strip()
+    if "T" in s:
+        s = s.split("T")[0]
+    parts = s.split("-")
+    if len(parts) == 3 and len(parts[0]) == 4:  # YYYY-MM-DD
+        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+    return s
+
+def format_receipt_number(rct_str):
+    if not rct_str:
+        return ""
+    s = str(rct_str).strip().replace("/", "-")
+    if s.startswith("RCT-GSI-"):
+        s = "RCT-" + s[8:]
+    return s
+
 class MockClient:
     def __init__(self, data):
         self.company_name = data.get('company_name') or ''
-        self.name = data.get('name') or data.get('client_name') or ''
+        self.name = data.get('name') or data.get('contact_person') or data.get('client_name') or ''
         self.email = data.get('email') or ''
         self.phone = data.get('phone') or ''
         self.address = data.get('address') or ''
+        self.country = data.get('country') or ''
         self.gst_no = data.get('gst_no') or data.get('gst_number') or ''
 
 class MockItem:
@@ -64,7 +84,7 @@ class MockItem:
 
 class MockReceiptData:
     def __init__(self, data):
-        self.receipt_number = data.get('receipt_number') or 'RCT/2026-27/001'
+        self.receipt_number = data.get('receipt_number') or 'RCT-2026-27-150'
         self.payment_date = str(data.get('payment_date') or '')
         self.payment_amount = float(data.get('payment_amount') or data.get('amount') or 0.0)
         self.payment_mode = str(data.get('payment_mode') or 'cash').capitalize()
@@ -92,11 +112,10 @@ def generate_receipt_pdf(receipt, media_root=""):
 
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
 
-    # 1️⃣ Create canvas FIRST
     p = canvas.Canvas(tmp_file.name, pagesize=A4)
     width, height = A4
 
-    # 2️⃣ Draw top header banner image (same as Invoice PDF)
+    # 1. Header banner image
     header_path = find_asset(media_root, "invoice_header.png")
     if header_path and os.path.exists(header_path):
         try:
@@ -105,38 +124,33 @@ def generate_receipt_pdf(receipt, media_root=""):
         except Exception as e:
             print("Header image error:", e, file=sys.stderr)
 
-    # Start content height
     y = height - 135
 
-    # -----------------------------
-    # WATERMARK
-    # -----------------------------
+    # 2. Watermark
     p.saveState()
     p.setFont("Poppins-Bold", 80)
     p.setFillGray(0.95, 0.15)
     p.drawCentredString(width/2, height/2, "GREHASOFT")
     p.restoreState()
 
-    # -----------------------------
-    # TITLE & STATUS BADGE
-    # -----------------------------
+    # 3. Title & Status Badge
     p.setFont("Poppins-Bold", 16)
     p.drawCentredString(width/2, y, "PAYMENT RECEIPT")
     y -= 25
 
-    # Badge: PAID
     status_display = "PAID"
     badge_color = colors.HexColor("#28a745")
     badge_width = 65
     badge_x = width - 50 - badge_width
     badge_y = y - 10
 
-    # -----------------------------
-    # RECEIPT META INFO
-    # -----------------------------
+    # 4. Receipt Meta Info
+    display_receipt_number = format_receipt_number(receipt.receipt_number)
+    display_payment_date = format_date_ddmmyyyy(receipt.payment_date)
+
     p.setFont("Poppins", 9.0)
-    p.drawString(50, y, f"Receipt No : {receipt.receipt_number}")
-    p.drawString(50, y - 16, f"Payment Date : {receipt.payment_date}")
+    p.drawString(50, y, f"Receipt No : {display_receipt_number}")
+    p.drawString(50, y - 16, f"Payment Date : {display_payment_date}")
 
     p.saveState()
     p.setFillColor(badge_color)
@@ -154,9 +168,7 @@ def generate_receipt_pdf(receipt, media_root=""):
     p.line(50, y, width - 50, y)
     y -= 15
 
-    # -----------------------------
-    # ISSUED BY (FROM) & PAID BY (TO)
-    # -----------------------------
+    # 5. Issued By (FROM) & Paid By (TO)
     styles = getSampleStyleSheet()
     content_style = ParagraphStyle(
         'PanelContent',
@@ -167,28 +179,28 @@ def generate_receipt_pdf(receipt, media_root=""):
     )
 
     from_html = (
-        "<b>GrehaSoft Smart IT Solutions</b><br/>"
-        "8th Floor, Vismaya Building,<br/>"
-        "Infopark Phase I, Kakkanad,<br/>"
-        "Kochi, Kerala - 682 042<br/>"
-        "Phone: +91 89215 40183<br/>"
-        "Email: info@grehasoft.com<br/>"
-        "Website: www.grehasoft.com"
+        "<b>GrehaSoft</b><br/>"
+        "Infopark Phase I,  Kakkanad, Kochi,<br/>"
+        "Kerala, India - 682 042<br/>"
+        
     )
 
     client = receipt.client
     to_lines = []
     if client.company_name:
         to_lines.append(f"<b>{client.company_name}</b>")
-    if client.name:
-        to_lines.append(f"Contact: {client.name}")
-    if client.email:
-        to_lines.append(f"Email: {client.email}")
-    if client.phone:
-        to_lines.append(f"Phone: {client.phone}")
+   
     if client.address:
         addr_clean = client.address.replace("\n", "<br/>").replace("\r", "")
-        to_lines.append(f"Address: {addr_clean}")
+        to_lines.append(f" {addr_clean}")
+    if getattr(client, 'country', None) and client.country:
+        to_lines.append(f"Country: {client.country}")
+    if client.phone:
+        to_lines.append(f"Phone: {client.phone}")
+    if client.name and client.name != client.company_name:
+        to_lines.append(f"Contact: {client.name}")
+    # if client.email:
+    #     to_lines.append(f"Email: {client.email}")
     if client.gst_no:
         to_lines.append(f"GSTIN: {client.gst_no}")
 
@@ -214,9 +226,7 @@ def generate_receipt_pdf(receipt, media_root=""):
     p.line(50, y, width - 50, y)
     y -= 20
 
-    # -----------------------------
-    # SERVICE / PAYMENT TABLE
-    # -----------------------------
+    # 6. Service / Payment Table
     desc_style = ParagraphStyle(
         'ReceiptItemDescription',
         parent=styles['Normal'],
@@ -244,7 +254,6 @@ def generate_receipt_pdf(receipt, media_root=""):
             f"Rs {receipt.payment_amount:,.2f}"
         ])
 
-    # Summary Rows
     total_row_idx = len(table_data)
     table_data.append(["Total Invoice Amount", f"Rs {receipt.invoice_total:,.2f}"])
 
@@ -268,7 +277,6 @@ def generate_receipt_pdf(receipt, media_root=""):
         ("TOPPADDING", (0, 0), (-1, -1), 6),
     ]
 
-    # Style summary rows
     table_styles.extend([
         ("FONTNAME", (0, total_row_idx), (-1, total_row_idx), "Poppins-Medium"),
         ("FONTSIZE", (0, total_row_idx), (-1, total_row_idx), 9.5),
@@ -285,7 +293,7 @@ def generate_receipt_pdf(receipt, media_root=""):
     table.setStyle(TableStyle(table_styles))
 
     w, h = table.wrap(width - 100, height)
-    if y - h < 120:
+    if y - h < 180:
         p.showPage()
         p.saveState()
         p.setFont("Poppins-Bold", 80)
@@ -298,9 +306,7 @@ def generate_receipt_pdf(receipt, media_root=""):
     table.drawOn(p, 50, y - h)
     y = y - h - 15
 
-    # -----------------------------
-    # AMOUNT IN WORDS & PAYMENT METHOD
-    # -----------------------------
+    # 7. Amount in Words & Payment Method
     current_pay_amount = receipt.payment_amount
     rupees = int(current_pay_amount)
     paise = int(round((current_pay_amount - rupees) * 100))
@@ -323,32 +329,46 @@ def generate_receipt_pdf(receipt, media_root=""):
     p.drawString(50, y, f"Amount Received in Words: {final_words.capitalize()}")
     y -= 18
     p.drawString(50, y, f"Payment Mode: {receipt.payment_mode}" + (f" | Notes: {receipt.notes}" if receipt.notes else ""))
-    y -= 15
+    y -= 25
 
-    # -----------------------------
-    # FOOTER: PLACE, DATE, SEAL & HR STYLE FOOTER BAR
-    # -----------------------------
-    place_date_y = 120
-    p.setFillColor(colors.HexColor("#000000"))
-    p.setFont("Poppins", 10)
-    p.drawString(50, place_date_y, "Place: Kochi")
-    p.drawString(50, place_date_y - 15, f"Date: {receipt.payment_date}")
+    # 8. Check vertical space remaining above footer elements
+    if y < 190:
+        p.showPage()
+        p.saveState()
+        p.setFont("Poppins-Bold", 80)
+        p.setFillGray(0.95, 0.15)
+        p.drawCentredString(width/2, height/2, "GREHASOFT")
+        p.restoreState()
+        y = height - 80
 
-    # Seal beside Date/Place on the right
+    # 9. Seal aligned LEFT below payment details
     seal_path = find_asset(media_root, "seal.png")
+    seal_width = 90
+    seal_height = 75
+    seal_x = 50
+    seal_y = y - seal_height
+
     if seal_path and os.path.exists(seal_path):
         try:
             seal = ImageReader(seal_path)
-            p.drawImage(seal, width - 50 - 130, 70, width=130, height=110, mask='auto')
+            p.drawImage(seal, seal_x, seal_y, width=seal_width, height=seal_height, mask='auto')
         except Exception as e:
             print("Seal image error:", e, file=sys.stderr)
 
-    # Green Footer Line (matching HR Documents PDF)
+    # 10. Place and Date directly BELOW seal, left-aligned at seal's left edge (x = 50)
+    place_y = seal_y - 14
+    date_y = place_y - 14
+
+    p.setFillColor(colors.HexColor("#000000"))
+    p.setFont("Poppins", 9.5)
+    p.drawString(50, place_y, "Place: Kochi")
+    p.drawString(50, date_y, f"Date: {display_payment_date}")
+
+    # 11. Green Footer Line & Text
     p.setStrokeColor(colors.HexColor("#1AB728"))
     p.setLineWidth(2)
     p.line(50, 60, width - 50, 60)
 
-    # Footer Text (matching HR Documents PDF)
     p.setFillColor(colors.HexColor("#05044A"))
     p.setFont("Poppins", 9)
     p.drawCentredString(width / 2, 40, "Grehasoft | Infopark, Kochi | www.grehasoft.com")

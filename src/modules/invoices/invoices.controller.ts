@@ -78,6 +78,14 @@ export class InvoicesController {
   }
 
   @Put([':id', ':id/'])
+  async updatePut(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: any,
+    @Body() body: any,
+  ) {
+    return this.invoicesService.update(id, user, body);
+  }
+
   @Patch([':id', ':id/'])
   async update(
     @Param('id', ParseIntPipe) id: number,

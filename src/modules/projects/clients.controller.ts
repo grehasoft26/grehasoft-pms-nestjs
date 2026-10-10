@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, ParseIntPipe, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Get, Post, Put, Patch, Delete, Param, Query, Body, UseGuards, ParseIntPipe, HttpCode, HttpStatus } from '@nestjs/common';
 import { ClientsService } from './clients.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
@@ -44,7 +44,17 @@ export class ClientsController {
     return this.clientsService.create(body);
   }
 
-  @Patch(':id')
+  @Put([':id', ':id/'])
+  @Permissions('VIEW_CLIENTS')
+  async updatePut(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: any,
+    @Body() body: any,
+  ) {
+    return this.clientsService.update(id, user, body);
+  }
+
+  @Patch([':id', ':id/'])
   @Permissions('VIEW_CLIENTS')
   async update(
     @Param('id', ParseIntPipe) id: number,
