@@ -257,7 +257,7 @@ def generate_receipt_pdf(receipt, media_root=""):
     header_path = find_asset(media_root, "invoice_header.png")
     if header_path:
         try:
-            p.drawImage(ImageReader(header_path), 0, height - 90, width=width, height=90)
+            p.drawImage(ImageReader(header_path), 0, height - 80, width=width, height=80)
         except Exception as e:
             print("Header image error:", e, file=sys.stderr)
 
@@ -314,10 +314,10 @@ def generate_receipt_pdf(receipt, media_root=""):
         to_parts.append(Paragraph(addr, small_style))
     to_contact = []
     
-    if client.name and client.company_name and client.name != client.company_name:
-        to_parts.append(Paragraph(f"Contact: {esc(client.name)}", small_style))
-    if client.phone:
-        to_contact.append(f"Phone: {esc(client.phone)}")
+    # if client.name and client.company_name and client.name != client.company_name:
+    #     to_parts.append(Paragraph(f"Contact: {esc(client.name)}", small_style))
+    # if client.phone:
+    #     to_contact.append(f"Phone: {esc(client.phone)}")
     if to_contact:
         to_parts.append(Paragraph(" &nbsp;|&nbsp; ".join(to_contact), small_style))
     if client.gst_no:
@@ -418,7 +418,7 @@ def generate_receipt_pdf(receipt, media_root=""):
         y -= nh + 12
 
     # ---------- 7. Seal + Place / Date ----------
-    seal_w, seal_h = 90, 75
+    seal_w, seal_h = 80, 75
     block_h = seal_h + 34
     if y - block_h < 75:
         draw_footer(p, width)
