@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import tempfile
 import shutil
 from num2words import num2words
@@ -13,6 +14,22 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+# Brand palette (unchanged from the previous receipt / invoice design)
+BRAND_NAVY = colors.HexColor("#1f4e79")
+BRAND_DARK = colors.HexColor("#05044A")
+BRAND_GREEN = colors.HexColor("#1AB728")
+PAID_GREEN = colors.HexColor("#28a745")
+TEXT_DARK = colors.HexColor("#1e293b")
+TEXT_MUTED = colors.HexColor("#64748b")
+RULE_GREY = colors.HexColor("#e2e8f0")
+PANEL_BG = colors.HexColor("#f8fafc")
+RECEIVED_BG = colors.HexColor("#eaf7ee")
+RECEIVED_TEXT = colors.HexColor("#155724")
+BALANCE_RED = colors.HexColor("#b91c1c")
+
+MARGIN = 50
+
 
 def find_asset(media_root, filename):
     paths = [
@@ -31,10 +48,11 @@ def find_asset(media_root, filename):
             return p
     return None
 
+
 def setup_poppins_fonts():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     fonts_dir = os.path.join(script_dir, "fonts")
-    
+
     reg_path = os.path.join(fonts_dir, "Poppins-Regular.ttf")
     med_path = os.path.join(fonts_dir, "Poppins-Medium.ttf")
     bold_path = os.path.join(fonts_dir, "Poppins-Bold.ttf")
@@ -45,6 +63,7 @@ def setup_poppins_fonts():
         pdfmetrics.registerFont(TTFont("Poppins-Medium", med_path))
     if os.path.exists(bold_path):
         pdfmetrics.registerFont(TTFont("Poppins-Bold", bold_path))
+
 
 def format_date_ddmmyyyy(date_str):
     if not date_str:
@@ -57,47 +76,132 @@ def format_date_ddmmyyyy(date_str):
         return f"{parts[2]}-{parts[1]}-{parts[0]}"
     return s
 
-import re
 
-def format_receipt_number(rct_str):
+def format_receipt_number(rct_str, invoice_number=None):
+    """Display-only receipt number. Prefer the invoice-derived base; never mutate stored values.
+
+    Invoice GSI/2026-27/001 -> RCT-2026-27-001
+    Stored RCT-2026-27-001-2 / RCT/GSI-2026-27-001/01 -> RCT-2026-27-001
+    Invoice suffixes are not stripped; only receipt payment suffixes are.
+    """
+    inv = str(invoice_number or "").strip()
+    if inv:
+        sanitized = re.sub(r"^GSI[/\-_]?", "", inv, flags=re.I)
+        sanitized = sanitized.replace("/", "-")
+        return f"RCT-{sanitized}"
+
     if not rct_str:
         return ""
-    s = str(rct_str).strip()
-    s = re.sub(r'[-/]01$', '', s)
-    s = s.replace("/", "-")
-    if s.startswith("RCT-GSI-"):
+    s = str(rct_str).strip().replace("/", "-")
+    if s.upper().startswith("RCT-GSI-"):
         s = "RCT-" + s[8:]
+    payment_suffix = re.match(r"^(RCT-\d{4}-\d{2}-[A-Za-z0-9]+)-\d+$", s)
+    if payment_suffix:
+        return payment_suffix.group(1)
     return s
+
+
+def format_inr(amount):
+    """Format a number as Indian currency, e.g. Rs. 1,23,456.00"""
+    try:
+        value = float(amount or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    negative = value < 0
+    value = abs(value)
+    whole, frac = f"{value:.2f}".split(".")
+    if len(whole) > 3:
+        head, tail = whole[:-3], whole[-3:]
+        groups = []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            groups.insert(0, head)
+        whole = ",".join(groups) + "," + tail
+    return f"{'-' if negative else ''}Rs. {whole}.{frac}"
+
+
+def amount_in_words(amount):
+    rupees = int(amount)
+    paise = int(round((amount - rupees) * 100))
+    try:
+        words = num2words(rupees, lang="en_IN").replace(",", "")
+    except Exception:
+        words = str(rupees)
+    if paise > 0:
+        try:
+            paise_words = num2words(paise, lang="en_IN")
+        except Exception:
+            paise_words = str(paise)
+        text = f"Rupees {words} and {paise_words} paise only"
+    else:
+        text = f"Rupees {words} only"
+    return text[:1].upper() + text[1:]
+
+
+PAYMENT_MODE_LABELS = {
+    "cash": "Cash",
+    "upi": "UPI",
+    "bank": "Bank Transfer",
+    "bank_transfer": "Bank Transfer",
+    "neft": "NEFT",
+    "rtgs": "RTGS",
+    "imps": "IMPS",
+    "cheque": "Cheque",
+    "card": "Card",
+    "advance": "Advance",
+}
+
+
+def format_payment_mode(mode):
+    m = str(mode or "").strip()
+    if not m:
+        return ""
+    return PAYMENT_MODE_LABELS.get(m.lower(), m.replace("_", " ").title())
+
+
+def esc(text):
+    return (str(text or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def _opt_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 class MockClient:
     def __init__(self, data):
-        self.company_name = data.get('company_name') or ''
-        self.name = data.get('name') or data.get('contact_person') or data.get('client_name') or ''
-        self.email = data.get('email') or ''
-        self.phone = data.get('phone') or ''
-        self.address = data.get('address') or ''
-        self.country = data.get('country') or ''
-        self.gst_no = data.get('gst_no') or data.get('gst_number') or ''
+        self.company_name = (data.get('company_name') or '').strip()
+        self.name = (data.get('name') or data.get('contact_person') or data.get('client_name') or '').strip()
+        self.email = (data.get('email') or '').strip()
+        self.phone = (data.get('phone') or '').strip()
+        self.address = (data.get('address') or '').strip()
+        self.country = (data.get('country') or '').strip()
+        self.gst_no = (data.get('gst_no') or data.get('gst_number') or '').strip()
 
-class MockItem:
-    def __init__(self, item):
-        self.description = item.get('description', '')
-        self.quantity = item.get('quantity', 1)
-        self.rate = float(item.get('rate', 0.0))
-        self.amount = float(item.get('amount', 0.0))
 
 class MockReceiptData:
     def __init__(self, data):
-        self.receipt_number = data.get('receipt_number') or 'RCT-2026-27-150'
+        self.receipt_number = str(data.get('receipt_number') or '')
         self.payment_date = str(data.get('payment_date') or '')
         self.payment_amount = float(data.get('payment_amount') or data.get('amount') or 0.0)
-        self.payment_mode = str(data.get('payment_mode') or 'cash').capitalize()
-        self.notes = str(data.get('notes') or '')
+        self.payment_mode = format_payment_mode(data.get('payment_mode'))
+        self.notes = str(data.get('notes') or '').strip()
 
-        self.invoice_number = str(data.get('invoice_number') or 'INV-001')
+        self.invoice_number = str(data.get('invoice_number') or '')
         self.invoice_date = str(data.get('invoice_date') or '')
         self.invoice_total = float(data.get('invoice_total') or 0.0)
-        self.service_description = str(data.get('service_description') or f"Payment for Invoice {self.invoice_number}")
+        # Supplied by the backend; None means "not available" and the row is hidden.
+        self.previously_paid = _opt_float(data.get('previously_paid'))
+        self.balance_due = _opt_float(data.get('balance_due'))
 
         client_data = data.get('client') or {}
         if not isinstance(client_data, dict):
@@ -108,302 +212,271 @@ class MockReceiptData:
             client_data['phone'] = data.get('client_phone')
         self.client = MockClient(client_data)
 
-        raw_items = data.get('items', [])
-        self.items = [MockItem(i) for i in raw_items]
+
+def draw_watermark(p, width, height):
+    p.saveState()
+    p.setFont("Poppins-Bold", 80)
+    p.setFillGray(0.95, 0.15)
+    p.drawCentredString(width / 2, height / 2, "GREHASOFT")
+    p.restoreState()
+
+
+def draw_footer(p, width):
+    p.setStrokeColor(BRAND_GREEN)
+    p.setLineWidth(2)
+    p.line(MARGIN, 60, width - MARGIN, 60)
+    p.setFillColor(BRAND_DARK)
+    p.setFont("Poppins", 9)
+    p.drawCentredString(width / 2, 40, "Grehasoft | Infopark, Kochi | www.grehasoft.com")
+
 
 def generate_receipt_pdf(receipt, media_root=""):
     setup_poppins_fonts()
 
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp_file.close()
 
     p = canvas.Canvas(tmp_file.name, pagesize=A4)
     width, height = A4
+    content_w = width - 2 * MARGIN
 
-    # 1. Header banner image
+    styles = getSampleStyleSheet()
+    label_style = ParagraphStyle(
+        'Label', parent=styles['Normal'],
+        fontName='Poppins-Medium', fontSize=8, leading=11, textColor=TEXT_MUTED)
+    body_style = ParagraphStyle(
+        'Body', parent=styles['Normal'],
+        fontName='Poppins', fontSize=9, leading=13, textColor=TEXT_DARK)
+    name_style = ParagraphStyle(
+        'Name', parent=body_style,
+        fontName='Poppins-Bold', fontSize=10.5, leading=14)
+    small_style = ParagraphStyle(
+        'Small', parent=body_style, fontSize=8.5, leading=12, textColor=TEXT_DARK)
+
+    # ---------- 1. Header banner ----------
     header_path = find_asset(media_root, "invoice_header.png")
-    if header_path and os.path.exists(header_path):
+    if header_path:
         try:
-            header = ImageReader(header_path)
-            p.drawImage(header, 0, height-90, width=width, height=90)
+            p.drawImage(ImageReader(header_path), 0, height - 90, width=width, height=90)
         except Exception as e:
             print("Header image error:", e, file=sys.stderr)
 
-    y = height - 135
+    draw_watermark(p, width, height)
 
-    # 2. Watermark
-    p.saveState()
-    p.setFont("Poppins-Bold", 80)
-    p.setFillGray(0.95, 0.15)
-    p.drawCentredString(width/2, height/2, "GREHASOFT")
-    p.restoreState()
+    # ---------- 2. Title (centered, no PAID badge) ----------
+    y = height - 118
+    p.setFillColor(BRAND_NAVY)
+    p.setFont("Poppins-Bold", 17)
+    p.drawCentredString(width / 2, y, "PAYMENT RECEIPT")
 
-    # 3. Title & Status Badge
-    p.setFont("Poppins-Bold", 16)
-    p.drawCentredString(width/2, y, "PAYMENT RECEIPT")
-    y -= 25
+    # Thin rule below title
+    y -= 10
+    p.setStrokeColor(RULE_GREY)
+    p.setLineWidth(0.8)
+    p.line(MARGIN, y, width - MARGIN, y)
+    y -= 14
 
-    status_display = "PAID"
-    badge_color = colors.HexColor("#28a745")
-    badge_width = 65
-    badge_x = width - 50 - badge_width
-    badge_y = y - 10
-
-    # 4. Receipt Meta Info
-    display_receipt_number = format_receipt_number(receipt.receipt_number)
+    # ---------- 3. Receipt No & Payment Date (left-aligned, below title) ----------
+    display_receipt_number = format_receipt_number(receipt.receipt_number, receipt.invoice_number)
     display_payment_date = format_date_ddmmyyyy(receipt.payment_date)
 
-    p.setFont("Poppins", 9.0)
-    p.drawString(50, y, f"Receipt No : {display_receipt_number}")
-    p.drawString(50, y - 16, f"Payment Date : {display_payment_date}")
+    p.setFont("Poppins-Medium", 9)
+    p.setFillColor(TEXT_DARK)
+    if display_receipt_number:
+        p.drawString(MARGIN, y, f"Receipt No: {display_receipt_number}")
+        y -= 14
+    if display_payment_date:
+        p.drawString(MARGIN, y, f"Payment Date: {display_payment_date}")
+        y -= 14
 
-    p.saveState()
-    p.setFillColor(badge_color)
-    p.roundRect(badge_x, badge_y, badge_width, 18, 3, fill=1, stroke=0)
-    p.setFillColor(colors.white)
-    p.setFont("Poppins-Bold", 8.5)
-    p.drawCentredString(badge_x + badge_width/2, badge_y + 5, status_display)
-    p.restoreState()
+    y -= 8  # breathing room before FROM/TO
 
-    y -= 32
+    # ---------- 4. FROM / TO two-column layout ----------
+    col_gap = 20
+    col_w = (content_w - col_gap) / 2
 
-    # Top separator line
-    p.setStrokeColor(colors.HexColor("#e2e8f0"))
-    p.setLineWidth(1)
-    p.line(50, y, width - 50, y)
-    y -= 15
+    # --- FROM: GrehaSoft company details ---
+    from_parts = [
+        Paragraph("FROM", label_style),
+        Paragraph("Grehasoft", name_style),
+        Paragraph("Infopark Phase I, Kakkanad, Kochi,", small_style),
+        Paragraph("Kerala, India - 682 042", small_style),
+    ]
 
-    # 5. Issued By (FROM) & Paid By (TO)
-    styles = getSampleStyleSheet()
-    content_style = ParagraphStyle(
-        'PanelContent',
-        parent=styles['Normal'],
-        fontName='Poppins',
-        fontSize=9,
-        leading=13
-    )
-
-    from_html = (
-        "<b>GrehaSoft</b><br/>"
-        "Infopark Phase I,  Kakkanad, Kochi,<br/>"
-        "Kerala, India - 682 042<br/>"
-        
-    )
-
+    # --- TO: customer details (only populate what's present) ---
     client = receipt.client
-    to_lines = []
-    if client.company_name:
-        to_lines.append(f"<b>{client.company_name}</b>")
-   
+    primary_name = client.company_name or client.name
+    to_parts = [Paragraph("TO", label_style)]
+    if primary_name:
+        to_parts.append(Paragraph(esc(primary_name), name_style))
+    if client.name and client.company_name and client.name != client.company_name:
+        to_parts.append(Paragraph(f"Attn: {esc(client.name)}", small_style))
     if client.address:
-        addr_clean = client.address.replace("\n", "<br/>").replace("\r", "")
-        to_lines.append(f" {addr_clean}"),
-    if getattr(client, 'country', None) and client.country:
-        to_lines.append(f"Country: {client.country}")
+        addr = esc(client.address).replace("\r", "").replace("\n", "<br/>")
+        to_parts.append(Paragraph(addr, small_style))
+    to_contact = []
     if client.phone:
-        to_lines.append(f"Phone: {client.phone}")
-    if client.name and client.name != client.company_name:
-        to_lines.append(f"Contact: {client.name}")
-    # if client.email:
-    #     to_lines.append(f"Email: {client.email}")
+        to_contact.append(f"Ph: {esc(client.phone)}")
+    
+    if to_contact:
+        to_parts.append(Paragraph(" &nbsp;|&nbsp; ".join(to_contact), small_style))
     if client.gst_no:
-        to_lines.append(f"GSTIN: {client.gst_no}")
+        to_parts.append(Paragraph(f"GSTIN: {esc(client.gst_no)}", small_style))
 
-    to_html = "<br/>".join(to_lines) if to_lines else "Valued Client"
+    # Payment reference below customer details (Invoice No + Mode)
+   
+    # if receipt.payment_mode:
+    #     to_parts.append(Paragraph(f"Payment Mode: {esc(receipt.payment_mode)}", small_style)
 
-    left_cell = Paragraph(f"<font color='#1f4e79'><b>FROM:</b></font><br/><br/>{from_html}", content_style)
-    right_cell = Paragraph(f"<font color='#1f4e79'><b>TO:</b></font><br/><br/>{to_html}", content_style)
-
-    info_table = Table([[left_cell, right_cell]], colWidths=[265, 265])
-    info_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
-        ('TOPPADDING', (0, 0), (-1, -1), 0),
-        ('LEFTPADDING', (0, 0), (-1, -1), 0),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-    ]))
-
-    iw, ih = info_table.wrap(width - 100, height)
-    info_table.drawOn(p, 50, y - ih)
-    y = y - ih - 15
-
-    # Bottom separator line
-    p.line(50, y, width - 50, y)
-    y -= 20
-
-    # 6. Service / Payment Table
-    desc_style = ParagraphStyle(
-        'ReceiptItemDescription',
-        parent=styles['Normal'],
-        fontName='Poppins',
-        fontSize=9,
-        leading=12,
-        textColor=colors.black
-    )
-
-    table_data = [
-        ["Description of Service", "Amount"]
-    ]
-
-    if receipt.items and len(receipt.items) > 0:
-        for item in receipt.items:
-            clean_desc = str(item.description or '').replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
-            table_data.append([
-                Paragraph(clean_desc, desc_style) if clean_desc else "",
-                f"Rs {item.amount:,.2f}"
-            ])
-    else:
-        clean_desc = str(receipt.service_description or '').replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
-        table_data.append([
-            Paragraph(clean_desc, desc_style) if clean_desc else "",
-            f"Rs {receipt.payment_amount:,.2f}"
-        ])
-
-    total_row_idx = len(table_data)
-    table_data.append(["Total Invoice Amount", f"Rs {receipt.invoice_total:,.2f}"])
-
-    received_row_idx = len(table_data)
-    table_data.append(["Amount Received (Current Payment)", f"Rs {receipt.payment_amount:,.2f}"])
-
-    table = Table(table_data, colWidths=[345, 150])
-
-    items_count = len(receipt.items) if receipt.items else 1
-    table_styles = [
+    from_to_table = Table([[from_parts, to_parts]], colWidths=[col_w, col_w])
+    from_to_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("GRID", (0, 0), (-1, items_count), 1, colors.grey),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Poppins-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 10),
-        ("ALIGN", (1, 1), (1, items_count), "RIGHT"),
-        ("FONTNAME", (0, 1), (-1, items_count), "Poppins"),
-        ("FONTSIZE", (0, 1), (-1, items_count), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (0, 0), col_gap),
+        ("RIGHTPADDING", (1, 0), (1, 0), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    _, ft_h = from_to_table.wrap(content_w, height)
+    from_to_table.drawOn(p, MARGIN, y - ft_h)
+    y -= ft_h + 14
+
+    # Thin rule after FROM/TO
+    p.setStrokeColor(RULE_GREY)
+    p.setLineWidth(0.8)
+    p.line(MARGIN, y, width - MARGIN, y)
+    y -= 14
+
+    # ---------- 5. Amount Received highlight ----------
+    box_h = 50
+    p.setFillColor(RECEIVED_BG)
+    p.roundRect(MARGIN, y - box_h, content_w, box_h, 6, fill=1, stroke=0)
+    p.setFillColor(RECEIVED_TEXT)
+    p.setFont("Poppins-Medium", 8.5)
+    p.drawString(MARGIN + 14, y - 19, "AMOUNT RECEIVED")
+    p.setFont("Poppins-Bold", 17)
+    p.drawString(MARGIN + 14, y - 39, format_inr(receipt.payment_amount))
+    y -= box_h + 6
+
+    words_par = Paragraph(
+        f"<font color='#64748b'>Amount in words:</font> {esc(amount_in_words(receipt.payment_amount))}",
+        body_style)
+    _, wh = words_par.wrap(content_w, height)
+    words_par.drawOn(p, MARGIN, y - wh)
+    y -= wh + 14
+
+    # ---------- 6. Payment Summary ----------
+    p.setFillColor(BRAND_NAVY)
+    p.setFont("Poppins-Bold", 10)
+    p.drawString(MARGIN, y, "Payment Summary")
+    y -= 8
+
+    rows = [["Invoice Total", format_inr(receipt.invoice_total)]]
+    if receipt.previously_paid is not None and receipt.previously_paid > 0.004:
+        rows.append(["Previously Paid", format_inr(receipt.previously_paid)])
+    received_idx = len(rows)
+    rows.append([f"Amount Received Against Invoice No. {esc(receipt.invoice_number)}", format_inr(receipt.payment_amount)])
+    balance_idx = None
+    if receipt.balance_due is not None:
+        balance_idx = len(rows)
+        rows.append(["Balance Due", format_inr(receipt.balance_due)])
+
+    summary = Table(rows, colWidths=[content_w - 160, 160])
+    ts = [
+        ("FONTNAME", (0, 0), (-1, -1), "Poppins"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+        ("TEXTCOLOR", (0, 0), (-1, -1), TEXT_DARK),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.6, RULE_GREY),
+        ("BOX", (0, 0), (-1, -1), 0.8, RULE_GREY),
+        ("BACKGROUND", (0, 0), (-1, -1), PANEL_BG),
+        ("FONTNAME", (0, received_idx), (-1, received_idx), "Poppins-Bold"),
+        ("TEXTCOLOR", (0, received_idx), (-1, received_idx), RECEIVED_TEXT),
+        ("BACKGROUND", (0, received_idx), (-1, received_idx), RECEIVED_BG),
     ]
+    if balance_idx is not None:
+        bal_color = BALANCE_RED if receipt.balance_due > 0.004 else RECEIVED_TEXT
+        ts += [
+            ("FONTNAME", (0, balance_idx), (-1, balance_idx), "Poppins-Bold"),
+            ("TEXTCOLOR", (0, balance_idx), (-1, balance_idx), bal_color),
+            ("BACKGROUND", (0, balance_idx), (-1, balance_idx), colors.white),
+        ]
+    summary.setStyle(TableStyle(ts))
+    _, sh = summary.wrap(content_w, height)
+    summary.drawOn(p, MARGIN, y - sh)
+    y -= sh + 12
 
-    table_styles.extend([
-        ("FONTNAME", (0, total_row_idx), (-1, total_row_idx), "Poppins-Medium"),
-        ("FONTSIZE", (0, total_row_idx), (-1, total_row_idx), 9.5),
-        ("ALIGN", (0, total_row_idx), (-1, -1), "RIGHT"),
-        ("LINEABOVE", (0, total_row_idx), (-1, total_row_idx), 1, colors.grey),
-        ("FONTNAME", (0, received_row_idx), (-1, received_row_idx), "Poppins-Bold"),
-        ("FONTSIZE", (0, received_row_idx), (-1, received_row_idx), 10),
-        ("BACKGROUND", (0, received_row_idx), (-1, received_row_idx), colors.HexColor("#d4edda")),
-        ("TEXTCOLOR", (0, received_row_idx), (-1, received_row_idx), colors.HexColor("#155724")),
-        ("LINEABOVE", (0, received_row_idx), (-1, received_row_idx), 1, colors.grey),
-        ("LINEBELOW", (0, received_row_idx), (-1, received_row_idx), 1.5, colors.grey),
-    ])
+    if receipt.notes:
+        notes_par = Paragraph(
+            f"<font color='#64748b'>Notes:</font> {esc(receipt.notes)}", body_style)
+        _, nh = notes_par.wrap(content_w, height)
+        notes_par.drawOn(p, MARGIN, y - nh)
+        y -= nh + 12
 
-    table.setStyle(TableStyle(table_styles))
-
-    w, h = table.wrap(width - 100, height)
-    if y - h < 180:
+    # ---------- 7. Seal + Place / Date ----------
+    seal_w, seal_h = 90, 75
+    block_h = seal_h + 34
+    if y - block_h < 75:
+        draw_footer(p, width)
         p.showPage()
-        p.saveState()
-        p.setFont("Poppins-Bold", 80)
-        p.setFillGray(0.95, 0.15)
-        p.drawCentredString(width/2, height/2, "GREHASOFT")
-        p.restoreState()
-        y = height - 80
-        w, h = table.wrap(width - 100, height)
-
-    table.drawOn(p, 50, y - h)
-    y = y - h - 15
-
-    # 7. Amount in Words & Payment Method
-    current_pay_amount = receipt.payment_amount
-    rupees = int(current_pay_amount)
-    paise = int(round((current_pay_amount - rupees) * 100))
-
-    try:
-        amount_words = num2words(rupees, lang="en_IN").replace(",", "")
-    except Exception:
-        amount_words = str(rupees)
-
-    if paise > 0:
-        try:
-            paise_words = num2words(paise, lang="en_IN")
-        except Exception:
-            paise_words = str(paise)
-        final_words = f"Rupees {amount_words} and {paise_words} paise only"
-    else:
-        final_words = f"Rupees {amount_words} only"
-
-    p.setFont("Poppins", 9.5)
-    p.drawString(50, y, f"Amount Received in Words: {final_words.capitalize()}")
-    y -= 18
-    p.drawString(50, y, f"Payment Mode: {receipt.payment_mode}" + (f" | Notes: {receipt.notes}" if receipt.notes else ""))
-    y -= 25
-
-    # 8. Check vertical space remaining above footer elements
-    if y < 190:
-        p.showPage()
-        p.saveState()
-        p.setFont("Poppins-Bold", 80)
-        p.setFillGray(0.95, 0.15)
-        p.drawCentredString(width/2, height/2, "GREHASOFT")
-        p.restoreState()
+        draw_watermark(p, width, height)
         y = height - 80
 
-    # 9. Seal aligned LEFT below payment details
+    y -= 6
     seal_path = find_asset(media_root, "seal.png")
-    seal_width = 90
-    seal_height = 75
-    seal_x = 50
-    seal_y = y - seal_height
-
-    if seal_path and os.path.exists(seal_path):
+    if seal_path:
         try:
-            seal = ImageReader(seal_path)
-            p.drawImage(seal, seal_x, seal_y, width=seal_width, height=seal_height, mask='auto')
+            p.drawImage(ImageReader(seal_path), MARGIN, y - seal_h,
+                        width=seal_w, height=seal_h, mask='auto')
         except Exception as e:
             print("Seal image error:", e, file=sys.stderr)
 
-    # 10. Place and Date directly BELOW seal, left-aligned at seal's left edge (x = 50)
-    place_y = seal_y - 14
-    date_y = place_y - 14
-
-    p.setFillColor(colors.HexColor("#000000"))
-    p.setFont("Poppins", 9.5)
-    p.drawString(50, place_y, "Place: Kochi")
-    p.drawString(50, date_y, f"Date: {display_payment_date}")
-
-    # 11. Green Footer Line & Text
-    p.setStrokeColor(colors.HexColor("#1AB728"))
-    p.setLineWidth(2)
-    p.line(50, 60, width - 50, 60)
-
-    p.setFillColor(colors.HexColor("#05044A"))
+    p.setFillColor(TEXT_DARK)
     p.setFont("Poppins", 9)
-    p.drawCentredString(width / 2, 40, "Grehasoft | Infopark, Kochi | www.grehasoft.com")
+    p.drawString(MARGIN, y - seal_h - 14, "Place: Kochi")
+    if display_payment_date:
+        p.drawString(MARGIN, y - seal_h - 27, f"Date: {display_payment_date}")
+
+    # p.setFillColor(TEXT_MUTED)
+    # p.setFont("Poppins", 8)
+    # p.drawRightString(width - MARGIN, y - seal_h - 27,
+    #                   "This is a computer-generated receipt.")
+
+    # ---------- 8. Footer ----------
+    draw_footer(p, width)
 
     p.save()
-
     return tmp_file.name
+
 
 def main():
     if len(sys.argv) < 3:
         print("Usage: python generate_receipt_pdf.py <json_input_file> <output_pdf_file>", file=sys.stderr)
         sys.exit(1)
-        
+
     input_file = sys.argv[1]
     output_file = sys.argv[2]
-    
+
     with open(input_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
-        
+
     receipt_data = data.get('receipt', {})
     media_root = data.get('media_root', '')
-    
+
     mock_receipt = MockReceiptData(receipt_data)
     pdf_temp_path = generate_receipt_pdf(mock_receipt, media_root=media_root)
-    
+
     shutil.copyfile(pdf_temp_path, output_file)
     try:
         os.remove(pdf_temp_path)
     except Exception:
         pass
     print("SUCCESS")
+
 
 if __name__ == '__main__':
     main()

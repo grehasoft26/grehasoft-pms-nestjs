@@ -103,6 +103,47 @@ export class InvoicePaymentsService {
     return s;
   }
 
+  /**
+   * Receipt number shown inside the PDF only. Stored payment.receipt_number is unchanged.
+   * Derived from the invoice number so every payment on the same invoice shows the same base
+   * (e.g. RCT-2026-27-001-2 still displays RCT-2026-27-001). Invoice suffixes are not stripped.
+   */
+  getDisplayReceiptNumber(invoiceNumber?: string | null, storedReceiptNumber?: string | null): string {
+    const invoice = (invoiceNumber || '').trim();
+    if (invoice) {
+      const sanitizedInvNum = invoice.replace(/^GSI[\/\-_]?/i, '').replace(/\//g, '-');
+      return `RCT-${sanitizedInvNum}`;
+    }
+    return this.normalizeStoredReceiptNumberForDisplay(storedReceiptNumber || '');
+  }
+
+  private normalizeStoredReceiptNumberForDisplay(rctStr: string): string {
+    if (!rctStr) return '';
+    let s = String(rctStr).trim().replace(/\//g, '-');
+    if (s.toUpperCase().startsWith('RCT-GSI-')) {
+      s = 'RCT-' + s.slice(8);
+    }
+    // Strip a payment-sequence suffix only (e.g. -2, -3, -01), never the invoice sequence.
+    const withPaymentSuffix = s.match(/^(RCT-\d{4}-\d{2}-[A-Za-z0-9]+)-\d+$/);
+    if (withPaymentSuffix) {
+      return withPaymentSuffix[1];
+    }
+    return s;
+  }
+
+  private nextUniqueStoredReceiptNumber(baseReceiptNumber: string, used: Set<string>): string {
+    if (!used.has(baseReceiptNumber)) {
+      return baseReceiptNumber;
+    }
+    for (let n = 2; n < 10000; n++) {
+      const candidate = `${baseReceiptNumber}-${n}`;
+      if (!used.has(candidate)) {
+        return candidate;
+      }
+    }
+    throw new InternalServerErrorException('Failed to allocate a unique receipt number');
+  }
+
   async getOrAssignReceiptNumber(paymentId: number): Promise<string> {
     return this.acquireLock(async () => {
       const existing = await this.prisma.invoicePayment.findUnique({
@@ -122,8 +163,8 @@ export class InvoicePaymentsService {
       }
 
       const rawInvoiceNum = existing.invoice?.invoice_number || `INV-${existing.invoice_id}`;
-      const sanitizedInvNum = rawInvoiceNum.replace(/^GSI[\/\-_]?/i, '').replace(/[\/]/g, '-');
-      const prefix = `RCT-${sanitizedInvNum}`;
+      const sanitizedInvNum = rawInvoiceNum.replace(/^GSI[\/\-_]?/i, '').replace(/\//g, '-');
+      const baseReceiptNumber = `RCT-${sanitizedInvNum}`;
       const lockKey = `receipt_lock_inv_${existing.invoice_id}`;
 
       let mysqlLockAcquired = false;
@@ -139,6 +180,7 @@ export class InvoicePaymentsService {
           // Ignore lock query errors in non-MySQL environments or mocks
         }
 
+        // Re-check after acquiring lock (another concurrent call may have just assigned one).
         const recheck = await this.prisma.invoicePayment.findUnique({
           where: { id: paymentId },
           select: { receipt_number: true },
@@ -147,25 +189,36 @@ export class InvoicePaymentsService {
           return recheck.receipt_number;
         }
 
-        const existingPayments = await this.prisma.invoicePayment.findMany({
-          where: {
-            invoice_id: existing.invoice_id,
-            receipt_number: { startsWith: prefix },
-          },
-          select: { receipt_number: true },
-        });
+        const maxAttempts = 25;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          const usedReceipts = await this.prisma.invoicePayment.findMany({
+            where: {
+              receipt_number: { startsWith: baseReceiptNumber },
+            },
+            select: { receipt_number: true },
+          });
+          const used = new Set(
+            usedReceipts.map((p) => p.receipt_number).filter((n): n is string => !!n),
+          );
+          const candidateReceiptNumber = this.nextUniqueStoredReceiptNumber(baseReceiptNumber, used);
 
-        let candidateReceiptNumber = prefix;
-        if (existingPayments.length > 0) {
-          candidateReceiptNumber = `${prefix}-${existingPayments.length + 1}`;
+          try {
+            const updated = await this.prisma.invoicePayment.update({
+              where: { id: paymentId },
+              data: { receipt_number: candidateReceiptNumber },
+            });
+            return updated.receipt_number;
+          } catch (error: any) {
+            if (error?.code !== 'P2002') {
+              throw error;
+            }
+            if (attempt === maxAttempts) {
+              throw error;
+            }
+          }
         }
 
-        const updated = await this.prisma.invoicePayment.update({
-          where: { id: paymentId },
-          data: { receipt_number: candidateReceiptNumber },
-        });
-
-        return updated.receipt_number;
+        throw new InternalServerErrorException('Failed to assign a unique receipt number');
       } finally {
         if (mysqlLockAcquired) {
           try {
@@ -188,6 +241,7 @@ export class InvoicePaymentsService {
           include: {
             client: true,
             items: true,
+            payments: true,
           },
         },
       },
@@ -206,32 +260,46 @@ export class InvoicePaymentsService {
 
     const receiptNumber = await this.getOrAssignReceiptNumber(id);
 
+    // Point-in-time summary for THIS receipt, using the same formula as
+    // InvoicesService.formatInvoice (total_paid = advance + sum(payments)).
+    // "Previously paid" = advance + payments recorded before this one
+    // (ordered by payment_date, then id as a tie-breaker).
+    const invoiceTotal = payment.invoice.total ? Number(payment.invoice.total) : 0;
+    const currentAmount = payment.amount ? Number(payment.amount) : 0;
+    const advance = (payment.invoice as any)?.advance ? Number((payment.invoice as any).advance) : 0;
+    const currentTime = payment.payment_date ? new Date(payment.payment_date).getTime() : 0;
+    const earlierPaymentsSum = ((payment.invoice as any)?.payments || [])
+      .filter((p: any) => {
+        if (p.id === payment.id) return false;
+        const t = p.payment_date ? new Date(p.payment_date).getTime() : 0;
+        return t < currentTime || (t === currentTime && p.id < payment.id);
+      })
+      .reduce((sum: number, p: any) => sum + (p.amount ? Number(p.amount) : 0), 0);
+    const previouslyPaid = Math.round((advance + earlierPaymentsSum) * 100) / 100;
+    const balanceDue = Math.max(0, Math.round((invoiceTotal - previouslyPaid - currentAmount) * 100) / 100);
+
     const receiptData = {
-      receipt_number: receiptNumber,
+      receipt_number: this.getDisplayReceiptNumber(payment.invoice.invoice_number, receiptNumber),
       payment_date: this.formatDateDDMMYYYY(payment.payment_date),
-      payment_amount: payment.amount ? Number(payment.amount) : 0,
+      payment_amount: currentAmount,
       payment_mode: payment.payment_mode || 'cash',
       notes: payment.notes || '',
       invoice_number: payment.invoice.invoice_number,
       invoice_date: this.formatDateDDMMYYYY(payment.invoice?.issue_date),
-      invoice_total: payment.invoice.total ? Number(payment.invoice.total) : 0,
+      invoice_total: invoiceTotal,
+      previously_paid: previouslyPaid,
+      balance_due: balanceDue,
       service_description: `Payment for Invoice ${payment.invoice.invoice_number}`,
       client: {
         name: payment.invoice.client?.name || '',
         company_name: payment.invoice.client?.company_name || '',
         email: payment.invoice.client?.email || '',
         phone: payment.invoice.client?.phone || '',
-        address: payment.invoice.client?.address || '',
+        address: (payment.invoice as any)?.client_address?.trim?.() || payment.invoice.client?.address || '',
         gst_no: payment.invoice.client?.gst_no || '',
         country: (payment.invoice.client as any)?.country || '',
         contact_person: (payment.invoice.client as any)?.contact_person || '',
       },
-      items: (payment.invoice.items || []).map((item: any) => ({
-        description: item.description,
-        quantity: item.quantity,
-        rate: Number(item.rate),
-        amount: Number(item.amount),
-      })),
     };
 
     const pdfBuffer = await this.pdfService.generateReceiptPdf(receiptData);

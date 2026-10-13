@@ -40,6 +40,18 @@ describe('InvoicePaymentsService', () => {
       }),
       update: jest.fn().mockImplementation(async ({ where, data }) => {
         if (!mockPaymentsDb[where.id]) throw new NotFoundException('Payment not found');
+        if (data.receipt_number) {
+          const conflict = Object.values(mockPaymentsDb).find(
+            (p: any) => p.id !== where.id && p.receipt_number === data.receipt_number,
+          );
+          if (conflict) {
+            const err: any = new Error(
+              'Unique constraint failed on the constraint: `invoice_payments_receipt_number_key`',
+            );
+            err.code = 'P2002';
+            throw err;
+          }
+        }
         mockPaymentsDb[where.id].receipt_number = data.receipt_number;
         return { ...mockPaymentsDb[where.id] };
       }),
@@ -101,7 +113,7 @@ describe('InvoicePaymentsService', () => {
       expect(res).toBe('RCT-2026-27-012');
     });
 
-    it('B. Second payment for same invoice -> RCT-2026-27-012-2', async () => {
+    it('B. Second payment for same invoice -> RCT-2026-27-012-2 (unique stored number)', async () => {
       mockPaymentsDb[1] = {
         id: 1,
         invoice_id: 12,
@@ -117,9 +129,11 @@ describe('InvoicePaymentsService', () => {
 
       const res = await service.getOrAssignReceiptNumber(2);
       expect(res).toBe('RCT-2026-27-012-2');
+      expect(mockPaymentsDb[1].receipt_number).toBe('RCT-2026-27-012');
+      expect(mockPaymentsDb[2].receipt_number).toBe('RCT-2026-27-012-2');
     });
 
-    it('C. Third payment for same invoice -> RCT-2026-27-012-3', async () => {
+    it('C. Third payment for same invoice -> RCT-2026-27-012-3 (unique stored number)', async () => {
       mockPaymentsDb[1] = {
         id: 1,
         invoice_id: 12,
@@ -141,6 +155,9 @@ describe('InvoicePaymentsService', () => {
 
       const res = await service.getOrAssignReceiptNumber(3);
       expect(res).toBe('RCT-2026-27-012-3');
+      expect(mockPaymentsDb[1].receipt_number).toBe('RCT-2026-27-012');
+      expect(mockPaymentsDb[2].receipt_number).toBe('RCT-2026-27-012-2');
+      expect(mockPaymentsDb[3].receipt_number).toBe('RCT-2026-27-012-3');
     });
 
     it('D. Existing legacy receipt remains RCT-2026-27-150 (never modified)', async () => {
@@ -155,7 +172,7 @@ describe('InvoicePaymentsService', () => {
       expect(res).toBe('RCT-2026-27-150');
     });
 
-    it('E. Existing legacy receipt + new payment -> new payment gets RCT-2026-27-012-2', async () => {
+    it('E. Existing receipt + new payment for same invoice -> new payment gets unique suffix', async () => {
       mockPaymentsDb[10] = {
         id: 10,
         invoice_id: 12,
@@ -174,6 +191,7 @@ describe('InvoicePaymentsService', () => {
 
       const res11 = await service.getOrAssignReceiptNumber(11);
       expect(res11).toBe('RCT-2026-27-012-2');
+      expect(mockPaymentsDb[10].receipt_number).toBe('RCT-2026-27-012');
     });
 
     it('F. Edit payment date after receipt generation -> receipt number remains unchanged', async () => {
@@ -214,6 +232,32 @@ describe('InvoicePaymentsService', () => {
 
       const uniqueResults = new Set(results);
       expect(uniqueResults.size).toBe(5);
+      expect(uniqueResults).toEqual(
+        new Set([
+          'RCT-2026-27-012',
+          'RCT-2026-27-012-2',
+          'RCT-2026-27-012-3',
+          'RCT-2026-27-012-4',
+          'RCT-2026-27-012-5',
+        ]),
+      );
+      expect(results.every((n) => n && n.startsWith('RCT-2026-27-012'))).toBe(true);
+    });
+  });
+
+  describe('getDisplayReceiptNumber', () => {
+    it('derives the base receipt number from the invoice number', () => {
+      expect(service.getDisplayReceiptNumber('GSI/2026-27/001', 'RCT-2026-27-001')).toBe('RCT-2026-27-001');
+    });
+
+    it('does not strip suffixes that belong to the invoice number', () => {
+      expect(service.getDisplayReceiptNumber('GSI/2026-27/001-2', 'RCT-2026-27-001-2')).toBe('RCT-2026-27-001-2');
+    });
+
+    it('normalizes stored suffixes and legacy formats when invoice number is missing', () => {
+      expect(service.getDisplayReceiptNumber('', 'RCT-2026-27-001-2')).toBe('RCT-2026-27-001');
+      expect(service.getDisplayReceiptNumber(null, 'RCT-2026-27-001-3')).toBe('RCT-2026-27-001');
+      expect(service.getDisplayReceiptNumber(undefined, 'RCT/GSI-2026-27-001/01')).toBe('RCT-2026-27-001');
     });
   });
 
@@ -273,6 +317,161 @@ describe('InvoicePaymentsService', () => {
       expect(service.getReceiptPdfFilename('RCT-2026-27-150', paymentNoCompany)).toBe(
         'receipt_RCT-2026-27-150.pdf',
       );
+    });
+
+    it('assigns a unique stored number for a null second payment and still displays the invoice base in the PDF', async () => {
+      const invoice = {
+        invoice_number: 'GSI/2026-27/001',
+        issue_date: new Date('2026-09-01T00:00:00.000Z'),
+        total: 2750,
+        advance: 0,
+        client_id: 5,
+        client: { name: 'John Doe', company_name: 'Acme Corp' },
+        items: [],
+        payments: [] as any[],
+      };
+
+      mockPaymentsDb[3] = {
+        id: 3,
+        invoice_id: 1,
+        amount: 1000,
+        payment_date: new Date('2026-10-13T00:00:00.000Z'),
+        payment_mode: 'bank',
+        receipt_number: 'RCT-2026-27-001',
+        invoice: { ...invoice, payments: [] },
+      };
+      mockPaymentsDb[4] = {
+        id: 4,
+        invoice_id: 1,
+        amount: 1750,
+        payment_date: new Date('2026-10-13T00:00:00.000Z'),
+        payment_mode: 'bank',
+        receipt_number: null,
+        invoice: { ...invoice, payments: [mockPaymentsDb[3]] },
+      };
+
+      mockPdfService.generateReceiptPdf.mockResolvedValue(Buffer.from('PDF'));
+      const user = { id: 1, role: { name: 'ADMIN' } };
+
+      await service.generateReceiptPdfStream(3, user);
+      await service.generateReceiptPdfStream(4, user);
+
+      const pdfCalls = mockPdfService.generateReceiptPdf.mock.calls.map((c: any[]) => c[0]);
+      expect(pdfCalls[0].receipt_number).toBe('RCT-2026-27-001');
+      expect(pdfCalls[1].receipt_number).toBe('RCT-2026-27-001');
+      expect(mockPaymentsDb[3].receipt_number).toBe('RCT-2026-27-001');
+      expect(mockPaymentsDb[4].receipt_number).toBe('RCT-2026-27-001-2');
+    });
+
+    it('PDF display uses the same base receipt number for first, second, and third payments', async () => {
+      const invoice = {
+        invoice_number: 'GSI/2026-27/001',
+        issue_date: new Date('2026-09-01T00:00:00.000Z'),
+        total: 9000,
+        advance: 0,
+        client_id: 5,
+        client: { name: 'John Doe', company_name: 'Acme Corp' },
+        items: [],
+        payments: [] as any[],
+      };
+
+      mockPaymentsDb[1] = {
+        id: 1,
+        invoice_id: 1,
+        amount: 3000,
+        payment_date: new Date('2026-09-05T00:00:00.000Z'),
+        payment_mode: 'upi',
+        receipt_number: 'RCT-2026-27-001',
+        invoice: { ...invoice, payments: [] },
+      };
+      mockPaymentsDb[2] = {
+        id: 2,
+        invoice_id: 1,
+        amount: 3000,
+        payment_date: new Date('2026-09-10T00:00:00.000Z'),
+        payment_mode: 'upi',
+        receipt_number: 'RCT-2026-27-001-2',
+        invoice: { ...invoice, payments: [mockPaymentsDb[1]] },
+      };
+      mockPaymentsDb[3] = {
+        id: 3,
+        invoice_id: 1,
+        amount: 3000,
+        payment_date: new Date('2026-09-15T00:00:00.000Z'),
+        payment_mode: 'upi',
+        receipt_number: 'RCT-2026-27-001-3',
+        invoice: { ...invoice, payments: [mockPaymentsDb[1], mockPaymentsDb[2]] },
+      };
+
+      mockPdfService.generateReceiptPdf.mockResolvedValue(Buffer.from('PDF'));
+      const user = { id: 1, role: { name: 'ADMIN' } };
+
+      await service.generateReceiptPdfStream(1, user);
+      await service.generateReceiptPdfStream(2, user);
+      await service.generateReceiptPdfStream(3, user);
+
+      const pdfCalls = mockPdfService.generateReceiptPdf.mock.calls.map((c: any[]) => c[0]);
+      expect(pdfCalls[0]).toEqual(
+        expect.objectContaining({
+          receipt_number: 'RCT-2026-27-001',
+          payment_amount: 3000,
+          previously_paid: 0,
+          balance_due: 6000,
+        }),
+      );
+      expect(pdfCalls[1]).toEqual(
+        expect.objectContaining({
+          receipt_number: 'RCT-2026-27-001',
+          payment_amount: 3000,
+          previously_paid: 3000,
+          balance_due: 3000,
+        }),
+      );
+      expect(pdfCalls[2]).toEqual(
+        expect.objectContaining({
+          receipt_number: 'RCT-2026-27-001',
+          payment_amount: 3000,
+          previously_paid: 6000,
+          balance_due: 0,
+        }),
+      );
+
+      expect(mockPaymentsDb[1].receipt_number).toBe('RCT-2026-27-001');
+      expect(mockPaymentsDb[2].receipt_number).toBe('RCT-2026-27-001-2');
+      expect(mockPaymentsDb[3].receipt_number).toBe('RCT-2026-27-001-3');
+    });
+
+    it('PDF display uses a different base receipt number for a different invoice', async () => {
+      mockPaymentsDb[20] = {
+        id: 20,
+        invoice_id: 20,
+        amount: 1500,
+        payment_date: new Date('2026-09-20T00:00:00.000Z'),
+        payment_mode: 'cash',
+        receipt_number: 'RCT-2026-27-002',
+        invoice: {
+          invoice_number: 'GSI/2026-27/002',
+          issue_date: new Date('2026-09-18T00:00:00.000Z'),
+          total: 1500,
+          client_id: 8,
+          client: { name: 'Other Client', company_name: 'Other Co' },
+          items: [],
+          payments: [],
+        },
+      };
+
+      mockPdfService.generateReceiptPdf.mockResolvedValue(Buffer.from('PDF'));
+      await service.generateReceiptPdfStream(20, { id: 1, role: { name: 'ADMIN' } });
+
+      expect(mockPdfService.generateReceiptPdf).toHaveBeenCalledWith(
+        expect.objectContaining({
+          receipt_number: 'RCT-2026-27-002',
+          invoice_number: 'GSI/2026-27/002',
+          payment_amount: 1500,
+          balance_due: 0,
+        }),
+      );
+      expect(mockPaymentsDb[20].receipt_number).toBe('RCT-2026-27-002');
     });
 
     it('should throw ForbiddenException if CLIENT role tries to access another client payment', async () => {
