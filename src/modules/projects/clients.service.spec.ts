@@ -11,25 +11,35 @@ describe('ClientsService', () => {
   let nextId = 1;
 
   const mockPrismaService = {
+    $queryRawUnsafe: jest.fn().mockResolvedValue([{ lock_result: 1 }]),
     client: {
       findFirst: jest.fn().mockImplementation(async ({ where }) => {
-        const clients = Object.values(mockClientsDb).filter((c: any) => c.deleted_at === null);
-        
-        if (where.email !== undefined) {
-          const matched = clients.find((c: any) => {
-            if (c.email !== where.email) return false;
-            if (where.id?.not !== undefined && c.id === where.id.not) return false;
-            return true;
-          });
-          return matched || null;
+        let clients = Object.values(mockClientsDb);
+        if (where?.deleted_at === null) {
+          clients = clients.filter((c: any) => c.deleted_at === null);
         }
 
-        if (where.id !== undefined) {
-          const matched = clients.find((c: any) => c.id === where.id);
-          return matched || null;
+        if (where?.email !== undefined) {
+          clients = clients.filter((c: any) => c.email === where.email);
         }
 
-        return null;
+        if (where?.company_name !== undefined) {
+          const rawName =
+            typeof where.company_name === 'string'
+              ? where.company_name
+              : where.company_name.equals || where.company_name;
+          clients = clients.filter(
+            (c: any) => String(c.company_name).toLowerCase() === String(rawName).toLowerCase(),
+          );
+        }
+
+        if (where?.id?.not !== undefined) {
+          clients = clients.filter((c: any) => c.id !== where.id.not);
+        } else if (where?.id !== undefined && typeof where.id === 'number') {
+          clients = clients.filter((c: any) => c.id === where.id);
+        }
+
+        return clients[0] || null;
       }),
 
       create: jest.fn().mockImplementation(async ({ data }) => {
@@ -252,20 +262,80 @@ describe('ClientsService', () => {
       expect(result2.email).toBe('');
     });
 
-    it('should reject creation if email is a duplicate of an existing non-empty email', async () => {
+    it('should reject creation when company name already exists with a different email', async () => {
       await service.create({
         name: 'Client 1',
-        company_name: 'Corp 1',
-        email: 'dup@company.com',
+        company_name: 'Acme Corp',
+        email: 'first@acme.com',
       });
 
       await expect(
         service.create({
           name: 'Client 2',
-          company_name: 'Corp 2',
-          email: 'dup@company.com',
+          company_name: 'Acme Corp',
+          email: 'second@acme.com',
         }),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toMatchObject({
+        response: { company_name: ['This company name is already registered.'] },
+      });
+    });
+
+    it('should reject creation when company name already exists with the same email', async () => {
+      await service.create({
+        name: 'Client 1',
+        company_name: 'Acme Corp',
+        email: 'shared@acme.com',
+      });
+
+      await expect(
+        service.create({
+          name: 'Client 2',
+          company_name: 'Acme Corp',
+          email: 'shared@acme.com',
+        }),
+      ).rejects.toMatchObject({
+        response: { company_name: ['This company name is already registered.'] },
+      });
+    });
+
+    it('should allow creation when email is reused with a different company name', async () => {
+      await service.create({
+        name: 'Client 1',
+        company_name: 'Corp 1',
+        email: 'shared@company.com',
+      });
+
+      const result = await service.create({
+        name: 'Client 2',
+        company_name: 'Corp 2',
+        email: 'shared@company.com',
+      });
+
+      expect(result.company_name).toBe('Corp 2');
+      expect(result.email).toBe('shared@company.com');
+    });
+
+    it('should reject concurrent creation of the same company name', async () => {
+      const payload = {
+        name: 'Concurrent',
+        company_name: 'Lock Corp',
+        email: 'one@lock.com',
+      };
+      const payload2 = {
+        name: 'Concurrent 2',
+        company_name: 'Lock Corp',
+        email: 'two@lock.com',
+      };
+
+      const results = await Promise.allSettled([service.create(payload), service.create(payload2)]);
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+        response: { company_name: ['This company name is already registered.'] },
+      });
     });
   });
 
@@ -292,6 +362,42 @@ describe('ClientsService', () => {
 
       const user = { id: 1, role: { name: 'SUPER_ADMIN' } };
       await expect(service.update(created.id, user, { company_name: '' })).rejects.toThrow(BadRequestException);
+    });
+
+    it('should allow updating email to an email already used by another client', async () => {
+      const first = await service.create({
+        name: 'Client A',
+        company_name: 'Alpha Ltd',
+        email: 'alpha@company.com',
+      });
+      const second = await service.create({
+        name: 'Client B',
+        company_name: 'Beta Ltd',
+        email: 'beta@company.com',
+      });
+
+      const user = { id: 1, role: { name: 'SUPER_ADMIN' } };
+      const updated = await service.update(second.id, user, { email: first.email });
+
+      expect(updated.email).toBe('alpha@company.com');
+    });
+
+    it('should reject update if company_name duplicates another client', async () => {
+      await service.create({
+        name: 'Client A',
+        company_name: 'Alpha Ltd',
+        email: 'alpha@company.com',
+      });
+      const second = await service.create({
+        name: 'Client B',
+        company_name: 'Beta Ltd',
+        email: 'beta@company.com',
+      });
+
+      const user = { id: 1, role: { name: 'SUPER_ADMIN' } };
+      await expect(service.update(second.id, user, { company_name: 'Alpha Ltd' })).rejects.toMatchObject({
+        response: { company_name: ['This company name is already registered.'] },
+      });
     });
 
     it('should allow clearing contact_person name on update', async () => {

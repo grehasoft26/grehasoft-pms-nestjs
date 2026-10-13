@@ -1,10 +1,77 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException, InternalServerErrorException } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PasswordUtil } from '../../core/utils/password.util';
+
+const DUPLICATE_COMPANY_MESSAGE = 'This company name is already registered.';
 
 @Injectable()
 export class ClientsService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private companyLockPromise: Promise<any> = Promise.resolve();
+
+  private async acquireCompanyLock<T>(fn: () => Promise<T>): Promise<T> {
+    let release: () => void;
+    const nextLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const currentLock = this.companyLockPromise;
+    this.companyLockPromise = currentLock.then(() => nextLock, () => nextLock);
+    await currentLock;
+    try {
+      return await fn();
+    } finally {
+      release!();
+    }
+  }
+
+  private companyLockKey(companyName: string): string {
+    const digest = crypto.createHash('sha256').update(companyName.toLowerCase()).digest('hex').slice(0, 32);
+    return `client_company_${digest}`;
+  }
+
+  private async assertUniqueCompanyName(companyName: string, excludeId?: number) {
+    const existing = await this.prisma.client.findFirst({
+      where: {
+        company_name: companyName,
+        deleted_at: null,
+        ...(excludeId ? { id: { not: excludeId } } : {}),
+      },
+      select: { id: true },
+    });
+    if (existing) {
+      throw new BadRequestException({ company_name: [DUPLICATE_COMPANY_MESSAGE] });
+    }
+  }
+
+  private async withCompanyNameLock<T>(companyName: string, fn: () => Promise<T>): Promise<T> {
+    return this.acquireCompanyLock(async () => {
+      const lockKey = this.companyLockKey(companyName);
+      let mysqlLockAcquired = false;
+      try {
+        try {
+          const lockRes: any = await this.prisma.$queryRawUnsafe(
+            `SELECT GET_LOCK('${lockKey}', 10) as lock_result`,
+          );
+          if (lockRes && lockRes[0] && (lockRes[0].lock_result === 1 || lockRes[0].lock_result === '1')) {
+            mysqlLockAcquired = true;
+          }
+        } catch (e) {
+          // Ignore lock query errors in non-MySQL environments or mocks
+        }
+        return await fn();
+      } finally {
+        if (mysqlLockAcquired) {
+          try {
+            await this.prisma.$queryRawUnsafe(`SELECT RELEASE_LOCK('${lockKey}')`);
+          } catch (e) {
+            // Ignore release errors
+          }
+        }
+      }
+    });
+  }
 
   private formatClient(client: any) {
     if (!client) return null;
@@ -131,29 +198,26 @@ export class ClientsService {
       throw new BadRequestException({ company_name: ['Company name is required.'] });
     }
 
+    const companyName = body.company_name.trim();
     const emailVal = body.email ? body.email.trim() : '';
-    if (emailVal !== '') {
-      const existing = await this.prisma.client.findFirst({
-        where: { email: emailVal, deleted_at: null },
-      });
-      if (existing) {
-        throw new BadRequestException({ email: ['A client with this email address already exists.'] });
-      }
-    }
 
-    const client = await this.prisma.client.create({
-      data: {
-        name: body.name ? body.name.trim() : '',
-        email: emailVal,
-        phone: body.phone || '',
-        company_name: body.company_name.trim(),
-        gst_no: body.gst_number || body.gst_no || null,
-        address: body.address || '',
-        status: body.status || 'active',
-      },
-      include: { portal_users: true },
+    return this.withCompanyNameLock(companyName, async () => {
+      await this.assertUniqueCompanyName(companyName);
+
+      const client = await this.prisma.client.create({
+        data: {
+          name: body.name ? body.name.trim() : '',
+          email: emailVal,
+          phone: body.phone || '',
+          company_name: companyName,
+          gst_no: body.gst_number || body.gst_no || null,
+          address: body.address || '',
+          status: body.status || 'active',
+        },
+        include: { portal_users: true },
+      });
+      return this.formatClient(client);
     });
-    return this.formatClient(client);
   }
 
   async update(id: number, user: any, body: any) {
@@ -183,16 +247,7 @@ export class ClientsService {
       data.name = body.name ? body.name.trim() : '';
     }
     if (body.email !== undefined) {
-      const emailVal = body.email ? body.email.trim() : '';
-      if (emailVal !== '') {
-        const existing = await this.prisma.client.findFirst({
-          where: { email: emailVal, id: { not: id }, deleted_at: null },
-        });
-        if (existing) {
-          throw new BadRequestException({ email: ['A client with this email address already exists.'] });
-        }
-      }
-      data.email = emailVal;
+      data.email = body.email ? body.email.trim() : '';
     }
     if (body.phone !== undefined) data.phone = body.phone;
     if (body.gst_number !== undefined || body.gst_no !== undefined) {
@@ -201,13 +256,22 @@ export class ClientsService {
     if (body.address !== undefined) data.address = body.address;
     if (body.status !== undefined) data.status = body.status;
 
-    const updated = await this.prisma.client.update({
-      where: { id },
-      data,
-      include: { portal_users: true },
-    });
+    const persistUpdate = async () => {
+      if (data.company_name) {
+        await this.assertUniqueCompanyName(data.company_name, id);
+      }
+      const updated = await this.prisma.client.update({
+        where: { id },
+        data,
+        include: { portal_users: true },
+      });
+      return this.formatClient(updated);
+    };
 
-    return this.formatClient(updated);
+    if (data.company_name) {
+      return this.withCompanyNameLock(data.company_name, persistUpdate);
+    }
+    return persistUpdate();
   }
 
   async remove(id: number, user: any, query: { force?: string }) {
