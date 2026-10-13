@@ -313,10 +313,11 @@ def generate_receipt_pdf(receipt, media_root=""):
         addr = esc(client.address).replace("\r", "").replace("\n", "<br/>")
         to_parts.append(Paragraph(addr, small_style))
     to_contact = []
-    if client.phone:
-        to_contact.append(f"Phone: {esc(client.phone)}")
+    
     if client.name and client.company_name and client.name != client.company_name:
         to_parts.append(Paragraph(f"Contact: {esc(client.name)}", small_style))
+    if client.phone:
+        to_contact.append(f"Phone: {esc(client.phone)}")
     if to_contact:
         to_parts.append(Paragraph(" &nbsp;|&nbsp; ".join(to_contact), small_style))
     if client.gst_no:
