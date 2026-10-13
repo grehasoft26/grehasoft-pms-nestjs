@@ -426,6 +426,83 @@ describe('InvoicesService', () => {
       expect(result.balance).toBe(1500);
     });
 
+    describe('invoice items preservation on edit', () => {
+      const storedItems = [
+        { id: 11, description: 'Website design', quantity: 2, rate: 1000, amount: 2000 },
+        { id: 12, description: 'Hosting', quantity: 1, rate: 500, amount: 500 },
+      ];
+      const invoiceWithItems = {
+        ...existingInvoice,
+        subtotal: 2500,
+        tax: 250,
+        total: 2750,
+        advance: 500,
+        items: storedItems,
+        payments: [{ id: 1, invoice_id: 1, amount: 300, payment_date: new Date() }],
+      };
+
+      it('client-only PATCH (items omitted) does not touch invoice items and keeps totals/payments', async () => {
+        mockPrismaService.invoice.findUnique
+          .mockResolvedValueOnce(invoiceWithItems)
+          .mockResolvedValueOnce({ ...invoiceWithItems, client_id: 2, client: { id: 2, name: 'Client B' } });
+        mockPrismaService.client.findUnique.mockResolvedValue({ id: 2, name: 'Client B' });
+        mockPrismaService.invoice.update.mockResolvedValue({});
+
+        const result = await service.update(1, adminUser, { client: 2 });
+
+        expect(mockPrismaService.invoiceItem.deleteMany).not.toHaveBeenCalled();
+        expect(mockPrismaService.invoiceItem.create).not.toHaveBeenCalled();
+        expect(mockPrismaService.invoice.update.mock.calls[0][0].data).toEqual({ client_id: 2 });
+        expect(mockPrismaService.invoicePayment.create).not.toHaveBeenCalled();
+        expect(result.client).toBe(2);
+        expect(result.items.map((i: any) => i.description)).toEqual(['Website design', 'Hosting']);
+        expect(result.subtotal).toBe(2500);
+        expect(result.tax).toBe(250);
+        expect(result.total).toBe(2750);
+        expect(result.advance).toBe(500);
+        expect(result.payments).toHaveLength(1);
+      });
+
+      it('full PUT with client change and identical items does not delete/recreate items', async () => {
+        mockPrismaService.invoice.findUnique
+          .mockResolvedValueOnce(invoiceWithItems)
+          .mockResolvedValueOnce({ ...invoiceWithItems, client_id: 2, client: { id: 2, name: 'Client B' } });
+        mockPrismaService.client.findUnique.mockResolvedValue({ id: 2, name: 'Client B' });
+        mockPrismaService.invoice.update.mockResolvedValue({});
+
+        const result = await service.update(1, adminUser, {
+          client: 2,
+          items: [
+            { id: 11, description: 'Website design', quantity: 2, rate: 1000 },
+            { id: 12, description: 'Hosting', quantity: 1, rate: 500 },
+          ],
+          tax: 250,
+          total: 2750,
+        });
+
+        expect(mockPrismaService.invoiceItem.deleteMany).not.toHaveBeenCalled();
+        expect(mockPrismaService.invoiceItem.create).not.toHaveBeenCalled();
+        expect(mockPrismaService.invoice.update.mock.calls[0][0].data).toEqual(
+          expect.objectContaining({ client_id: 2, subtotal: 2500, tax: 250, total: 2750 }),
+        );
+        expect(result.items).toHaveLength(2);
+      });
+
+      it('still rewrites items when they are actually changed', async () => {
+        mockPrismaService.invoice.findUnique
+          .mockResolvedValueOnce(invoiceWithItems)
+          .mockResolvedValueOnce(invoiceWithItems);
+        mockPrismaService.invoice.update.mockResolvedValue({});
+
+        await service.update(1, adminUser, {
+          items: [{ description: 'Website design', quantity: 3, rate: 1000 }],
+        });
+
+        expect(mockPrismaService.invoiceItem.deleteMany).toHaveBeenCalledWith({ where: { invoice_id: 1 } });
+        expect(mockPrismaService.invoiceItem.create).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('should create invoice with custom client_address and persist it', async () => {
       const customAddress = '456 Custom Suite, Infopark, Kochi';
       mockPrismaService.client.findUnique.mockResolvedValue({ id: 1, name: 'Client A', address: 'Master Address' });

@@ -447,20 +447,34 @@ export class InvoicesService {
       data.tax = tax;
       data.total = body.total !== undefined ? Number(body.total) : subtotal + tax;
 
-      await this.prisma.invoiceItem.deleteMany({ where: { invoice_id: id } });
-      for (const item of body.items) {
-        const qty = item.quantity || 1;
-        const rate = Number(item.rate || 0);
-        await this.prisma.invoiceItem.create({
-          data: {
-            invoice_id: id,
-            description: item.description || '',
-            quantity: qty,
-            rate,
-            amount: qty * rate,
-          },
-        });
+      const normalize = (list: any[]) =>
+        list.map((it: any) => [
+          String(it.description || ''),
+          Number(it.quantity || 1),
+          Number(it.rate || 0),
+        ].join('|'));
+      const incoming = normalize(body.items);
+      const stored = normalize(existing.items || []);
+      const itemsUnchanged =
+        incoming.length === stored.length && incoming.every((v, idx) => v === stored[idx]);
+
+      if (!itemsUnchanged) {
+        await this.prisma.invoiceItem.deleteMany({ where: { invoice_id: id } });
+        for (const item of body.items) {
+          const qty = item.quantity || 1;
+          const rate = Number(item.rate || 0);
+          await this.prisma.invoiceItem.create({
+            data: {
+              invoice_id: id,
+              description: item.description || '',
+              quantity: qty,
+              rate,
+              amount: qty * rate,
+            },
+          });
+        }
       }
+
     } else if (body.tax !== undefined || body.total !== undefined) {
       if (body.tax !== undefined) data.tax = Number(body.tax);
       data.total = body.total !== undefined ? Number(body.total) : Number(existing.subtotal) + (data.tax ?? Number(existing.tax));
