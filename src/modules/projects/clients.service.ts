@@ -4,6 +4,7 @@ import { PrismaService } from '../../core/prisma.service';
 import { PasswordUtil } from '../../core/utils/password.util';
 
 const DUPLICATE_COMPANY_MESSAGE = 'This company name is already registered.';
+export const CLIENT_HAS_INVOICES_MESSAGE = 'Cannot delete this client because invoices are associated with this client.';
 
 @Injectable()
 export class ClientsService {
@@ -275,6 +276,13 @@ export class ClientsService {
   }
 
   async remove(id: number, user: any, query: { force?: string }) {
+    // Invoices (and their payments) must never be orphaned or altered by a client
+    // deletion, so block it for everyone, including forced super-admin deletes.
+    const invoiceCount = await this.prisma.invoice.count({ where: { client_id: id } });
+    if (invoiceCount > 0) {
+      throw new BadRequestException({ error: CLIENT_HAS_INVOICES_MESSAGE });
+    }
+
     const activeUsers = await this.prisma.user.count({
       where: { client_id: id, is_active: true, deleted_at: null },
     });

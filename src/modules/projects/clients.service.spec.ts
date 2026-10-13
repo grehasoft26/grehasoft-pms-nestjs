@@ -12,6 +12,22 @@ describe('ClientsService', () => {
 
   const mockPrismaService = {
     $queryRawUnsafe: jest.fn().mockResolvedValue([{ lock_result: 1 }]),
+    invoice: {
+      count: jest.fn().mockResolvedValue(0),
+      update: jest.fn(),
+      updateMany: jest.fn(),
+      delete: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    invoicePayment: {
+      update: jest.fn(),
+      updateMany: jest.fn(),
+      delete: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    user: {
+      count: jest.fn().mockResolvedValue(0),
+    },
     client: {
       findFirst: jest.fn().mockImplementation(async ({ where }) => {
         let clients = Object.values(mockClientsDb);
@@ -410,6 +426,73 @@ describe('ClientsService', () => {
       const updated = await service.update(created.id, user, { name: '' });
 
       expect(updated.name).toBe('');
+    });
+  });
+
+  describe('remove', () => {
+    const user = { id: 1, is_superuser: true, role: { name: 'SUPER_ADMIN' } };
+    const BLOCK_MESSAGE = 'Cannot delete this client because invoices are associated with this client.';
+
+    beforeEach(() => {
+      prisma.invoice.count.mockResolvedValue(0);
+      prisma.user.count.mockResolvedValue(0);
+    });
+
+    it('rejects deletion with 400 and the exact message when the client has invoices', async () => {
+      const created = await service.create({ name: 'A', company_name: 'Has Invoices' });
+      prisma.invoice.count.mockResolvedValue(2);
+
+      const promise = service.remove(created.id, user, {});
+      await expect(promise).rejects.toBeInstanceOf(BadRequestException);
+      await expect(promise).rejects.toMatchObject({
+        status: 400,
+        response: { error: BLOCK_MESSAGE },
+      });
+
+      expect(prisma.invoice.count).toHaveBeenCalledWith({ where: { client_id: created.id } });
+      expect(mockClientsDb[created.id].deleted_at).toBeNull();
+      expect(prisma.client.update).not.toHaveBeenCalled();
+    });
+
+    it('blocks deletion even when a super admin passes force=true', async () => {
+      const created = await service.create({ name: 'A', company_name: 'Forced' });
+      prisma.invoice.count.mockResolvedValue(1);
+
+      await expect(service.remove(created.id, user, { force: 'true' })).rejects.toMatchObject({
+        response: { error: BLOCK_MESSAGE },
+      });
+      expect(mockClientsDb[created.id].deleted_at).toBeNull();
+    });
+
+    it('does not modify or delete any invoices or payments when deletion is blocked', async () => {
+      const created = await service.create({ name: 'A', company_name: 'Protected' });
+      prisma.invoice.count.mockResolvedValue(3);
+      prisma.client.update.mockClear();
+
+      await expect(service.remove(created.id, user, {})).rejects.toBeInstanceOf(BadRequestException);
+
+      for (const model of [prisma.invoice, prisma.invoicePayment]) {
+        expect(model.update).not.toHaveBeenCalled();
+        expect(model.updateMany).not.toHaveBeenCalled();
+        expect(model.delete).not.toHaveBeenCalled();
+        expect(model.deleteMany).not.toHaveBeenCalled();
+      }
+      expect(prisma.client.update).not.toHaveBeenCalled();
+    });
+
+    it('still deletes (soft-deletes) a client that has no invoices', async () => {
+      const created = await service.create({ name: 'B', company_name: 'No Invoices' });
+
+      const result = await service.remove(created.id, user, {});
+
+      expect(result).toBeNull();
+      expect(prisma.client.update).toHaveBeenCalledWith({
+        where: { id: created.id },
+        data: { deleted_at: expect.any(Date) },
+      });
+      expect(mockClientsDb[created.id].deleted_at).toBeInstanceOf(Date);
+      expect(prisma.invoice.update).not.toHaveBeenCalled();
+      expect(prisma.invoice.deleteMany).not.toHaveBeenCalled();
     });
   });
 });
