@@ -1,4 +1,4 @@
-import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { Injectable, ForbiddenException, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import * as crypto from 'crypto';
 
@@ -49,12 +49,14 @@ export class InfrastructureService {
       ];
     }
 
+    const isAdm = this.isAdmin(user);
+
     if (query.all === 'true') {
       const servers = await this.prisma.server.findMany({
         where,
         orderBy: { name: 'asc' },
       });
-      return servers;
+      return servers.map((s) => this.formatServer(s, isAdm));
     }
 
     const pageNum = Math.max(1, Number(query.page) || 1);
@@ -74,18 +76,22 @@ export class InfrastructureService {
       count,
       next: pageNum * limitNum < count ? `/api/infrastructure/servers?page=${pageNum + 1}` : null,
       previous: pageNum > 1 ? `/api/infrastructure/servers?page=${pageNum - 1}` : null,
-      results,
+      results: results.map((s) => this.formatServer(s, isAdm)),
     };
   }
 
   async getServerById(user: any, id: number) {
     const server = await this.prisma.server.findUnique({ where: { id } });
     if (!server) throw new NotFoundException('Server not found');
-    return server;
+    return this.formatServer(server, this.isAdmin(user));
   }
 
   async createServer(user: any, data: any) {
-    return this.prisma.server.create({
+    const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date') ?? null;
+    const expiryDate = this.parseDateOnly(data.expiry_date, 'Expiry date') ?? null;
+    this.validateServerDetails(data.phone_number, purchaseDate, expiryDate);
+
+    const server = await this.prisma.server.create({
       data: {
         name: data.name,
         provider: data.provider || '',
@@ -93,15 +99,35 @@ export class InfrastructureService {
         server_ip: data.server_ip || '',
         ip_address: data.ip_address || '',
         notes: data.notes || '',
+        username: data.username || '',
+        password: data.password ? this.encryptPassword(data.password) : '',
+        phone_number: data.phone_number ? String(data.phone_number).trim() : '',
+        purchase_date: purchaseDate,
+        expiry_date: expiryDate,
       },
     });
+    return this.formatServer(server, this.isAdmin(user));
   }
 
   async updateServer(user: any, id: number, data: any) {
     const server = await this.prisma.server.findUnique({ where: { id } });
     if (!server) throw new NotFoundException('Server not found');
 
-    return this.prisma.server.update({
+    const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date');
+    const expiryDate = this.parseDateOnly(data.expiry_date, 'Expiry date');
+    this.validateServerDetails(
+      data.phone_number,
+      purchaseDate !== undefined ? purchaseDate : server.purchase_date,
+      expiryDate !== undefined ? expiryDate : server.expiry_date,
+    );
+
+    // The masked placeholder sent back by non-admins must not overwrite the stored password
+    const password =
+      data.password === undefined || data.password === InfrastructureService.PASSWORD_MASK
+        ? undefined
+        : data.password ? this.encryptPassword(data.password) : '';
+
+    const updated = await this.prisma.server.update({
       where: { id },
       data: {
         name: data.name,
@@ -110,8 +136,49 @@ export class InfrastructureService {
         server_ip: data.server_ip,
         ip_address: data.ip_address,
         notes: data.notes,
+        username: data.username,
+        password,
+        phone_number: data.phone_number !== undefined ? (data.phone_number ? String(data.phone_number).trim() : '') : undefined,
+        purchase_date: purchaseDate,
+        expiry_date: expiryDate,
       },
     });
+    return this.formatServer(updated, this.isAdmin(user));
+  }
+
+  private static readonly PASSWORD_MASK = '••••••••';
+
+  private formatServer(server: any, isAdm: boolean) {
+    if (!server.password) return server;
+    return {
+      ...server,
+      password: isAdm ? this.decryptPassword(server.password) : InfrastructureService.PASSWORD_MASK,
+    };
+  }
+
+  /**
+   * Parses a date-only value ("YYYY-MM-DD", optionally with a time part) to UTC midnight
+   * so the stored DATE matches the selected calendar day.
+   * undefined -> undefined (not provided), null/"" -> null (cleared).
+   */
+  private parseDateOnly(value: any, label: string): Date | null | undefined {
+    if (value === undefined) return undefined;
+    if (value === null || value === '') return null;
+    const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const date = match ? new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))) : null;
+    if (!date || date.getUTCMonth() !== Number(match![2]) - 1 || date.getUTCDate() !== Number(match![3])) {
+      throw new BadRequestException(`${label} must be a valid date (YYYY-MM-DD).`);
+    }
+    return date;
+  }
+
+  private validateServerDetails(phoneNumber: any, purchaseDate: Date | null, expiryDate: Date | null) {
+    if (phoneNumber && !/^\+?[0-9\s\-().]{7,20}$/.test(String(phoneNumber).trim())) {
+      throw new BadRequestException('Phone number may contain only digits, spaces, +, -, ( ) and must be 7-20 characters.');
+    }
+    if (purchaseDate && expiryDate && expiryDate < purchaseDate) {
+      throw new BadRequestException('Expiry date cannot be earlier than purchase date.');
+    }
   }
 
   async deleteServer(user: any, id: number) {
@@ -220,7 +287,7 @@ export class InfrastructureService {
 
     const domain = await this.prisma.domain.create({
       data: {
-        project_id: Number(data.project_id || data.project),
+        project_id: this.parseOptionalProjectId(data) ?? null,
         domain_name: data.domain_name,
         provider: data.provider || '',
         purchase_date: data.purchase_date ? new Date(data.purchase_date) : null,
@@ -231,10 +298,6 @@ export class InfrastructureService {
       },
       include: { project: true, server: true },
     });
-
-    if (expiryDate) {
-      await this.scheduleRenewalReminder(user, domain.domain_name, expiryDate);
-    }
 
     return {
       ...domain,
@@ -254,7 +317,7 @@ export class InfrastructureService {
     const domain = await this.prisma.domain.update({
       where: { id },
       data: {
-        project_id: data.project_id || data.project ? Number(data.project_id || data.project) : undefined,
+        project_id: this.parseOptionalProjectId(data),
         domain_name: data.domain_name,
         provider: data.provider,
         purchase_date: data.purchase_date !== undefined ? (data.purchase_date ? new Date(data.purchase_date) : null) : undefined,
@@ -266,10 +329,6 @@ export class InfrastructureService {
       include: { project: true, server: true },
     });
 
-    if (expiryDate) {
-      await this.scheduleRenewalReminder(user, domain.domain_name, expiryDate);
-    }
-
     return {
       ...domain,
       project: domain.project_id,
@@ -279,28 +338,26 @@ export class InfrastructureService {
     };
   }
 
+  /**
+   * Domain project is optional. Reads `project_id` or `project`:
+   * not sent -> undefined (unchanged), null/"" -> null (no project), otherwise a positive integer id.
+   */
+  private parseOptionalProjectId(data: any): number | null | undefined {
+    const key = data.project_id !== undefined ? 'project_id' : data.project !== undefined ? 'project' : null;
+    if (!key) return undefined;
+    const value = data[key];
+    if (value === null || value === '') return null;
+    const id = Number(value);
+    if (!Number.isInteger(id) || id <= 0) {
+      throw new BadRequestException('Project must be a valid project id.');
+    }
+    return id;
+  }
+
   async deleteDomain(user: any, id: number) {
     const domain = await this.prisma.domain.findUnique({ where: { id } });
     if (!domain) throw new NotFoundException('Domain not found');
     return this.prisma.domain.delete({ where: { id } });
-  }
-
-  private async scheduleRenewalReminder(user: any, domainName: string, expiryDate: Date) {
-    const due_date = new Date(expiryDate.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    if (due_date > today) {
-      await this.prisma.reminder.create({
-        data: {
-          user_id: user.id,
-          title: `Domain Renewal: ${domainName}`,
-          description: 'Renew domain before expiry',
-          due_date,
-          type: 'general',
-        },
-      });
-    }
   }
 
   // -------------------------------------------------------------

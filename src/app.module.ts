@@ -13,6 +13,7 @@ import { ProposalsModule } from './modules/proposals/proposals.module';
 import { InvoicesModule } from './modules/invoices/invoices.module';
 import { SeoModule } from './modules/seo/seo.module';
 import { InfrastructureModule } from './modules/infrastructure/infrastructure.module';
+import { CompanyCredentialsModule } from './modules/company-credentials/company-credentials.module';
 import { HrModule } from './modules/hr/hr.module';
 import { TrackingModule } from './modules/tracking/tracking.module';
 import { RemindersModule } from './modules/reminders/reminders.module';
@@ -40,6 +41,7 @@ import { FinancialReportsModule } from './modules/financial-reports/financial-re
     SeoModule,
     SeoReportsModule,
     InfrastructureModule,
+    CompanyCredentialsModule,
     HrModule,
     TrackingModule,
     RemindersModule,
