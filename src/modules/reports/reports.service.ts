@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { aggregateInvoiceFinancials, computeInvoiceFinancials } from '../invoices/invoice-status';
 
 @Injectable()
 export class ReportsService {
@@ -264,25 +265,19 @@ export class ReportsService {
       include: { payments: true },
     });
 
-    let totalBilled = 0;
-    let totalPaid = 0;
-    let totalPending = 0;
-
-    for (const inv of invoices) {
-      const total = Number(inv.total || 0);
-      totalBilled += total;
-
-      const advance = Number(inv.advance || 0);
-      const paid = advance + inv.payments.reduce((acc, p) => acc + Number(p.amount || 0), 0);
-      totalPaid += paid;
-      totalPending += Math.max(0, total - paid);
-    }
+    // Shared paise-based calculation (same figures as the invoices API)
+    const totals = aggregateInvoiceFinancials(
+      invoices.map((inv) =>
+        computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments, due_date: inv.due_date }),
+      ),
+    );
 
     return {
-      total_billed: Math.round(totalBilled * 100) / 100,
-      total_paid: Math.round(totalPaid * 100) / 100,
-      total_pending: Math.round(totalPending * 100) / 100,
-      invoice_count: invoices.length,
+      total_billed: totals.total_billed,
+      total_paid: totals.total_paid,
+      total_pending: totals.total_balance,
+      total_overpaid: totals.total_overpaid,
+      invoice_count: totals.invoice_count,
     };
   }
 }

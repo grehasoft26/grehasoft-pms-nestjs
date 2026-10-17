@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
+import { aggregateInvoiceFinancials, computeInvoiceFinancials } from '../invoices/invoice-status';
 
 @Injectable()
 export class FinancialReportsService {
@@ -69,15 +70,12 @@ export class FinancialReportsService {
       include: { payments: true },
     });
 
-    let totalOutstandingRevenue = 0;
-    for (const inv of allInvoices) {
-      const total = Number(inv.total || 0);
-      const advance = Number(inv.advance || 0);
-      const paymentsSum = inv.payments.reduce((acc, p) => acc + Number(p.amount || 0), 0);
-      const paid = advance + paymentsSum;
-      const balance = Math.max(0, total - paid);
-      totalOutstandingRevenue += balance;
-    }
+    // Shared paise-based calculation (same balance as the invoices API)
+    const totalOutstandingRevenue = aggregateInvoiceFinancials(
+      allInvoices.map((inv) =>
+        computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments }),
+      ),
+    ).total_balance;
 
     // Expenses Paid & Pending
     const currentMonthExpenses = await this.prisma.expense.findMany({

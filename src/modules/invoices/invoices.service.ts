@@ -4,6 +4,15 @@ import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
+import {
+  INITIAL_PAYMENT_NOTE,
+  aggregateInvoiceFinancials,
+  computeInvoiceFinancials,
+  findInitialPaymentId,
+  matchesInvoiceStatusFilter,
+  toPaise,
+  validatePaymentAmount,
+} from './invoice-status';
 
 export class InvoiceSigning {
   static generateToken(invoiceId: number, secret: string, expiresInSeconds: number = 172800): string {
@@ -141,23 +150,14 @@ export class InvoicesService {
       created_at: p.created_at ? p.created_at.toISOString() : null,
     }));
 
-    const paymentsSum = payments.reduce((sum: number, p: any) => sum + p.amount, 0);
-    const total_paid = advance + paymentsSum;
-    const balance = Math.max(0, total - total_paid);
-
-    const todayStr = new Date().toISOString().split('T')[0];
-    const dueDateStr = i.due_date ? i.due_date.toISOString().split('T')[0] : null;
-
-    let status = 'unpaid';
-    if (total_paid >= total && total > 0) {
-      status = 'paid';
-    } else if (dueDateStr && dueDateStr < todayStr && total_paid < total) {
-      status = 'overdue';
-    } else if (total_paid > 0 && total_paid < total) {
-      status = 'partial';
-    } else {
-      status = 'unpaid';
-    }
+    // Shared paise-based calculation (see invoice-status.ts)
+    const financials = computeInvoiceFinancials({
+      total,
+      advance,
+      payments: i.payments || [],
+      due_date: i.due_date,
+    });
+    const dueDateStr = financials.due_date;
 
     const tax_rate = subtotal > 0 ? Number(((tax / subtotal) * 100).toFixed(2)) : 0;
 
@@ -186,10 +186,14 @@ export class InvoicesService {
       subtotal,
       tax,
       tax_rate,
-      total,
-      total_paid,
-      balance,
-      status,
+      total: financials.total,
+      total_paid: financials.total_paid,
+      balance: financials.balance,
+      status: financials.status,
+      payment_status: financials.payment_status,
+      is_overdue: financials.is_overdue,
+      overpaid_amount: financials.overpaid_amount,
+      initial_payment_id: findInitialPaymentId(i),
       notes: i.notes || '',
       created_at: i.created_at ? i.created_at.toISOString() : null,
       items: (i.items || []).map((item: any) => {
@@ -250,7 +254,7 @@ export class InvoicesService {
 
       let formatted = invoices.map((i) => this.formatInvoice(i));
       if (query.status && query.status !== 'all') {
-        formatted = formatted.filter((inv) => inv.status === query.status);
+        formatted = formatted.filter((inv) => matchesInvoiceStatusFilter(inv, query.status));
       }
       return formatted;
     }
@@ -270,7 +274,7 @@ export class InvoicesService {
 
     let formatted = invoices.map((i) => this.formatInvoice(i));
     if (query.status && query.status !== 'all') {
-      formatted = formatted.filter((inv) => inv.status === query.status);
+      formatted = formatted.filter((inv) => matchesInvoiceStatusFilter(inv, query.status));
     }
 
     const totalCount = formatted.length;
@@ -339,7 +343,14 @@ export class InvoicesService {
     const tax = Number(body.tax || 0);
     const total = body.total !== undefined ? Number(body.total) : subtotal + tax;
 
-    const initialPaymentAmount = Number(body.payment_amount ?? body.advance ?? 0);
+    const rawInitialPayment = body.payment_amount ?? body.advance ?? 0;
+    const initialPaymentAmount = Number(rawInitialPayment);
+    // An initial payment of 0/blank means "no payment"; anything else must be a positive
+    // amount that does not exceed the invoice total.
+    if (rawInitialPayment !== '' && rawInitialPayment !== null && initialPaymentAmount !== 0) {
+      const paymentError = validatePaymentAmount(rawInitialPayment, toPaise(total));
+      if (paymentError) throw new BadRequestException(paymentError);
+    }
     const issueDateObj = new Date(body.issue_date || new Date());
     const paymentDateObj = body.payment_date ? new Date(body.payment_date) : issueDateObj;
     const paymentMode = body.payment_mode || 'cash';
@@ -381,7 +392,7 @@ export class InvoicesService {
             amount: initialPaymentAmount,
             payment_date: paymentDateObj,
             payment_mode: paymentMode,
-            notes: 'Initial payment received on invoice creation',
+            notes: INITIAL_PAYMENT_NOTE,
           },
         });
       }
@@ -417,6 +428,10 @@ export class InvoicesService {
     if (body.due_date !== undefined) data.due_date = body.due_date ? new Date(body.due_date) : null;
 
     const newPaymentAmount = Number(body.new_payment_amount || 0);
+    // 0/blank means "no new payment"; negative or non-numeric amounts are rejected
+    if (Number.isNaN(newPaymentAmount) || newPaymentAmount < 0) {
+      throw new BadRequestException('Payment amount must be greater than zero.');
+    }
     const paymentMode = body.payment_mode || body.new_payment_mode || 'cash';
     const paymentDateStr = body.payment_date || body.new_payment_date;
     const paymentDateObj = paymentDateStr ? new Date(paymentDateStr) : (body.issue_date ? new Date(body.issue_date) : new Date());
@@ -482,10 +497,22 @@ export class InvoicesService {
 
     if (newPaymentAmount > 0) {
       await this.prisma.$transaction(async (tx) => {
-        await tx.invoice.update({
+        // Lock the invoice row so concurrent payments cannot both pass the balance check
+        await tx.$queryRaw`SELECT id FROM invoices WHERE id = ${id} FOR UPDATE`;
+
+        const updatedInvoice = await tx.invoice.update({
           where: { id },
           data,
         });
+        const existingPayments = await tx.invoicePayment.findMany({ where: { invoice_id: id } });
+
+        const current = computeInvoiceFinancials({
+          total: updatedInvoice.total,
+          advance: updatedInvoice.advance,
+          payments: existingPayments,
+        });
+        const paymentError = validatePaymentAmount(newPaymentAmount, current.balance_paise);
+        if (paymentError) throw new BadRequestException(paymentError);
 
         await tx.invoicePayment.create({
           data: {
@@ -524,21 +551,22 @@ export class InvoicesService {
     const invoices = await this.findAll(user, { all: 'true' });
     const list = Array.isArray(invoices) ? invoices : invoices.results;
 
-    let totalRevenue = 0;
-    let totalPaid = 0;
-    let totalBalance = 0;
-
-    for (const inv of list) {
-      totalRevenue += inv.total;
-      totalPaid += inv.total_paid;
-      totalBalance += inv.balance;
-    }
+    // Exact paise-based totals from the same per-invoice figures shown in the table
+    const totals = aggregateInvoiceFinancials(
+      list.map((inv) =>
+        computeInvoiceFinancials({ total: inv.total, payments: [{ amount: inv.total_paid }], due_date: inv.due_date }),
+      ),
+    );
 
     return {
-      total_invoices: list.length,
-      total_revenue: totalRevenue,
-      total_paid: totalPaid,
-      total_balance: totalBalance,
+      total_invoices: totals.invoice_count,
+      total_revenue: totals.total_billed,
+      // Cash received, including any overpayment (reported separately below)
+      total_paid: totals.total_paid,
+      total_balance: totals.total_balance,
+      total_overpaid: totals.total_overpaid,
+      overdue_count: totals.overdue_count,
+      overdue_balance: totals.overdue_balance,
     };
   }
 

@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
+import { computeInvoiceFinancials, roundMoney, toPaise, validatePaymentAmount } from './invoice-status';
 
 export class ReceiptSigning {
   static generateToken(paymentId: number, secret: string, expiresInSeconds: number = 172800): string {
@@ -260,23 +261,29 @@ export class InvoicePaymentsService {
 
     const receiptNumber = await this.getOrAssignReceiptNumber(id);
 
-    // Point-in-time summary for THIS receipt, using the same formula as
-    // InvoicesService.formatInvoice (total_paid = advance + sum(payments)).
-    // "Previously paid" = advance + payments recorded before this one
-    // (ordered by payment_date, then id as a tie-breaker).
-    const invoiceTotal = payment.invoice.total ? Number(payment.invoice.total) : 0;
-    const currentAmount = payment.amount ? Number(payment.amount) : 0;
-    const advance = (payment.invoice as any)?.advance ? Number((payment.invoice as any).advance) : 0;
+    // Point-in-time summary for THIS receipt, using the shared invoice calculation
+    // (invoice-status.ts): "previously paid" = advance + payments recorded before this one
+    // (ordered by payment_date, then id as a tie-breaker); all amounts in exact paise.
     const currentTime = payment.payment_date ? new Date(payment.payment_date).getTime() : 0;
-    const earlierPaymentsSum = ((payment.invoice as any)?.payments || [])
-      .filter((p: any) => {
-        if (p.id === payment.id) return false;
-        const t = p.payment_date ? new Date(p.payment_date).getTime() : 0;
-        return t < currentTime || (t === currentTime && p.id < payment.id);
-      })
-      .reduce((sum: number, p: any) => sum + (p.amount ? Number(p.amount) : 0), 0);
-    const previouslyPaid = Math.round((advance + earlierPaymentsSum) * 100) / 100;
-    const balanceDue = Math.max(0, Math.round((invoiceTotal - previouslyPaid - currentAmount) * 100) / 100);
+    const earlierPayments = ((payment.invoice as any)?.payments || []).filter((p: any) => {
+      if (p.id === payment.id) return false;
+      const t = p.payment_date ? new Date(p.payment_date).getTime() : 0;
+      return t < currentTime || (t === currentTime && p.id < payment.id);
+    });
+    const before = computeInvoiceFinancials({
+      total: payment.invoice.total,
+      advance: (payment.invoice as any)?.advance,
+      payments: earlierPayments,
+    });
+    const after = computeInvoiceFinancials({
+      total: payment.invoice.total,
+      advance: (payment.invoice as any)?.advance,
+      payments: [...earlierPayments, payment],
+    });
+    const invoiceTotal = after.total;
+    const currentAmount = roundMoney(payment.amount);
+    const previouslyPaid = before.total_paid;
+    const balanceDue = after.balance;
 
     const receiptData = {
       receipt_number: this.getDisplayReceiptNumber(payment.invoice.invoice_number, receiptNumber),
@@ -396,20 +403,40 @@ export class InvoicePaymentsService {
     }
 
     const invoiceId = Number(body.invoice || body.invoice_id);
-    const invoice = await this.prisma.invoice.findUnique({ where: { id: invoiceId } });
-    if (!invoice) throw new NotFoundException('Invoice not found');
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) throw new NotFoundException('Invoice not found');
 
-    const payment = await this.prisma.invoicePayment.create({
-      data: {
-        invoice_id: invoiceId,
-        amount: Number(body.amount || 0),
-        payment_date: new Date(body.payment_date || new Date()),
-        payment_mode: body.payment_mode || 'cash',
-        notes: body.notes || '',
-      },
+    const payment = await this.prisma.$transaction(async (tx) => {
+      const financials = await this.lockInvoiceFinancials(tx, invoiceId);
+      const paymentError = validatePaymentAmount(body.amount, financials.balance_paise);
+      if (paymentError) throw new BadRequestException(paymentError);
+
+      return tx.invoicePayment.create({
+        data: {
+          invoice_id: invoiceId,
+          amount: roundMoney(body.amount),
+          payment_date: new Date(body.payment_date || new Date()),
+          payment_mode: body.payment_mode || 'cash',
+          notes: body.notes || '',
+        },
+      });
     });
 
     return this.formatPayment(payment);
+  }
+
+  /**
+   * Locks the invoice row (SELECT ... FOR UPDATE, released at commit) and returns its
+   * financials, optionally excluding one payment (the payment being edited).
+   */
+  private async lockInvoiceFinancials(tx: any, invoiceId: number, excludePaymentId?: number) {
+    await tx.$queryRaw`SELECT id FROM invoices WHERE id = ${invoiceId} FOR UPDATE`;
+    const invoice = await tx.invoice.findUnique({ where: { id: invoiceId }, include: { payments: true } });
+    if (!invoice) throw new NotFoundException('Invoice not found');
+    return computeInvoiceFinancials({
+      total: invoice.total,
+      advance: invoice.advance,
+      payments: (invoice.payments || []).filter((p: any) => p.id !== excludePaymentId),
+    });
   }
 
   async update(id: number, user: any, body: any) {
@@ -422,14 +449,29 @@ export class InvoicePaymentsService {
     if (!existing) throw new NotFoundException('Invoice payment not found');
 
     const data: any = {};
-    if (body.amount !== undefined) data.amount = Number(body.amount);
     if (body.payment_date !== undefined) data.payment_date = new Date(body.payment_date);
     if (body.payment_mode !== undefined) data.payment_mode = body.payment_mode;
     if (body.notes !== undefined) data.notes = body.notes;
 
-    const updated = await this.prisma.invoicePayment.update({
-      where: { id },
-      data,
+    const amountChanged = body.amount !== undefined && toPaise(body.amount) !== toPaise(existing.amount);
+    if (!amountChanged) {
+      if (body.amount !== undefined && toPaise(body.amount) <= 0) {
+        throw new BadRequestException('Payment amount must be greater than zero.');
+      }
+      const updated = await this.prisma.invoicePayment.update({ where: { id }, data });
+      return this.formatPayment(updated);
+    }
+
+    // Amount changed: revalidate against the balance excluding this payment's old amount
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const financials = await this.lockInvoiceFinancials(tx, existing.invoice_id, id);
+      const paymentError = validatePaymentAmount(body.amount, financials.balance_paise);
+      if (paymentError) throw new BadRequestException(paymentError);
+
+      return tx.invoicePayment.update({
+        where: { id },
+        data: { ...data, amount: roundMoney(body.amount) },
+      });
     });
 
     return this.formatPayment(updated);

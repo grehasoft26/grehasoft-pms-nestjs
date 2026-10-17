@@ -1,5 +1,6 @@
 import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { computeInvoiceFinancials, dateOnlyKey } from '../invoices/invoice-status';
 
 @Injectable()
 export class ClientPortalService {
@@ -27,19 +28,14 @@ export class ClientPortalService {
     return client;
   }
 
-  private calculateInvoiceStatus(inv: any): string {
-    const total = Number(inv.total || 0);
-    const advance = Number(inv.advance || 0);
-    const paid = advance + (inv.payments || []).reduce((acc: number, p: any) => acc + Number(p.amount || 0), 0);
-
-    if (total > 0 && paid >= total) return 'paid';
-    if (paid > 0 && paid < total) return 'partially_paid';
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    if (inv.due_date && new Date(inv.due_date) < today) return 'overdue';
-
-    return 'unpaid';
+  /** Shared invoice calculation (same rules as the main invoices API). */
+  private invoiceFinancials(inv: any) {
+    return computeInvoiceFinancials({
+      total: inv.total,
+      advance: inv.advance,
+      payments: inv.payments,
+      due_date: inv.due_date,
+    });
   }
 
   // -------------------------------------------------------------
@@ -154,8 +150,10 @@ export class ClientPortalService {
       include: { payments: true },
     });
 
-    const pending_invoices = invoices.filter((i) => this.calculateInvoiceStatus(i) !== 'paid').length;
-    const paid_invoices = invoices.filter((i) => this.calculateInvoiceStatus(i) === 'paid').length;
+    const invoiceFinancials = invoices.map((i) => this.invoiceFinancials(i));
+    // Pending = an outstanding balance remains (zero-total invoices are neither paid nor pending)
+    const pending_invoices = invoiceFinancials.filter((f) => f.balance_paise > 0).length;
+    const paid_invoices = invoiceFinancials.filter((f) => f.payment_status === 'paid').length;
 
     const taskFiles = await this.prisma.taskFile.findMany({
       where: { task: { project_id: { in: projectIds } } },
@@ -209,14 +207,21 @@ export class ClientPortalService {
         read: n.read,
         created_at: n.created_at.toISOString().replace('T', ' ').substring(0, 19),
       })),
-      invoices: invoices.map((inv) => ({
-        id: inv.id,
-        invoice_number: inv.invoice_number,
-        total: String(inv.total),
-        status: this.calculateInvoiceStatus(inv),
-        issue_date: inv.issue_date.toISOString().split('T')[0],
-        due_date: inv.due_date.toISOString().split('T')[0],
-      })),
+      invoices: invoices.map((inv, idx) => {
+        const f = invoiceFinancials[idx];
+        return {
+          id: inv.id,
+          invoice_number: inv.invoice_number,
+          total: String(inv.total),
+          status: f.status,
+          payment_status: f.payment_status,
+          is_overdue: f.is_overdue,
+          total_paid: f.total_paid,
+          balance: f.balance,
+          issue_date: dateOnlyKey(inv.issue_date),
+          due_date: dateOnlyKey(inv.due_date),
+        };
+      }),
       latest_reports: [],
       upcoming_deadlines: [],
     };

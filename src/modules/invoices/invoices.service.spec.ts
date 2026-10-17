@@ -10,6 +10,7 @@ describe('InvoicesService', () => {
 
   const mockPrismaService = {
     $transaction: jest.fn((cb: any) => cb(mockPrismaService)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     invoice: {
       findFirst: jest.fn(),
       findMany: jest.fn(),
@@ -28,6 +29,7 @@ describe('InvoicesService', () => {
     },
     invoicePayment: {
       create: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
     },
   };
 
