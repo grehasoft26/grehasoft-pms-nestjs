@@ -1,6 +1,9 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 
+/** Values of the ReminderType enum (prisma/schema.prisma). */
+const REMINDER_TYPES = ['general', 'invoice', 'payment', 'proposal', 'followup'] as const;
+
 @Injectable()
 export class RemindersService {
   constructor(private readonly prisma: PrismaService) {}
@@ -8,15 +11,29 @@ export class RemindersService {
   // -------------------------------------------------------------
   // 1. REMINDERS CRUD
   // -------------------------------------------------------------
-  async getReminders(user: any, query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+  async getReminders(
+    user: any,
+    query: { page?: string; limit?: string; search?: string; status?: string; all?: string } = {},
+  ) {
     const where: any = { user_id: user.id };
 
-    if (query.search) {
+    // Title and description (case-insensitive through the columns' *_ci collation; Prisma's
+    // `mode: 'insensitive'` is not supported on MySQL and made every search fail with a 500),
+    // plus the category when the term matches a reminder type
+    const search = String(query.search ?? '').trim();
+    if (search) {
+      const types = REMINDER_TYPES.filter((t) => t.includes(search.toLowerCase()));
       where.OR = [
-        { title: { contains: query.search, mode: 'insensitive' } },
-        { description: { contains: query.search, mode: 'insensitive' } },
+        { title: { contains: search } },
+        { description: { contains: search } },
+        ...(types.length ? [{ type: { in: types } }] : []),
       ];
     }
+
+    // Completion filter on the existing is_completed field: ?status=pending | completed
+    const status = String(query.status ?? '').toLowerCase();
+    if (status === 'completed') where.is_completed = true;
+    else if (status === 'pending') where.is_completed = false;
 
     if (query.all === 'true') {
       const reminders = await this.prisma.reminder.findMany({

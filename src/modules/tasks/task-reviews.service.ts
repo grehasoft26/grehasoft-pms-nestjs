@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { canAccessProject, projectScopeFor } from '../../core/utils/project-scope.util';
 
 @Injectable()
 export class TaskReviewsService {
@@ -27,9 +28,12 @@ export class TaskReviewsService {
     }
 
     const where: any = {};
-    if (query.task) {
-      where.task_file = { task_id: Number(query.task) };
-    }
+    const taskFileWhere: any = {};
+    if (query.task) taskFileWhere.task_id = Number(query.task);
+    // Reviews of files in projects inside the caller's scope (previously every review)
+    const scope = await projectScopeFor(this.prisma, user);
+    if (scope) taskFileWhere.task = { project: scope };
+    if (Object.keys(taskFileWhere).length) where.task_file = taskFileWhere;
 
     const reviews = await this.prisma.taskReview.findMany({
       where,
@@ -40,12 +44,24 @@ export class TaskReviewsService {
     return reviews.map((r) => this.formatReview(r));
   }
 
-  async findOne(id: number) {
+  /** The reviewed file's project must be inside the caller's scope; 404 otherwise. */
+  private async assertFileInScope(user: any, taskFileId: number, message: string) {
+    const file = await this.prisma.taskFile.findFirst({
+      where: { id: taskFileId, deleted_at: null },
+      select: { task: { select: { project_id: true } } },
+    });
+    if (!file?.task || !(await canAccessProject(this.prisma, user, file.task.project_id))) {
+      throw new NotFoundException(message);
+    }
+  }
+
+  async findOne(id: number, user: any) {
     const review = await this.prisma.taskReview.findUnique({
       where: { id },
       include: { reviewer: true },
     });
     if (!review) throw new NotFoundException('Task review not found');
+    await this.assertFileInScope(user, review.task_file_id, 'Task review not found');
     return this.formatReview(review);
   }
 
@@ -67,6 +83,7 @@ export class TaskReviewsService {
     }
 
     const taskFileId = Number(body.task_file || body.task_file_id);
+    await this.assertFileInScope(user, taskFileId, 'Task file not found');
     const existingApproved = await this.prisma.taskReview.findFirst({
       where: { task_file_id: taskFileId, status: 'approved' },
     });
@@ -97,6 +114,7 @@ export class TaskReviewsService {
   async update(id: number, user: any, body: any) {
     const existing = await this.prisma.taskReview.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Task review not found');
+    await this.assertFileInScope(user, existing.task_file_id, 'Task review not found');
 
     if (existing.reviewer_id !== user.id && !user.is_superuser) {
       throw new ForbiddenException('You can edit only your own review.');
@@ -117,6 +135,7 @@ export class TaskReviewsService {
   async remove(id: number, user: any) {
     const existing = await this.prisma.taskReview.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Task review not found');
+    await this.assertFileInScope(user, existing.task_file_id, 'Task review not found');
 
     if (existing.reviewer_id !== user.id && !user.is_superuser) {
       throw new ForbiddenException('You can delete only your own review.');

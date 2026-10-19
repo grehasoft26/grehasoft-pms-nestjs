@@ -3,6 +3,7 @@ import { MilestonesService } from './milestones.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 
 @Controller('api/v1/milestones')
@@ -12,6 +13,7 @@ export class MilestonesController {
 
   @Get()
   @Permissions('VIEW_PROJECTS')
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.milestonesService.findAll(user, query);
   }

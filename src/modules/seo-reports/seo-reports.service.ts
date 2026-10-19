@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
+import { resolveClientForUser } from '../../core/utils/client-scope.util';
 import { CreateSeoReportDto } from './dto/create-seo-report.dto';
 import { UpdateSeoReportDto } from './dto/update-seo-report.dto';
 import {
@@ -195,23 +196,17 @@ export class SeoReportsService {
   async findAll(user: any, query: any = {}) {
     const where: any = {};
 
-    if (this.isClient(user)) {
-      // Find client record belonging to user
-      const client = await this.prisma.client.findFirst({
-        where: {
-          OR: [
-            { portal_users: { some: { id: user.id } } },
-            { email: user.email },
-            { id: user.client_id || 0 },
-          ],
-        },
-      });
+    const isClientUser = this.isClient(user);
+    if (isClientUser) {
+      // Client record belonging to the user (fails closed when it cannot be determined)
+      const client = await resolveClientForUser(this.prisma, user);
       if (!client) return { count: 0, results: [] };
       where.client_id = client.id;
       where.status = 'published'; // CLIENT users only see published reports
     }
 
-    if (query.client_id || query.client) where.client_id = Number(query.client_id || query.client);
+    // CLIENT users cannot widen their scope with ?client_id=
+    if (!isClientUser && (query.client_id || query.client)) where.client_id = Number(query.client_id || query.client);
     if (query.website_id || query.website) where.website_id = Number(query.website_id || query.website);
     if (query.report_month) where.report_month = query.report_month;
     if (query.status && !this.isClient(user)) where.status = query.status;
@@ -279,15 +274,7 @@ export class SeoReportsService {
     if (!report) throw new NotFoundException(`SEO Report #${id} not found.`);
 
     if (this.isClient(user)) {
-      const client = await this.prisma.client.findFirst({
-        where: {
-          OR: [
-            { portal_users: { some: { id: user.id } } },
-            { email: user.email },
-            { id: user.client_id || 0 },
-          ],
-        },
-      });
+      const client = await resolveClientForUser(this.prisma, user);
       if (!client || report.client_id !== client.id || report.status !== 'published') {
         throw new ForbiddenException('You do not have access to view this report.');
       }
@@ -581,7 +568,9 @@ export class SeoReportsService {
       if (report.status !== 'published') {
         throw new ForbiddenException('Clients can only download published SEO reports.');
       }
-      if (user.client_id && report.client_id !== user.client_id) {
+      // Same client resolution as findOne; fail closed (previously skipped when client_id was null)
+      const client = await resolveClientForUser(this.prisma, user);
+      if (!client || report.client_id !== client.id) {
         throw new ForbiddenException('You do not have permission to access this SEO report.');
       }
     } else if (!this.isPrivileged(user) && !this.isExecutive(user)) {

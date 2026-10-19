@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { InfrastructureService } from './infrastructure.service';
 import {
+  InfrastructureSummaryController,
   ServersController,
   DomainsController,
   CredentialsController,
@@ -8,6 +9,7 @@ import {
 
 @Module({
   controllers: [
+    InfrastructureSummaryController,
     ServersController,
     DomainsController,
     CredentialsController,

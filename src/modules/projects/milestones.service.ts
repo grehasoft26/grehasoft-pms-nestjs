@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/commo
 import { PrismaService } from '../../core/prisma.service';
 import { ProgressAggregationService } from './services/progress-aggregation.service';
 import { ProjectActivityLogsService } from './services/project-activity-logs.service';
+import { canAccessProject, projectScopeFor } from '../../core/utils/project-scope.util';
 
 @Injectable()
 export class MilestonesService {
@@ -26,29 +27,15 @@ export class MilestonesService {
   }
 
   async findAll(user: any, query: { project?: string }) {
-    const roleName = user.role?.name;
     const where: any = {};
 
     if (query.project) {
       where.project_id = Number(query.project);
     }
 
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (client) {
-        where.project = { client_id: client.id };
-      } else {
-        return query.project ? [] : { count: 0, next: null, previous: null, results: [] };
-      }
-    } else if (roleName === 'TEAM_MEMBER') {
-      where.project = {
-        members: {
-          some: { user_id: user.id },
-        },
-      };
-    }
+    // Milestones of projects in the caller's scope (previously only CLIENT and TEAM_MEMBER were scoped)
+    const scope = await projectScopeFor(this.prisma, user);
+    if (scope) where.project = scope;
 
     const milestones = await this.prisma.milestone.findMany({
       where,
@@ -70,11 +57,17 @@ export class MilestonesService {
     };
   }
 
+  /** The project must be inside the caller's scope; 404 otherwise. */
+  private async assertProjectInScope(user: any, projectId: number, message: string) {
+    if (!(await canAccessProject(this.prisma, user, projectId))) throw new NotFoundException(message);
+  }
+
   async findOne(id: number, user: any) {
     const milestone = await this.prisma.milestone.findUnique({
       where: { id },
     });
     if (!milestone) throw new NotFoundException('Milestone not found');
+    await this.assertProjectInScope(user, milestone.project_id, 'Milestone not found');
     return this.formatMilestone(milestone);
   }
 
@@ -85,6 +78,7 @@ export class MilestonesService {
     }
 
     const projectId = Number(body.project || body.project_id);
+    await this.assertProjectInScope(user, projectId, 'Project not found');
     const created = await this.prisma.milestone.create({
       data: {
         project_id: projectId,
@@ -114,6 +108,7 @@ export class MilestonesService {
 
     const existing = await this.prisma.milestone.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Milestone not found');
+    await this.assertProjectInScope(user, existing.project_id, 'Milestone not found');
 
     const data: any = {};
     if (body.title !== undefined) data.title = body.title;
@@ -145,6 +140,7 @@ export class MilestonesService {
 
     const existing = await this.prisma.milestone.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Milestone not found');
+    await this.assertProjectInScope(user, existing.project_id, 'Milestone not found');
 
     await this.prisma.milestone.delete({ where: { id } });
 

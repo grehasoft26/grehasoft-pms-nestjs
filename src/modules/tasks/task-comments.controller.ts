@@ -3,6 +3,7 @@ import { TaskCommentsService } from './task-comments.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 
 @Controller('api/v1/task-comments')
@@ -12,18 +13,20 @@ export class TaskCommentsController {
 
   @Get()
   @Permissions('VIEW_TASKS')
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.taskCommentsService.findAll(user, query);
   }
 
   @Get(':id')
   @Permissions('VIEW_TASKS')
-  async findOne(@Param('id', ParseIntPipe) id: number) {
-    return this.taskCommentsService.findOne(id);
+  async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.taskCommentsService.findOne(id, user);
   }
 
   @Post()
   @Permissions('VIEW_TASKS')
+  @ClientAccess()
   async create(@CurrentUser() user: any, @Body() body: any) {
     return this.taskCommentsService.create(user, body);
   }

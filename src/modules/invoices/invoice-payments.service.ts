@@ -40,7 +40,10 @@ export class ReceiptSigning {
     const payload = `receipt:${paymentId}:${expiresAt}`;
     const expectedHmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
 
-    if (hmacStr !== expectedHmac) {
+    // Constant-time comparison (as InvoiceSigning does)
+    const given = Buffer.from(String(hmacStr), 'utf8');
+    const expected = Buffer.from(expectedHmac, 'utf8');
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
       return { valid: false, error: 'Invalid signature token.' };
     }
 
@@ -592,6 +595,8 @@ export class InvoicePaymentsService {
   async generateSecureLink(id: number, req?: any) {
     const payment = await this.prisma.invoicePayment.findUnique({ where: { id } });
     if (!payment) throw new NotFoundException('Invoice payment not found');
+    // Caller must be able to read this payment (findOne applies CLIENT ownership scoping)
+    if (req?.user) await this.findOne(id, req.user);
 
     const secret = this.getSigningSecret();
     const token = ReceiptSigning.generateToken(id, secret, 172800);

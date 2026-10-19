@@ -24,6 +24,19 @@ export class SeoService {
     return role === 'CLIENT';
   }
 
+  /** Non-privileged users may only save daily logs as draft or submitted (no self-approval). */
+  private assertLogStatusAllowed(user: any, status: any) {
+    if (status === undefined || status === null || this.isPrivileged(user)) return;
+    if (!['draft', 'submitted'].includes(String(status))) {
+      throw new BadRequestException('You can only save as draft or submit.');
+    }
+  }
+
+  /** Decrypted item passwords are shown only to SEO managers and the log's own executive. */
+  private canSeeLogPasswords(user: any, log: any): boolean {
+    return !!user && (this.isPrivileged(user) || (log?.executive_id !== undefined && log.executive_id === user.id));
+  }
+
   // -------------------------------------------------------------
   // 1. SEO ACTIVITY TYPES
   // -------------------------------------------------------------
@@ -316,8 +329,9 @@ export class SeoService {
   // -------------------------------------------------------------
   // 4. SEO DAILY WORK LOGS
   // -------------------------------------------------------------
-  private formatDailyLog(log: any) {
+  private formatDailyLog(log: any, viewer?: any) {
     if (!log) return null;
+    const revealPasswords = this.canSeeLogPasswords(viewer, log);
     const exec = log.executive;
     const web = log.website;
     const createdBy = log.created_by;
@@ -329,8 +343,8 @@ export class SeoService {
           ...it,
           activity_type: it.activity_type_id || (it.activity_type ? it.activity_type.id : undefined),
           activity_type_name: it.activity_type ? it.activity_type.name : '',
-          password: it.password ? this.decryptPassword(it.password) : '',
-          decrypted_password: it.password ? this.decryptPassword(it.password) : '',
+          password: revealPasswords && it.password ? this.decryptPassword(it.password) : '',
+          decrypted_password: revealPasswords && it.password ? this.decryptPassword(it.password) : '',
         }))
       : [];
 
@@ -358,9 +372,11 @@ export class SeoService {
       where.executive_id = user.id;
     }
 
-    if (query.status) where.status = query.status;
+    // Query filters must not widen the forced scope: clients stay on approved logs,
+    // executives stay on their own logs
+    if (query.status && !this.isClient(user)) where.status = query.status;
     if (query.website) where.website_id = Number(query.website);
-    if (query.executive) where.executive_id = Number(query.executive);
+    if (query.executive && !this.isClient(user) && !this.isExecutive(user)) where.executive_id = Number(query.executive);
     if (query.seo_task) where.seo_task_id = Number(query.seo_task);
     if (query.start_date) where.log_date = { gte: new Date(query.start_date) };
     if (query.end_date) {
@@ -391,7 +407,7 @@ export class SeoService {
         orderBy: [{ log_date: 'desc' }, { created_at: 'desc' }],
       });
 
-      return logs.map((l) => this.formatDailyLog(l));
+      return logs.map((l) => this.formatDailyLog(l, user));
     }
 
     const pageNum = Math.max(1, Number(query.page) || 1);
@@ -417,7 +433,7 @@ export class SeoService {
       take: limitNum,
     });
 
-    const formatted = logs.map((l) => this.formatDailyLog(l));
+    const formatted = logs.map((l) => this.formatDailyLog(l, user));
 
     return {
       count,
@@ -442,7 +458,15 @@ export class SeoService {
       },
     });
     if (!log) throw new NotFoundException('Daily work log not found');
-    return this.formatDailyLog(log);
+    // Same scope as the list (previously any user could read any log by id)
+    if (this.isClient(user)) {
+      if (!user.client_id || log.website?.client_id !== user.client_id || log.status !== 'approved') {
+        throw new NotFoundException('Daily work log not found');
+      }
+    } else if (this.isExecutive(user) && log.executive_id !== user.id) {
+      throw new NotFoundException('Daily work log not found');
+    }
+    return this.formatDailyLog(log, user);
   }
 
   async createDailyLog(user: any, data: any) {
@@ -452,7 +476,13 @@ export class SeoService {
 
     const website_id = Number(data.website_id || data.website);
     const log_date = new Date(data.log_date);
-    const executive_id = data.executive_id || data.executive ? Number(data.executive_id || data.executive) : user.id;
+    const requestedExecutive = data.executive_id || data.executive ? Number(data.executive_id || data.executive) : user.id;
+    // Only SEO managers may log work on behalf of another executive or set approval statuses
+    if (!this.isPrivileged(user) && requestedExecutive !== user.id) {
+      throw new ForbiddenException('You can only log work for yourself.');
+    }
+    this.assertLogStatusAllowed(user, data.status);
+    const executive_id = requestedExecutive;
 
     // Check if existing log for (executive, website, date)
     const existingLog = await this.prisma.sEODailyWorkLog.findFirst({
@@ -511,10 +541,14 @@ export class SeoService {
       },
     });
 
-    return this.formatDailyLog(createdLog);
+    return this.formatDailyLog(createdLog, user);
   }
 
   async addItemsToDailyLog(user: any, data: any) {
+    if (this.isClient(user)) {
+      throw new ForbiddenException('Clients do not have permission to modify daily work logs.');
+    }
+    this.assertLogStatusAllowed(user, data.status);
     const website_id = Number(data.website_id || data.website);
     const log_date = new Date(data.log_date);
     const executive_id = user.id;
@@ -581,7 +615,7 @@ export class SeoService {
       },
     });
 
-    return this.formatDailyLog(updatedLog);
+    return this.formatDailyLog(updatedLog, user);
   }
 
   async updateDailyLog(user: any, id: number, data: any) {
@@ -592,6 +626,10 @@ export class SeoService {
     const log = await this.prisma.sEODailyWorkLog.findUnique({ where: { id } });
     if (!log) throw new NotFoundException('Daily work log not found');
 
+    if (!this.isPrivileged(user) && !this.isExecutive(user)) {
+      // Previously any other role (e.g. TEAM_MEMBER) could edit any log and set any status
+      throw new ForbiddenException('Only SEO managers and the log\'s executive can edit daily work logs.');
+    }
     if (this.isExecutive(user)) {
       if (log.executive_id !== user.id) {
         throw new ForbiddenException('You can only edit your own logs.');
@@ -623,7 +661,7 @@ export class SeoService {
       },
     });
 
-    return this.formatDailyLog(updatedLog);
+    return this.formatDailyLog(updatedLog, user);
   }
 
   async deleteDailyLog(user: any, id: number) {
@@ -633,7 +671,7 @@ export class SeoService {
     const log = await this.prisma.sEODailyWorkLog.findUnique({ where: { id } });
     if (!log) throw new NotFoundException('Daily work log not found');
 
-    if (this.isExecutive(user) && log.executive_id !== user.id) {
+    if (!this.isPrivileged(user) && log.executive_id !== user.id) {
       throw new ForbiddenException('You can only delete your own logs.');
     }
     return this.prisma.sEODailyWorkLog.delete({ where: { id } });
@@ -1031,6 +1069,10 @@ export class SeoService {
   async updateTask(user: any, id: number, data: any) {
     const oldTask = await this.prisma.sEOTask.findUnique({ where: { id } });
     if (!oldTask) throw new NotFoundException('Task not found');
+    // Previously any logged-in user (including clients) could edit any SEO task
+    if (!this.isPrivileged(user) && !(this.isExecutive(user) && oldTask.assigned_executive_id === user.id)) {
+      throw new ForbiddenException('Only SEO managers and the assigned executive can update this task.');
+    }
 
     const updateData: any = {};
     if (data.title !== undefined) updateData.title = data.title;
@@ -1202,6 +1244,11 @@ export class SeoService {
   }
 
   async updateReminder(user: any, id: number, data: any) {
+    const reminder = await this.prisma.sEOReminder.findUnique({ where: { id } });
+    if (!reminder) throw new NotFoundException('Reminder not found');
+    if (!this.isPrivileged(user) && !(this.isExecutive(user) && reminder.assigned_executive_id === user.id)) {
+      throw new ForbiddenException('Only SEO managers and the assigned executive can update this reminder.');
+    }
     return this.prisma.sEOReminder.update({
       where: { id },
       data: {
@@ -1214,6 +1261,10 @@ export class SeoService {
   }
 
   async deleteReminder(user: any, id: number) {
+    // Same rule as creating reminders: SEO managers only
+    if (!this.isPrivileged(user)) {
+      throw new ForbiddenException('Only SEO managers can delete reminders.');
+    }
     return this.prisma.sEOReminder.delete({ where: { id } });
   }
 
@@ -1224,6 +1275,10 @@ export class SeoService {
     const where: any = {};
     if (this.isExecutive(user)) {
       where.website = { assigned_executive_id: user.id };
+    } else if (!this.isPrivileged(user)) {
+      // Decrypted SEO credentials: managers (all) and executives (assigned websites) only.
+      // Previously clients and every other role received all credentials in plaintext.
+      throw new ForbiddenException('You do not have permission to view SEO credentials.');
     }
     const creds = await this.prisma.sEOCredential.findMany({
       where,

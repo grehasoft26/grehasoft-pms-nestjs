@@ -3,6 +3,7 @@ import { ClientsService } from './clients.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 
 @Controller('api/v1/clients')
@@ -12,6 +13,7 @@ export class ClientsController {
 
   @Get()
   @Permissions('VIEW_CLIENTS')
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.clientsService.findAll(user, query);
   }
@@ -34,6 +36,7 @@ export class ClientsController {
 
   @Get(':id')
   @Permissions('VIEW_CLIENTS')
+  @ClientAccess()
   async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.clientsService.findOne(id, user);
   }
@@ -56,6 +59,7 @@ export class ClientsController {
 
   @Patch([':id', ':id/'])
   @Permissions('VIEW_CLIENTS')
+  @ClientAccess()
   async update(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,

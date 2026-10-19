@@ -2,6 +2,8 @@ import { Injectable, BadRequestException, NotFoundException, ForbiddenException 
 import { PrismaService } from '../../core/prisma.service';
 import { PasswordUtil } from '../../core/utils/password.util';
 import { formatUserResponse } from './user.serializer';
+import { getActiveRolePermissions, getEffectiveAccess, isSuperAdmin } from '../../core/utils/role-access.util';
+import { isPrivilegedRoleName } from '../../core/utils/permission-catalog';
 
 @Injectable()
 export class UsersService {
@@ -13,7 +15,8 @@ export class UsersService {
       include: { role: true, department: true, client: true },
     });
     if (!freshUser) throw new NotFoundException('User not found');
-    return formatUserResponse(freshUser);
+    // role_permissions stays as stored; effective access is what the backend guards actually allow
+    return { ...formatUserResponse(freshUser), ...getEffectiveAccess(freshUser) };
   }
 
   async updateProfile(user: any, body: any, file?: any) {
@@ -187,18 +190,22 @@ export class UsersService {
   }
 
   async create(reqUser: any, body: any) {
-    const reqIsSuper = reqUser.is_superuser || reqUser.role?.name === 'SUPER_ADMIN';
+    const reqIsSuper = isSuperAdmin(reqUser);
 
     let roleObj = null;
     if (body.role) {
       roleObj = await this.prisma.role.findFirst({
-        where: { OR: [{ id: Number(body.role) || -1 }, { name: String(body.role) }] },
+        where: {
+          deleted_at: null,
+          OR: [{ id: Number(body.role) || -1 }, { name: String(body.role) }],
+        },
       });
+      if (!roleObj) {
+        throw new BadRequestException({ role: 'Role not found or has been deleted.' });
+      }
     }
 
-    if (roleObj && roleObj.name === 'SUPER_ADMIN' && !reqIsSuper) {
-      throw new BadRequestException({ role: 'Only Super Admins can assign the SUPER_ADMIN role.' });
-    }
+    this.assertCanAssignRole(reqUser, reqIsSuper, roleObj);
 
     const hashedPassword = await PasswordUtil.hashPassword(body.password || 'password123');
 
@@ -257,11 +264,32 @@ export class UsersService {
     });
     if (!existing) throw new NotFoundException('User not found');
 
-    const reqIsSuper = reqUser.is_superuser || reqUser.role?.name === 'SUPER_ADMIN';
-    const tgtIsSuper = existing.is_superuser || existing.role?.name === 'SUPER_ADMIN';
+    const reqIsSuper = isSuperAdmin(reqUser);
+    const tgtIsSuper = isSuperAdmin(existing);
 
     if (tgtIsSuper && reqUser.id !== existing.id && !reqIsSuper) {
       throw new ForbiddenException({ role: 'Only Super Admins can modify other Super Admin accounts.' });
+    }
+
+    // Protected accounts (ADMIN role, or a role granting permissions the requester lacks):
+    // non-super managers may not change login or access fields (password reset or email change
+    // would let them take the account over and inherit its permissions)
+    const protection = reqUser.id !== existing.id ? this.accountProtection(reqUser, reqIsSuper, existing) : null;
+    if (protection) {
+      const changing = (key: string, current: any) =>
+        body[key] !== undefined && String(body[key] ?? '') !== String(current ?? '');
+      const sensitive = [
+        body.password ? 'password' : null,
+        changing('email', existing.email) ? 'email' : null,
+        changing('username', existing.username) ? 'username' : null,
+        body.is_active !== undefined && Boolean(body.is_active) !== Boolean(existing.is_active) ? 'is_active' : null,
+        changing('status', existing.status) ? 'status' : null,
+        changing('department', existing.department_id) ? 'department' : null,
+        changing('client', existing.client_id) ? 'client' : null,
+      ].filter(Boolean);
+      if (sensitive.length > 0) {
+        throw new ForbiddenException(`Only Super Admins can change ${sensitive.join(', ')} of ${protection}.`);
+      }
     }
 
     const data: any = {};
@@ -274,7 +302,10 @@ export class UsersService {
     if (body.salary_monthly !== undefined) data.salary_monthly = body.salary_monthly !== null && body.salary_monthly !== '' ? Number(body.salary_monthly) : null;
     if (body.status !== undefined) data.status = body.status;
     if (body.is_active !== undefined) data.is_active = body.is_active;
-    if (body.role !== undefined) data.role_id = Number(body.role) || null;
+    if (body.role !== undefined) {
+      const roleId = await this.resolveRoleChange(reqUser, reqIsSuper, existing, body.role);
+      if (roleId !== undefined) data.role_id = roleId;
+    }
     if (body.department !== undefined) data.department_id = body.department ? Number(body.department) : null;
     if (body.client !== undefined) data.client_id = body.client ? Number(body.client) : null;
     if (body.profile_photo !== undefined) data.profile_photo = body.profile_photo;
@@ -323,11 +354,124 @@ export class UsersService {
     return formatUserResponse(updated);
   }
 
-  async remove(id: number) {
+  /**
+   * Validates a requested role change (PATCH /users/:id).
+   * Returns the new role id (or null to clear it), or undefined when the role is unchanged.
+   * - The role must exist and not be soft-deleted.
+   * - Only super admins can assign the SUPER_ADMIN role.
+   * - Nobody can change their own role through this endpoint.
+   */
+  private async resolveRoleChange(reqUser: any, reqIsSuper: boolean, target: any, rawRole: any): Promise<number | null | undefined> {
+    const clearing = rawRole === null || rawRole === '' || rawRole === 0 || rawRole === '0';
+    const requestedId = clearing ? null : Number(rawRole);
+
+    // Unchanged role (e.g. an edit form re-sending the current value) is not a role change
+    if (requestedId === (target.role_id ?? null)) return undefined;
+
+    if (target.id === reqUser.id) {
+      throw new ForbiddenException({ role: 'You cannot change your own role.' });
+    }
+
+    // Only super admins may change (or clear) the role of a privileged account
+    // ...or of an account whose role grants permissions the requester does not hold (checked
+    // after the requested role itself, so its more specific error is reported first)
+    const assertTargetNotProtected = () => {
+      const protection = this.accountProtection(reqUser, reqIsSuper, target);
+      if (protection) {
+        throw new ForbiddenException({ role: `Only Super Admins can change the role of ${protection}.` });
+      }
+    };
+
+    if (requestedId === null) {
+      assertTargetNotProtected();
+      return null;
+    }
+
+    if (!Number.isInteger(requestedId) || requestedId <= 0) {
+      throw new BadRequestException({ role: 'Invalid role.' });
+    }
+
+    const role = await this.prisma.role.findFirst({ where: { id: requestedId, deleted_at: null } });
+    if (!role) {
+      throw new BadRequestException({ role: 'Role not found or has been deleted.' });
+    }
+
+    this.assertCanAssignRole(reqUser, reqIsSuper, role);
+    assertTargetNotProtected();
+
+    return role.id;
+  }
+
+  /**
+   * Role-assignment policy (create and update), using the role record from the database:
+   * - Super admins may assign any active role, including SUPER_ADMIN and ADMIN.
+   * - Others may not assign privileged roles (SUPER_ADMIN, ADMIN).
+   * - Others may only assign a role whose permissions they all hold themselves
+   *   (prevents escalation via roles a super admin granted extra permissions).
+   */
+  private assertCanAssignRole(reqUser: any, reqIsSuper: boolean, role: { name: string; permissions?: unknown } | null) {
+    if (!role || reqIsSuper) return;
+
+    if (isPrivilegedRoleName(role.name)) {
+      throw new ForbiddenException({ role: `Only Super Admins can assign the ${role.name} role.` });
+    }
+
+    const notHeld = this.permissionsNotHeld(reqUser, role);
+    if (notHeld.length > 0) {
+      throw new ForbiddenException({
+        role: `You cannot assign the ${role.name} role because it grants permissions you do not have: ${notHeld.join(', ')}.`,
+      });
+    }
+  }
+
+  /** Permissions the role grants that the requester's own active role does not. */
+  private permissionsNotHeld(reqUser: any, role: { permissions?: unknown } | null | undefined): string[] {
+    const held = new Set(getActiveRolePermissions(reqUser));
+    const rolePermissions = Array.isArray(role?.permissions)
+      ? (role!.permissions as unknown[]).filter((p): p is string => typeof p === 'string').map((p) => p.toUpperCase())
+      : [];
+    return [...new Set(rolePermissions.filter((p) => !held.has(p)))];
+  }
+
+  /**
+   * Why a non-super-admin may not take over (password, email, login and access fields), re-role
+   * or delete `target`; null when they may. Least privilege, like assertCanAssignRole: besides
+   * super admins and the privileged role names, any account whose role grants a permission the
+   * requester does not hold is protected, whatever the role is called. The target role's
+   * permissions are read even if it is soft-deleted, so a restored role cannot be exploited.
+   * Callers skip this for the requester's own account.
+   */
+  private accountProtection(reqUser: any, reqIsSuper: boolean, target: any): string | null {
+    if (reqIsSuper) return null;
+    if (isSuperAdmin(target)) return 'a Super Admin account';
+    if (isPrivilegedRoleName(target.role?.name)) return `an account that has the ${target.role.name} role`;
+    const notHeld = this.permissionsNotHeld(reqUser, target.role);
+    if (notHeld.length > 0) {
+      return `an account whose role grants permissions you do not have (${notHeld.join(', ')})`;
+    }
+    return null;
+  }
+
+  async remove(reqUser: any, id: number) {
     const existing = await this.prisma.user.findFirst({
       where: { id, deleted_at: null },
+      include: { role: true },
     });
     if (!existing) throw new NotFoundException('User not found');
+
+    if (reqUser && existing.id === reqUser.id) {
+      throw new ForbiddenException('You cannot delete your own account.');
+    }
+    if (isSuperAdmin(existing) && !isSuperAdmin(reqUser)) {
+      throw new ForbiddenException('Only Super Admins can delete Super Admin accounts.');
+    }
+    if (isPrivilegedRoleName(existing.role?.name) && !isSuperAdmin(reqUser)) {
+      throw new ForbiddenException(`Only Super Admins can delete accounts that have the ${existing.role.name} role.`);
+    }
+    const protection = this.accountProtection(reqUser, isSuperAdmin(reqUser), existing);
+    if (protection) {
+      throw new ForbiddenException(`Only Super Admins can delete ${protection}.`);
+    }
 
     await this.prisma.user.update({
       where: { id },

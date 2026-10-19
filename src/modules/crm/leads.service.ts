@@ -70,7 +70,7 @@ export class LeadsService {
       ];
     }
 
-    if (roleName !== 'SUPER_ADMIN' && roleName !== 'SALES_MANAGER' && !user.is_superuser) {
+    if (!this.canSeeAllLeads(user)) {
       where.assignments = {
         some: {
           sales_exec_id: user.id,
@@ -127,9 +127,17 @@ export class LeadsService {
     };
   }
 
+  /** Existing list rule: super admins and sales managers see every lead; others only assigned ones. */
+  private canSeeAllLeads(user: any): boolean {
+    const roleName = user?.role?.name;
+    return roleName === 'SUPER_ADMIN' || roleName === 'SALES_MANAGER' || !!user?.is_superuser;
+  }
+
   async findOne(id: number, user: any) {
+    // Same scope as findAll (previously any lead was readable/editable by id). Used by update/remove.
+    const scope = this.canSeeAllLeads(user) ? {} : { assignments: { some: { sales_exec_id: user.id } } };
     const lead = await this.prisma.lead.findFirst({
-      where: { id, deleted_at: null },
+      where: { id, deleted_at: null, ...scope },
       include: {
         client: true,
         converted_project: true,
@@ -257,8 +265,9 @@ export class LeadsService {
       throw new ForbiddenException('Clients do not have permission to modify lead data.');
     }
 
+    const scope = this.canSeeAllLeads(user) ? {} : { assignments: { some: { sales_exec_id: user.id } } };
     const lead = await this.prisma.lead.findFirst({
-      where: { id, deleted_at: null },
+      where: { id, deleted_at: null, ...scope },
       include: { client: true },
     });
 

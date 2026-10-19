@@ -3,6 +3,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma.service';
+import { DEACTIVATED_ROLE_MESSAGE, applyRoleStatus } from '../utils/role-access.util';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
@@ -43,6 +44,12 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       throw new UnauthorizedException('User no longer exists or is inactive');
     }
 
-    return user;
+    // Users still assigned to a soft-deleted role are refused (is_superuser keeps access)
+    const active = applyRoleStatus(user);
+    if (!active) {
+      throw new UnauthorizedException(DEACTIVATED_ROLE_MESSAGE);
+    }
+
+    return active;
   }
 }

@@ -18,8 +18,8 @@ export class ProjectMembersController {
 
   @Get(':id')
   @Permissions('VIEW_PROJECTS')
-  async findOne(@Param('id', ParseIntPipe) id: number) {
-    return this.membersService.findOne(id);
+  async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.membersService.findOne(id, user);
   }
 
   @Post()

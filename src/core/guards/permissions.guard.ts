@@ -2,6 +2,8 @@ import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@
 import { Reflector } from '@nestjs/core';
 import { PERMISSIONS_KEY } from '../decorators/permissions.decorator';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
+import { CLIENT_ACCESS_KEY } from '../decorators/client-access.decorator';
+import { getActiveRolePermissions, isActiveRole, isSuperAdmin } from '../utils/role-access.util';
 
 @Injectable()
 export class PermissionsGuard implements CanActivate {
@@ -32,29 +34,29 @@ export class PermissionsGuard implements CanActivate {
       throw new ForbiddenException('User not authenticated');
     }
 
-    // Superuser native Django bypass
-    if (user.is_superuser || user.role?.name === 'SUPER_ADMIN') {
+    // Superuser bypass: is_superuser flag or the ACTIVE built-in SUPER_ADMIN role
+    if (isSuperAdmin(user)) {
       return true;
     }
 
-    // CLIENT role native Django bypass for read-only client-scoped endpoints
-    if (user.role?.name === 'CLIENT' && requiredPermissions.every((p) => String(p).toUpperCase().startsWith('VIEW_'))) {
+    // CLIENT users may call only routes explicitly marked @ClientAccess() (client-portal routes
+    // whose services scope CLIENT callers to their own client). Previously any VIEW_-only route
+    // was open to CLIENT, including writes and company-wide reports.
+    const clientAccess = this.reflector.getAllAndOverride<boolean>(CLIENT_ACCESS_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (clientAccess === true && isActiveRole(user.role) && user.role.name === 'CLIENT') {
       return true;
     }
 
-    if (!user.role || !user.role.permissions) {
-      throw new ForbiddenException('You do not have permission to perform this action.');
-    }
+    // Soft-deleted or missing roles grant no permissions
+    const userPermissions = getActiveRolePermissions(user);
 
-    const userPermissions: string[] = Array.isArray(user.role.permissions)
-      ? (user.role.permissions as string[])
-      : [];
+    // Any one of the listed permissions is sufficient
+    const hasAny = requiredPermissions.some((perm) => userPermissions.includes(String(perm).toUpperCase()));
 
-    const hasAll = requiredPermissions.some((perm) =>
-      userPermissions.map((p) => String(p).toUpperCase()).includes(String(perm).toUpperCase()),
-    );
-
-    if (!hasAll) {
+    if (!hasAny) {
       throw new ForbiddenException('You do not have permission to perform this action.');
     }
 

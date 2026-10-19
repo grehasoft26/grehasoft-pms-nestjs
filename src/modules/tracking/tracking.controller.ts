@@ -15,13 +15,15 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../../core/guards/permissions.guard';
+import { Permissions } from '../../core/decorators/permissions.decorator';
 import { TrackingService } from './tracking.service';
 
 // -------------------------------------------------------------
 // 1. TRACKING CONTROLLER (/api/v1/tracking/)
 // -------------------------------------------------------------
 @Controller('api/v1/tracking')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
 export class TrackingController {
   constructor(private readonly trackingService: TrackingService) {}
 
@@ -46,16 +48,19 @@ export class TrackingController {
   }
 
   @Get('employee-status')
+  @Permissions('MANAGE_SETTINGS')
   async getAllEmployeeStatus() {
     return this.trackingService.getEmployeeStatus();
   }
 
   @Get('employee-status/:userId')
+  @Permissions('MANAGE_SETTINGS')
   async getSingleEmployeeStatus(@Param('userId', ParseIntPipe) userId: number) {
     return this.trackingService.getEmployeeStatus(userId);
   }
 
   @Post('toggle-tracking/:userId')
+  @Permissions('MANAGE_SETTINGS')
   async toggleTracking(
     @Request() req: any,
     @Param('userId', ParseIntPipe) userId: number,
@@ -70,26 +75,31 @@ export class TrackingController {
   }
 
   @Get('reports/daily')
+  @Permissions('MANAGE_SETTINGS')
   async getDailyReport(@Query() query: any) {
     return this.trackingService.getDailyReport(query);
   }
 
   @Get('reports/weekly')
+  @Permissions('MANAGE_SETTINGS')
   async getWeeklyReport(@Query() query: any) {
     return this.trackingService.getWeeklyReport(query);
   }
 
   @Get('reports/monthly')
+  @Permissions('MANAGE_SETTINGS')
   async getMonthlyReport(@Query() query: any) {
     return this.trackingService.getMonthlyReport(query);
   }
 
   @Get('reports/employee-analytics')
+  @Permissions('MANAGE_SETTINGS')
   async getEmployeeAnalytics(@Query() query: any) {
     return this.trackingService.getEmployeeAnalytics(query);
   }
 
   @Get('reports/export')
+  @Permissions('MANAGE_SETTINGS')
   async exportReport(@Query() query: any, @Response() res: any) {
     return this.trackingService.exportReport(res, query);
   }
@@ -99,7 +109,8 @@ export class TrackingController {
 // 2. TRACKING PROFILES CONTROLLER (/api/v1/tracking/profiles/)
 // -------------------------------------------------------------
 @Controller('api/v1/tracking/profiles')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@Permissions('MANAGE_SETTINGS')
 export class TrackingProfilesController {
   constructor(private readonly trackingService: TrackingService) {}
 

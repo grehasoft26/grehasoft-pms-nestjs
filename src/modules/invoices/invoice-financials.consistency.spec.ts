@@ -127,7 +127,7 @@ describe('Invoice financials consistency across modules', () => {
   let pdfService: { generateReceiptPdf: jest.Mock; generateInvoicePdf: jest.Mock };
 
   const admin = { id: 1, role: { name: 'SUPER_ADMIN' } };
-  const clientUser = { id: 50, email: CLIENT.email, role: { name: 'CLIENT' } };
+  const clientUser = { id: 50, client_id: 1, email: CLIENT.email, role: { name: 'CLIENT' } };
 
   beforeAll(() => {
     jest.useFakeTimers({ now: new Date('2026-10-17T06:30:00.000Z'), advanceTimers: true });

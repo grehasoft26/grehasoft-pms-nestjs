@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { canAccessProject, isClientUser, projectScopeFor } from '../../core/utils/project-scope.util';
 
 @Injectable()
 export class ProjectsService {
@@ -44,7 +45,6 @@ export class ProjectsService {
   }
 
   async findAll(user: any, query: { status?: string; client?: string; search?: string; project_id?: string; project?: string; page?: string; limit?: string; all?: string }) {
-    const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
     const projectId = query.project_id || query.project;
@@ -69,29 +69,10 @@ export class ProjectsService {
       ];
     }
 
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: {
-          OR: [
-            { portal_users: { some: { id: user.id } } },
-            { email: user.email },
-            { id: user.client_id || 0 },
-          ],
-        },
-      });
-      if (client) {
-        where.client_id = client.id;
-      } else {
-        return { count: 0, next: null, previous: null, results: [] };
-      }
-    } else if (roleName !== 'SUPER_ADMIN' && !user.is_superuser) {
-      // Non-admin users see projects they belong to as members
-      where.members = {
-        some: {
-          user_id: user.id,
-        },
-      };
-    }
+    // Clients: their own client's projects. Staff: projects they are a member of, manage or created.
+    // Super admins: all. (Previously ADMIN/PM saw member projects only, and by-id reads were unscoped.)
+    const scope = await projectScopeFor(this.prisma, user);
+    if (scope) where.AND = [scope];
 
     if (query.all === 'true') {
       const projects = await this.prisma.project.findMany({
@@ -142,8 +123,34 @@ export class ProjectsService {
     };
   }
 
+  /** Knowing a project id grants nothing: the project must be inside the caller's scope. */
+  private async assertProjectAccess(user: any, projectId: number) {
+    if (await canAccessProject(this.prisma, user, projectId)) return;
+    if (isClientUser(user)) throw new ForbiddenException('You do not have permission to view this project.');
+    throw new NotFoundException('Project not found');
+  }
+
+  /** Ids supplied by the form must refer to existing records (project manager: active, non-client staff). */
+  private async validateReferences(body: any) {
+    const clientId = body.client_id ?? body.client;
+    if (clientId !== undefined && clientId !== null && clientId !== '') {
+      const client = await this.prisma.client.findFirst({ where: { id: Number(clientId), deleted_at: null } });
+      if (!client) throw new BadRequestException({ client: ['Client not found.'] });
+    }
+    if (body.project_manager) {
+      const pm = await this.prisma.user.findFirst({
+        where: { id: Number(body.project_manager), deleted_at: null },
+        include: { role: true },
+      });
+      if (!pm || isClientUser(pm)) throw new BadRequestException({ project_manager: ['Project manager not found.'] });
+    }
+    if (body.department) {
+      const dept = await this.prisma.department.findFirst({ where: { id: Number(body.department), deleted_at: null } });
+      if (!dept) throw new BadRequestException({ department: ['Department not found.'] });
+    }
+  }
+
   async findOne(id: number, user: any) {
-    const roleName = user.role?.name;
     const project = await this.prisma.project.findFirst({
       where: { id, deleted_at: null },
       include: {
@@ -154,15 +161,7 @@ export class ProjectsService {
     });
 
     if (!project) throw new NotFoundException('Project not found');
-
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (!client || project.client_id !== client.id) {
-        throw new ForbiddenException('You do not have permission to view this project.');
-      }
-    }
+    await this.assertProjectAccess(user, id);
 
     return this.formatProject(project);
   }
@@ -177,6 +176,7 @@ export class ProjectsService {
     if (!clientId) {
       throw new BadRequestException({ client: ['Client is required.'] });
     }
+    await this.validateReferences(body);
 
     const project = await this.prisma.project.create({
       data: {
@@ -206,6 +206,7 @@ export class ProjectsService {
     }
 
     await this.findOne(id, user);
+    await this.validateReferences(body);
 
     const data: any = {};
     if (body.name !== undefined) data.name = body.name;
@@ -246,7 +247,8 @@ export class ProjectsService {
     return null;
   }
 
-  async findProjectMembers(id: number) {
+  async findProjectMembers(id: number, user: any) {
+    await this.findOne(id, user);
     const members = await this.prisma.projectMember.findMany({
       where: { project_id: id, user: { is_active: true, deleted_at: null } },
       include: { user: true },

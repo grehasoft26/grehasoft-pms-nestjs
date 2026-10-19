@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { staffProjectScope } from '../../core/utils/project-scope.util';
 import { aggregateInvoiceFinancials, computeInvoiceFinancials } from '../invoices/invoice-status';
 
 @Injectable()
@@ -37,7 +38,7 @@ export class ReportsService {
       }
 
       const projects = await this.prisma.project.findMany({
-        where: { client_id: clientId },
+        where: { client_id: clientId, deleted_at: null },
       });
 
       const activeProjectsCount = projects.filter((p) => p.status === 'in_progress').length;
@@ -49,7 +50,7 @@ export class ReportsService {
 
       const projectIds = projects.map((p) => p.id);
       const tasks = await this.prisma.task.findMany({
-        where: { project_id: { in: projectIds } },
+        where: { project_id: { in: projectIds }, deleted_at: null },
       });
 
       const completedTasksCount = tasks.filter((t) => t.status === 'done').length;
@@ -104,6 +105,7 @@ export class ReportsService {
 
       const userProjects = await this.prisma.project.findMany({
         where: {
+          deleted_at: null,
           OR: [
             { created_by_id: userId },
             { project_manager_id: userId },
@@ -116,14 +118,15 @@ export class ReportsService {
       const completedProjects = userProjects.filter((p) => p.status === 'completed').length;
       const totalProjects = userProjects.length;
 
+      // Current (not removed) assignments on live tasks only
       const taskAssignments = await this.prisma.taskAssignment.findMany({
-        where: { employee_id: userId },
+        where: { employee_id: userId, deleted_at: null },
         select: { task_id: true },
       });
       const taskIds = taskAssignments.map((ta) => ta.task_id);
 
       const assignedTasks = await this.prisma.task.findMany({
-        where: { id: { in: taskIds } },
+        where: { id: { in: taskIds }, deleted_at: null, project: { deleted_at: null } },
       });
 
       const completedTasks = assignedTasks.filter((t) => t.status === 'done').length;
@@ -161,27 +164,34 @@ export class ReportsService {
       };
     }
 
-    // ADMIN / SUPER_ADMIN / MANAGER DASHBOARD STATS
-    const allProjects = await this.prisma.project.findMany();
+    // SUPER_ADMIN: company-wide. Other staff (ADMIN, PROJECT_MANAGER, SEO, sales, ...): only projects
+    // they are a member of, manage or created, and their own reminders (reminders are personal
+    // everywhere else). Previously every non-client, non-team-member role got company-wide totals.
+    const scope = staffProjectScope(user);
+    const projectWhere: any = { deleted_at: null, ...(scope ? { AND: [scope] } : {}) };
+
+    const allProjects = await this.prisma.project.findMany({ where: projectWhere });
     const activeProjects = allProjects.filter((p) => p.status === 'in_progress').length;
     const completedProjects = allProjects.filter((p) => p.status === 'completed').length;
     const totalProjects = allProjects.length;
 
-    const allTasks = await this.prisma.task.findMany();
+    const allTasks = await this.prisma.task.findMany({ where: { deleted_at: null, project: projectWhere } });
     const completedTasks = allTasks.filter((t) => t.status === 'done').length;
     const pendingTasks = allTasks.filter((t) => t.status !== 'done').length;
 
     const activeClientsCount = await this.prisma.client.count({
       where: {
+        deleted_at: null,
         projects: {
           some: {
+            ...projectWhere,
             status: 'in_progress',
           },
         },
       },
     });
 
-    const allReminders = await this.prisma.reminder.findMany();
+    const allReminders = await this.prisma.reminder.findMany({ where: scope ? { user_id: userId } : {} });
     const pendingReminders = allReminders.filter((r) => !r.is_completed && new Date(r.due_date).toISOString().split('T')[0] >= today).length;
     const overdueReminders = allReminders.filter((r) => !r.is_completed && new Date(r.due_date).toISOString().split('T')[0] < today).length;
     const completedReminders = allReminders.filter((r) => r.is_completed).length;

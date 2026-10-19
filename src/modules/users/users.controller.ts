@@ -82,7 +82,7 @@ export class UsersController {
   @UseGuards(JwtAuthGuard, PermissionsGuard)
   @Permissions('MANAGE_USERS')
   @HttpCode(HttpStatus.NO_CONTENT)
-  async remove(@Param('id', ParseIntPipe) id: number) {
-    return this.usersService.remove(id);
+  async remove(@CurrentUser() reqUser: any, @Param('id', ParseIntPipe) id: number) {
+    return this.usersService.remove(reqUser, id);
   }
 }

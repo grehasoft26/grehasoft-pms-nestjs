@@ -3,6 +3,7 @@ import { ProjectsService } from './projects.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 
 @Controller('api/v1/projects')
@@ -12,12 +13,14 @@ export class ProjectsController {
 
   @Get()
   @Permissions('VIEW_PROJECTS')
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.projectsService.findAll(user, query);
   }
 
   @Get(':id')
   @Permissions('VIEW_PROJECTS')
+  @ClientAccess()
   async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.projectsService.findOne(id, user);
   }
@@ -47,7 +50,7 @@ export class ProjectsController {
 
   @Get(':id/members')
   @Permissions('VIEW_PROJECTS')
-  async getProjectMembers(@Param('id', ParseIntPipe) id: number) {
-    return this.projectsService.findProjectMembers(id);
+  async getProjectMembers(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.projectsService.findProjectMembers(id, user);
   }
 }

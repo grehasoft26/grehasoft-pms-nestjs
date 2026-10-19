@@ -1,5 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../../core/prisma.service';
+import { canAccessProject, isClientUser } from '../../../core/utils/project-scope.util';
 
 @Injectable()
 export class ProjectActivityLogsService {
@@ -20,19 +21,10 @@ export class ProjectActivityLogsService {
   }
 
   async findByProject(projectId: number, user: any) {
-    const roleName = user.role?.name;
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (client) {
-        const project = await this.prisma.project.findFirst({
-          where: { id: projectId, client_id: client.id },
-        });
-        if (!project) return [];
-      } else {
-        return [];
-      }
+    // Clients: own projects (empty list otherwise, as before). Staff: projects in their scope.
+    if (!(await canAccessProject(this.prisma, user, projectId))) {
+      if (isClientUser(user)) return [];
+      throw new NotFoundException('Project not found');
     }
 
     const logs = await this.prisma.projectActivityLog.findMany({

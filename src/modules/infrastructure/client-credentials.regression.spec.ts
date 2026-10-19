@@ -108,8 +108,16 @@ describe('InfrastructureService - Client Credentials (regression)', () => {
     mockPrismaService.websiteCredential.findUnique.mockResolvedValue(storedRow());
     expect(((await service.getCredentialById(admin, 11)) as any).admin_password).toBe('wp-pass');
 
+    // Non-admins must be members of the credential's project (Phase 2.2 record scoping)
+    mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
     mockPrismaService.websiteCredential.findUnique.mockResolvedValue(storedRow());
     expect(((await service.getCredentialById(member, 11)) as any).admin_password).toBe(MASK);
+  });
+
+  it('Phase 2.2: a non-member cannot read a credential by ID (404)', async () => {
+    mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 99 }]);
+    mockPrismaService.websiteCredential.findUnique.mockResolvedValue(storedRow());
+    await expect(service.getCredentialById(member, 11)).rejects.toThrow(NotFoundException);
   });
 
   it('updates a credential and re-encrypts a changed password', async () => {

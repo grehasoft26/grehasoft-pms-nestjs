@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AppController } from './app.controller';
+import { StripPasswordHashesInterceptor } from './core/interceptors/strip-password-hashes.interceptor';
 import { AppService } from './app.service';
 import { CoreModule } from './core/core.module';
 import { AuthModule } from './modules/auth/auth.module';
@@ -52,6 +54,10 @@ import { FinancialReportsModule } from './modules/financial-reports/financial-re
     FinancialReportsModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // Never return user login password hashes, whatever a service includes
+    { provide: APP_INTERCEPTOR, useClass: StripPasswordHashesInterceptor },
+  ],
 })
 export class AppModule {}

@@ -1,6 +1,7 @@
 import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import { computeInvoiceFinancials, dateOnlyKey } from '../invoices/invoice-status';
+import { resolveClientForUser } from '../../core/utils/client-scope.util';
 
 @Injectable()
 export class ClientPortalService {
@@ -12,14 +13,8 @@ export class ClientPortalService {
       throw new ForbiddenException('Unauthorized: User must have CLIENT role');
     }
 
-    const client = await this.prisma.client.findFirst({
-      where: {
-        OR: [
-          { email: user.email },
-          { id: user.id },
-        ],
-      },
-    });
+    // users.client_id link (never `client.id === user.id`, which matched unrelated clients)
+    const client = await resolveClientForUser(this.prisma, user);
 
     if (!client) {
       throw new NotFoundException('Associated client not found.');

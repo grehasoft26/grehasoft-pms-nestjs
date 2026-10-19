@@ -4,13 +4,18 @@ import { InvoicePaymentsService } from './invoice-payments.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 import { Public } from '../../core/decorators/public.decorator';
+import { PermissionsGuard } from '../../core/guards/permissions.guard';
+import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
+import { INVOICE_READ_PERMISSIONS, INVOICE_WRITE_PERMISSIONS } from '../../core/utils/permission-catalog';
 
 @Controller('api/v1/invoice-payments')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
 export class InvoicePaymentsController {
   constructor(private readonly invoicePaymentsService: InvoicePaymentsService) {}
 
   @Get()
+  @Permissions(...INVOICE_READ_PERMISSIONS)
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.invoicePaymentsService.findAll(user, query);
   }
@@ -29,21 +34,25 @@ export class InvoicePaymentsController {
   }
 
   @Get([':id/secure-link', ':id/secure-link/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async getSecureLink(@Param('id', ParseIntPipe) id: number, @Req() req: any) {
     return this.invoicePaymentsService.generateSecureLink(id, req);
   }
 
   @Get(':id')
+  @Permissions(...INVOICE_READ_PERMISSIONS)
   async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicePaymentsService.findOne(id, user);
   }
 
   @Post()
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async create(@CurrentUser() user: any, @Body() body: any) {
     return this.invoicePaymentsService.create(user, body);
   }
 
   @Patch(':id')
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async update(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -53,6 +62,7 @@ export class InvoicePaymentsController {
   }
 
   @Get([':id/receipt', ':id/receipt/'])
+  @Permissions(...INVOICE_READ_PERMISSIONS)
   async downloadReceipt(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -65,11 +75,13 @@ export class InvoicePaymentsController {
   }
 
   @Post([':id/send_email', ':id/send-email', ':id/send_email/', ':id/send-email/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async sendEmail(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicePaymentsService.sendEmail(id, user);
   }
 
   @Delete(':id')
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicePaymentsService.remove(id, user);

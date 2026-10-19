@@ -3,6 +3,8 @@ import { PrismaService } from '../../core/prisma.service';
 import { ProgressAggregationService } from '../projects/services/progress-aggregation.service';
 import { ProjectActivityLogsService } from '../projects/services/project-activity-logs.service';
 import { formatUserResponse } from '../users/user.serializer';
+import { canAccessProject, isClientUser, isProjectManagerRole, projectScopeFor } from '../../core/utils/project-scope.util';
+import { getActiveRolePermissions, isSuperAdmin } from '../../core/utils/role-access.util';
 
 @Injectable()
 export class TasksService {
@@ -85,7 +87,6 @@ export class TasksService {
       limit?: string;
     },
   ) {
-    const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
     if (query.project) {
@@ -107,24 +108,10 @@ export class TasksService {
       ];
     }
 
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (client) {
-        where.project = { client_id: client.id };
-      } else {
-        return query.project || query.all === 'true'
-          ? []
-          : { count: 0, next: null, previous: null, results: [] };
-      }
-    } else if (roleName !== 'SUPER_ADMIN' && roleName !== 'PROJECT_MANAGER' && !user.is_superuser) {
-      where.project = {
-        members: {
-          some: { user_id: user.id },
-        },
-      };
-    }
+    // Tasks of projects in the caller's scope. Previously PROJECT_MANAGER saw every task;
+    // other staff saw member projects only. Unresolvable clients get an empty result.
+    const scope = await projectScopeFor(this.prisma, user);
+    if (scope) where.project = scope;
 
     if (query.all === 'true' || (query.project && !query.page)) {
       const tasks = await this.prisma.task.findMany({
@@ -187,8 +174,70 @@ export class TasksService {
     };
   }
 
+  /** A task is only reachable through its project's scope (knowing the task id grants nothing). */
+  private async assertTaskProjectAccess(user: any, projectId: number) {
+    if (await canAccessProject(this.prisma, user, projectId)) return;
+    if (isClientUser(user)) throw new ForbiddenException('Clients do not have access to this task.');
+    throw new NotFoundException('Task not found');
+  }
+
+  /** Milestone and assignee ids from the form must belong to the task's project. */
+  private async validateProjectReferences(projectId: number, body: any) {
+    if (body.milestone) {
+      const milestone = await this.prisma.milestone.findFirst({ where: { id: Number(body.milestone), project_id: projectId } });
+      if (!milestone) throw new BadRequestException({ milestone: 'This milestone does not belong to the selected project.' });
+    }
+    const assignees: unknown[] = Array.isArray(body.assignees) ? body.assignees : [];
+    if (assignees.length > 0) {
+      const validMembers = await this.prisma.projectMember.findMany({
+        where: { project_id: projectId },
+      });
+      const validUserIds = new Set(validMembers.map((m: any) => m.user_id));
+      for (const empId of assignees) {
+        if (!validUserIds.has(Number(empId))) {
+          throw new BadRequestException({ assignee: 'This user is not a member of the selected project.' });
+        }
+      }
+    }
+  }
+
+  /**
+   * Makes the task's active assignments match `assigneeIds` (already validated as project members).
+   * task_assignments has a unique (task_id, employee_id) key that includes soft-deleted rows, so
+   * rows are never re-inserted: unchanged assignees are left as they are (keeping assigned_at and
+   * assigned_by), removed ones are soft-deleted with unassigned_at, and a returning assignee's
+   * old row is restored. Previously every save soft-deleted and re-created all rows, which hit
+   * the unique key whenever an assignee was kept or re-added.
+   */
+  private async syncAssignments(taskId: number, assigneeIds: unknown[], assignedById: number) {
+    const wanted = new Set(assigneeIds.map((v) => Number(v)));
+    const existing = await this.prisma.taskAssignment.findMany({ where: { task_id: taskId } });
+    const now = new Date();
+
+    for (const row of existing) {
+      if (wanted.has(row.employee_id) && row.deleted_at) {
+        await this.prisma.taskAssignment.update({
+          where: { id: row.id },
+          data: { deleted_at: null, unassigned_at: null, assigned_at: now, assigned_by_id: assignedById },
+        });
+      } else if (!wanted.has(row.employee_id) && !row.deleted_at) {
+        await this.prisma.taskAssignment.update({
+          where: { id: row.id },
+          data: { deleted_at: now, unassigned_at: now },
+        });
+      }
+    }
+
+    const known = new Set(existing.map((row: any) => row.employee_id));
+    for (const employeeId of wanted) {
+      if (known.has(employeeId)) continue;
+      await this.prisma.taskAssignment.create({
+        data: { task_id: taskId, employee_id: employeeId, assigned_by_id: assignedById },
+      });
+    }
+  }
+
   async findOne(id: number, user: any) {
-    const roleName = user.role?.name;
     const task = await this.prisma.task.findFirst({
       where: { id, deleted_at: null },
       include: {
@@ -208,15 +257,7 @@ export class TasksService {
     });
 
     if (!task) throw new NotFoundException('Task not found');
-
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (!client || task.project.client_id !== client.id) {
-        throw new ForbiddenException('Clients do not have access to this task.');
-      }
-    }
+    await this.assertTaskProjectAccess(user, task.project_id);
 
     return this.formatTask(task);
   }
@@ -231,20 +272,18 @@ export class TasksService {
     }
 
     const projectId = Number(body.project || body.project_id);
-    const assignees: number[] = body.assignees || [];
 
-    // Validate assigned users belong to project
-    if (assignees.length > 0) {
-      const validMembers = await this.prisma.projectMember.findMany({
-        where: { project_id: projectId },
-      });
-      const validUserIds = new Set(validMembers.map((m) => m.user_id));
-      for (const empId of assignees) {
-        if (!validUserIds.has(Number(empId))) {
-          throw new BadRequestException({ assignee: 'This user is not a member of the selected project.' });
-        }
-      }
+    // The target project must be inside the caller's scope (previously any project id was accepted)
+    if (!(await canAccessProject(this.prisma, user, projectId))) {
+      throw new NotFoundException('Project not found');
     }
+    // Creating tasks needs MANAGE_PROJECTS (the permission the "New Task" buttons use), on top of
+    // the route's VIEW_TASKS. Previously every role with VIEW_TASKS (e.g. SEO roles) could create tasks.
+    if (!isSuperAdmin(user) && !getActiveRolePermissions(user).includes('MANAGE_PROJECTS')) {
+      throw new ForbiddenException('You do not have permission to create tasks.');
+    }
+    // Validate milestone and assigned users belong to project
+    await this.validateProjectReferences(projectId, body);
 
     const task = await this.prisma.task.create({
       data: {
@@ -266,14 +305,8 @@ export class TasksService {
     });
 
     // Create assignments
-    for (const empId of assignees) {
-      await this.prisma.taskAssignment.create({
-        data: {
-          task_id: task.id,
-          employee_id: Number(empId),
-          assigned_by_id: user.id,
-        },
-      });
+    if (Array.isArray(body.assignees)) {
+      await this.syncAssignments(task.id, body.assignees, user.id);
     }
 
     await this.activityLogs.logActivity(
@@ -303,8 +336,10 @@ export class TasksService {
     });
 
     if (!existing) throw new NotFoundException('Task not found');
+    await this.assertTaskProjectAccess(user, existing.project_id);
 
-    const isSuperOrAdmin = user.is_superuser || ['SUPER_ADMIN', 'ADMIN', 'PROJECT_MANAGER'].includes(roleName);
+    // Manager roles may edit any field, but only inside projects in their scope (checked above)
+    const isSuperOrAdmin = isProjectManagerRole(user);
 
     // Team Member restrictions
     if (!isSuperOrAdmin) {
@@ -322,6 +357,8 @@ export class TasksService {
         );
       }
     }
+
+    await this.validateProjectReferences(existing.project_id, body);
 
     const data: any = {};
     if (body.title !== undefined) data.title = body.title;
@@ -359,20 +396,7 @@ export class TasksService {
 
     // Handle assignees update
     if (body.assignees !== undefined && Array.isArray(body.assignees)) {
-      await this.prisma.taskAssignment.updateMany({
-        where: { task_id: id, deleted_at: null },
-        data: { deleted_at: new Date() },
-      });
-
-      for (const empId of body.assignees) {
-        await this.prisma.taskAssignment.create({
-          data: {
-            task_id: id,
-            employee_id: Number(empId),
-            assigned_by_id: user.id,
-          },
-        });
-      }
+      await this.syncAssignments(id, body.assignees, user.id);
     }
 
     await this.activityLogs.logActivity(
@@ -391,9 +415,7 @@ export class TasksService {
   }
 
   async remove(id: number, user: any) {
-    const roleName = user.role?.name;
-    const isSuperOrAdmin = user.is_superuser || ['SUPER_ADMIN', 'ADMIN', 'PROJECT_MANAGER'].includes(roleName);
-    if (!isSuperOrAdmin) {
+    if (!isProjectManagerRole(user)) {
       throw new ForbiddenException('Only Project Managers or Administrators can delete tasks.');
     }
 
@@ -401,6 +423,7 @@ export class TasksService {
       where: { id, deleted_at: null },
     });
     if (!existing) throw new NotFoundException('Task not found');
+    await this.assertTaskProjectAccess(user, existing.project_id);
 
     await this.prisma.task.update({
       where: { id },

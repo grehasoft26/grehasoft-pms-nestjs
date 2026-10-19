@@ -631,6 +631,8 @@ export class InvoicesService {
   async generateSecureLink(id: number, req?: any) {
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Invoice not found');
+    // Caller must be able to read this invoice (findOne applies CLIENT ownership scoping)
+    if (req?.user) await this.findOne(id, req.user);
 
     const secret = this.getSigningSecret();
     const token = InvoiceSigning.generateToken(id, secret, 172800);

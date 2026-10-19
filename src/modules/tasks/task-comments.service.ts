@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { canAccessProject, isClientUser, isProjectManagerRole, projectScopeFor } from '../../core/utils/project-scope.util';
 
 @Injectable()
 export class TaskCommentsService {
@@ -18,23 +19,15 @@ export class TaskCommentsService {
   }
 
   async findAll(user: any, query: { task?: string }) {
-    const roleName = user.role?.name;
     const where: any = { deleted_at: null };
 
     if (query.task) {
       where.task_id = Number(query.task);
     }
 
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (client) {
-        where.task = { project: { client_id: client.id } };
-      } else {
-        return [];
-      }
-    }
+    // Comments on tasks of projects in the caller's scope (previously staff saw every comment)
+    const scope = await projectScopeFor(this.prisma, user);
+    if (scope) where.task = { project: scope };
 
     const comments = await this.prisma.taskComment.findMany({
       where,
@@ -45,32 +38,37 @@ export class TaskCommentsService {
     return comments.map((c) => this.formatComment(c));
   }
 
-  async findOne(id: number) {
+  /** The comment's task project must be inside the caller's scope; 404 otherwise. */
+  private async assertCommentInScope(user: any, taskId: number) {
+    const task = await this.prisma.task.findFirst({ where: { id: taskId, deleted_at: null }, select: { project_id: true } });
+    if (!task || !(await canAccessProject(this.prisma, user, task.project_id))) {
+      throw new NotFoundException('Task comment not found');
+    }
+  }
+
+  async findOne(id: number, user: any) {
     const comment = await this.prisma.taskComment.findFirst({
       where: { id, deleted_at: null },
       include: { user: true },
     });
     if (!comment) throw new NotFoundException('Task comment not found');
+    await this.assertCommentInScope(user, comment.task_id);
     return this.formatComment(comment);
   }
 
   async create(user: any, body: any) {
-    const roleName = user.role?.name;
     const taskId = Number(body.task || body.task_id);
 
     const task = await this.prisma.task.findUnique({
       where: { id: taskId },
       include: { project: true },
     });
-    if (!task) throw new NotFoundException('Task not found');
+    if (!task || task.deleted_at) throw new NotFoundException('Task not found');
 
-    if (roleName === 'CLIENT') {
-      const client = await this.prisma.client.findFirst({
-        where: { portal_users: { some: { id: user.id } } },
-      });
-      if (!client || task.project.client_id !== client.id) {
-        throw new ForbiddenException('You can only comment on tasks of your own projects.');
-      }
+    // Commenting requires access to the task's project (clients: own projects; staff: their scope)
+    if (!(await canAccessProject(this.prisma, user, task.project_id))) {
+      if (isClientUser(user)) throw new ForbiddenException('You can only comment on tasks of your own projects.');
+      throw new NotFoundException('Task not found');
     }
 
     const comment = await this.prisma.taskComment.create({
@@ -104,8 +102,9 @@ export class TaskCommentsService {
       where: { id, deleted_at: null },
     });
     if (!existing) throw new NotFoundException('Task comment not found');
+    await this.assertCommentInScope(user, existing.task_id);
 
-    const isSuperOrAdmin = user.is_superuser || ['SUPER_ADMIN', 'ADMIN', 'PROJECT_MANAGER'].includes(roleName);
+    const isSuperOrAdmin = isProjectManagerRole(user);
     if (!isSuperOrAdmin && existing.user_id !== user.id) {
       throw new ForbiddenException('You can only modify or delete your own comments.');
     }
@@ -129,8 +128,9 @@ export class TaskCommentsService {
       where: { id, deleted_at: null },
     });
     if (!existing) throw new NotFoundException('Task comment not found');
+    await this.assertCommentInScope(user, existing.task_id);
 
-    const isSuperOrAdmin = user.is_superuser || ['SUPER_ADMIN', 'ADMIN', 'PROJECT_MANAGER'].includes(roleName);
+    const isSuperOrAdmin = isProjectManagerRole(user);
     if (!isSuperOrAdmin && existing.user_id !== user.id) {
       throw new ForbiddenException('You can only modify or delete your own comments.');
     }

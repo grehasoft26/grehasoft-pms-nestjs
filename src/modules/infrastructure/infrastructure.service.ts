@@ -1,6 +1,9 @@
-import { Injectable, ForbiddenException, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, ForbiddenException, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../core/prisma.service';
+import { isSuperAdmin } from '../../core/utils/role-access.util';
 import * as crypto from 'crypto';
+import { expiryFilterWhere, expiryOrderBy, parseToday, searchTerm } from './infrastructure-list.util';
 
 @Injectable()
 export class InfrastructureService {
@@ -10,8 +13,7 @@ export class InfrastructureService {
   // HELPER: ROLE CHECKS & PROJECT SCOPING
   // -------------------------------------------------------------
   private isAdmin(user: any): boolean {
-    const role = user.role?.name || user.role_name;
-    return user.is_superuser || role === 'SUPER_ADMIN';
+    return isSuperAdmin(user);
   }
 
   private async getAccessibleProjectIds(user: any): Promise<number[]> {
@@ -24,15 +26,53 @@ export class InfrastructureService {
   }
 
   // -------------------------------------------------------------
+  // 0. SUMMARY (Infrastructure Overview cards)
+  // -------------------------------------------------------------
+  /**
+   * Totals for the overview cards: COUNT queries over every record the user may see, with the
+   * same scoping as the list endpoints (super admins: all; others: servers linked to their
+   * projects' domains, and their projects' domains and client credentials). Previously the page
+   * counted the rows of a paginated list, so totals stopped at the page size (5).
+   * No rows are read, so no passwords are loaded or decrypted.
+   */
+  async getSummary(user: any): Promise<{ servers: number; domains: number; credentials: number }> {
+    if (this.isAdmin(user)) {
+      const [servers, domains, credentials] = await Promise.all([
+        this.prisma.server.count(),
+        this.prisma.domain.count(),
+        this.prisma.websiteCredential.count(),
+      ]);
+      return { servers, domains, credentials };
+    }
+    const projectIds = await this.getAccessibleProjectIds(user);
+    if (projectIds.length === 0) return { servers: 0, domains: 0, credentials: 0 };
+    const inProjects = { project_id: { in: projectIds } };
+    const [servers, domains, credentials] = await Promise.all([
+      this.prisma.server.count({ where: { domains: { some: inProjects } } }),
+      this.prisma.domain.count({ where: inProjects }),
+      this.prisma.websiteCredential.count({ where: inProjects }),
+    ]);
+    return { servers, domains, credentials };
+  }
+
+  // -------------------------------------------------------------
   // 1. SERVERS
   // -------------------------------------------------------------
-  async getServers(user: any, query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
+  async getServers(
+    user: any,
+    query: { page?: string; limit?: string; search?: string; all?: string; fields?: string; ordering?: string; expiry?: string; today?: string } = {},
+  ) {
     const where: any = {};
+    // Validated before any query (400 on bad values)
+    const expiryWhere = expiryFilterWhere(query.expiry, parseToday(query.today));
+    const orderBy = expiryOrderBy(query.ordering);
+    // fields=expiry: unpaginated list of id/name/expiry_date for expiry notifications (no credentials)
+    const expiryOnly = query.fields === 'expiry';
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
       if (projectIds.length === 0) {
-        return query.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
+        return query.all === 'true' || expiryOnly ? [] : { count: 0, next: null, previous: null, results: [] };
       }
       where.domains = {
         some: {
@@ -41,12 +81,29 @@ export class InfrastructureService {
       };
     }
 
-    if (query.search) {
+    // Partial, case-insensitive match (the columns use a case-insensitive collation; Prisma's
+    // `mode: 'insensitive'` is not supported on MySQL and made every search fail). Credentials
+    // (username, password) are never searched.
+    const search = searchTerm(query.search);
+    if (search) {
       where.OR = [
-        { name: { contains: query.search, mode: 'insensitive' } },
-        { provider: { contains: query.search, mode: 'insensitive' } },
-        { ip_address: { contains: query.search, mode: 'insensitive' } },
+        { name: { contains: search } },
+        { provider: { contains: search } },
+        { notes: { contains: search } },
+        // also matched by the page's previous (client-side) search
+        { owner: { contains: search } },
+        { ip_address: { contains: search } },
       ];
+    }
+    if (expiryWhere) where.AND = [expiryWhere];
+
+    if (expiryOnly) {
+      // Selects only these columns, so the password is never read or decrypted
+      return this.prisma.server.findMany({
+        where: { ...where, expiry_date: { not: null } },
+        select: { id: true, name: true, expiry_date: true },
+        orderBy: { expiry_date: 'asc' },
+      });
     }
 
     const isAdm = this.isAdmin(user);
@@ -67,7 +124,7 @@ export class InfrastructureService {
 
     const results = await this.prisma.server.findMany({
       where,
-      orderBy: { id: 'desc' },
+      orderBy,
       skip,
       take: limitNum,
     });
@@ -83,7 +140,22 @@ export class InfrastructureService {
   async getServerById(user: any, id: number) {
     const server = await this.prisma.server.findUnique({ where: { id } });
     if (!server) throw new NotFoundException('Server not found');
+    // Same scope as the list: non-admins only see servers used by their projects' domains
+    if (!this.isAdmin(user)) {
+      const projectIds = await this.getAccessibleProjectIds(user);
+      const linked = projectIds.length
+        ? await this.prisma.domain.count({ where: { server_id: id, project_id: { in: projectIds } } })
+        : 0;
+      if (!linked) throw new NotFoundException('Server not found');
+    }
     return this.formatServer(server, this.isAdmin(user));
+  }
+
+  /** Non-admins may only read records of projects they are members of (404 otherwise). */
+  private async assertProjectReadable(user: any, projectId: number | null | undefined, notFoundMessage: string) {
+    if (this.isAdmin(user)) return;
+    const projectIds = await this.getAccessibleProjectIds(user);
+    if (!projectId || !projectIds.includes(projectId)) throw new NotFoundException(notFoundMessage);
   }
 
   async createServer(user: any, data: any) {
@@ -190,9 +262,16 @@ export class InfrastructureService {
   // -------------------------------------------------------------
   // 2. DOMAINS
   // -------------------------------------------------------------
-  async getDomains(user: any, query: { page?: string; limit?: string; search?: string; all?: string } | string = {}) {
-    const queryObj = typeof query === 'string' ? { search: query } : query;
+  async getDomains(
+    user: any,
+    query: { page?: string; limit?: string; search?: string; all?: string; ordering?: string; expiry?: string; today?: string } | string = {},
+  ) {
+    const queryObj: { page?: string; limit?: string; search?: string; all?: string; ordering?: string; expiry?: string; today?: string } =
+      typeof query === 'string' ? { search: query } : query;
     const where: any = {};
+    // Validated before any query (400 on bad values)
+    const expiryWhere = expiryFilterWhere(queryObj.expiry, parseToday(queryObj.today));
+    const orderBy = expiryOrderBy(queryObj.ordering);
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
@@ -202,14 +281,19 @@ export class InfrastructureService {
       where.project_id = { in: projectIds };
     }
 
-    const search = queryObj.search;
+    // Partial match. No `mode: 'insensitive'`: Prisma rejects it on MySQL (every search threw, so
+    // the page showed "No domains found"); these columns use a case-insensitive collation
+    // (utf8mb4_unicode_ci), so `contains` (LIKE '%term%') already ignores case.
+    const search = searchTerm(queryObj.search);
     if (search) {
       where.OR = [
-        { domain_name: { contains: search, mode: 'insensitive' } },
-        { provider: { contains: search, mode: 'insensitive' } },
-        { project: { name: { contains: search, mode: 'insensitive' } } },
+        { domain_name: { contains: search } },
+        { provider: { contains: search } },
+        { project: { name: { contains: search } } },
+        { server: { name: { contains: search } } },
       ];
     }
+    if (expiryWhere) where.AND = [expiryWhere];
 
     if (queryObj.all === 'true') {
       const domains = await this.prisma.domain.findMany({
@@ -242,7 +326,7 @@ export class InfrastructureService {
         project: { select: { id: true, name: true } },
         server: { select: { id: true, name: true } },
       },
-      orderBy: { id: 'desc' },
+      orderBy,
       skip,
       take: limitNum,
     });
@@ -272,6 +356,7 @@ export class InfrastructureService {
       },
     });
     if (!domain) throw new NotFoundException('Domain not found');
+    await this.assertProjectReadable(user, domain.project_id, 'Domain not found');
 
     return {
       ...domain,
@@ -282,13 +367,82 @@ export class InfrastructureService {
     };
   }
 
+  // ---- Domain name uniqueness -----------------------------------------------------------
+  // Names are unique ignoring case and surrounding spaces (normalized: trimmed, lower-case).
+  // Domains are hard-deleted, so every existing row counts. There is no database UNIQUE
+  // constraint yet (existing duplicates must be resolved first; see
+  // prisma/proposed-migrations/20261019180000_unique_domain_name), so concurrent saves are
+  // serialized in the database instead: the duplicate check is a locking read
+  // (SELECT ... FOR UPDATE) inside the same transaction as the insert/update, so a second save of
+  // the same name waits for the first to commit and then sees its row.
+
+  static readonly DOMAIN_EXISTS_MESSAGE = 'Domain already exists.';
+
+  /** The stored form of a domain name: trimmed (case kept for display). Required. */
+  normalizeDomainName(value: unknown): string {
+    const name = typeof value === 'string' ? value.trim() : '';
+    if (!name) throw new BadRequestException({ statusCode: 400, error: 'Bad Request', message: 'Domain name is required.', domain_name: 'Domain name is required.' });
+    if (name.length > 255) throw new BadRequestException({ statusCode: 400, error: 'Bad Request', message: 'Domain name is too long.', domain_name: 'Domain name is too long.' });
+    return name;
+  }
+
+  /** 409 with the message on `message` and on the field, for the form. */
+  private domainExistsError() {
+    const message = InfrastructureService.DOMAIN_EXISTS_MESSAGE;
+    return new ConflictException({ statusCode: 409, error: 'Conflict', message, domain_name: message });
+  }
+
+  /** Whether another domain has the same normalized name (optionally excluding one record). */
+  private async domainNameTaken(client: any, name: string, excludeId?: number, lock = false): Promise<boolean> {
+    const key = name.trim().toLowerCase();
+    const rows: Array<{ id: number }> = await client.$queryRaw(
+      Prisma.sql`SELECT id FROM domains WHERE LOWER(TRIM(domain_name)) = ${key}${
+        excludeId ? Prisma.sql` AND id <> ${excludeId}` : Prisma.empty
+      }${lock ? Prisma.sql` FOR UPDATE` : Prisma.empty}`,
+    );
+    return rows.length > 0;
+  }
+
+  /** GET /infrastructure/domains/check-name: availability for the form (MANAGE_INFRASTRUCTURE). */
+  async checkDomainName(name: unknown, excludeId?: unknown): Promise<{ exists: boolean }> {
+    const normalized = this.normalizeDomainName(name);
+    const exclude = excludeId === undefined || excludeId === null || excludeId === '' ? undefined : Number(excludeId);
+    if (exclude !== undefined && (!Number.isInteger(exclude) || exclude <= 0)) {
+      throw new BadRequestException('exclude must be a domain id.');
+    }
+    return { exists: await this.domainNameTaken(this.prisma, normalized, exclude) };
+  }
+
+  /**
+   * Runs a domain write after a locked duplicate check, in one transaction. A deadlock between
+   * concurrent saves (InnoDB picks a victim) is retried, and the retry then sees the committed
+   * row. A UNIQUE violation (once the constraint exists) maps to the same 409.
+   */
+  private async writeUniqueDomainName(name: string, excludeId: number | undefined, write: (tx: any) => Promise<any>): Promise<any> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.prisma.$transaction(async (tx: any) => {
+          if (await this.domainNameTaken(tx, name, excludeId, true)) throw this.domainExistsError();
+          return write(tx);
+        });
+      } catch (error: any) {
+        if (error instanceof ConflictException) throw error;
+        if (error?.code === 'P2002') throw this.domainExistsError();
+        const deadlock = error?.code === 'P2034' || String(error?.meta?.code) === '1213' || /deadlock/i.test(String(error?.message));
+        if (deadlock && attempt < 3) continue;
+        throw error;
+      }
+    }
+  }
+
   async createDomain(user: any, data: any) {
     const expiryDate = data.expiry_date ? new Date(data.expiry_date) : null;
+    const domainName = this.normalizeDomainName(data.domain_name);
 
-    const domain = await this.prisma.domain.create({
+    const domain = await this.writeUniqueDomainName(domainName, undefined, (tx) => tx.domain.create({
       data: {
         project_id: this.parseOptionalProjectId(data) ?? null,
-        domain_name: data.domain_name,
+        domain_name: domainName,
         provider: data.provider || '',
         purchase_date: data.purchase_date ? new Date(data.purchase_date) : null,
         expiry_date: expiryDate,
@@ -297,7 +451,7 @@ export class InfrastructureService {
         notes: data.notes || '',
       },
       include: { project: true, server: true },
-    });
+    }));
 
     return {
       ...domain,
@@ -313,12 +467,16 @@ export class InfrastructureService {
     if (!existing) throw new NotFoundException('Domain not found');
 
     const expiryDate = data.expiry_date !== undefined ? (data.expiry_date ? new Date(data.expiry_date) : null) : existing.expiry_date;
+    // Only a real rename is checked: saving other fields (or re-sending the same name with other
+    // spacing/case) never fails, even for a record that already has a duplicate
+    const domainName = data.domain_name !== undefined ? this.normalizeDomainName(data.domain_name) : undefined;
+    const renamed = domainName !== undefined && domainName.toLowerCase() !== String(existing.domain_name).trim().toLowerCase();
 
-    const domain = await this.prisma.domain.update({
+    const updateDomain = (client: any) => client.domain.update({
       where: { id },
       data: {
         project_id: this.parseOptionalProjectId(data),
-        domain_name: data.domain_name,
+        domain_name: domainName,
         provider: data.provider,
         purchase_date: data.purchase_date !== undefined ? (data.purchase_date ? new Date(data.purchase_date) : null) : undefined,
         expiry_date: expiryDate,
@@ -328,6 +486,9 @@ export class InfrastructureService {
       },
       include: { project: true, server: true },
     });
+    const domain = renamed
+      ? await this.writeUniqueDomainName(domainName!, id, updateDomain)
+      : await updateDomain(this.prisma);
 
     return {
       ...domain,
@@ -461,6 +622,7 @@ export class InfrastructureService {
       },
     });
     if (!c) throw new NotFoundException('Credential not found');
+    await this.assertProjectReadable(user, c.project_id, 'Credential not found');
 
     const isAdm = this.isAdmin(user);
     const res: any = {
@@ -531,6 +693,10 @@ export class InfrastructureService {
     const existing = await this.prisma.websiteCredential.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Credential not found');
 
+    // The masked placeholder sent back by edit forms must not overwrite the stored password
+    const pw = (value: any, empty: '' | null) =>
+      value === undefined || value === InfrastructureService.PASSWORD_MASK ? undefined : value ? this.encryptPassword(value) : empty;
+
     const cred = await this.prisma.websiteCredential.update({
       where: { id },
       data: {
@@ -538,31 +704,26 @@ export class InfrastructureService {
         domain_id: data.domain_id || data.domain ? Number(data.domain_id || data.domain) : undefined,
         admin_url: data.admin_url,
         admin_username: data.admin_username,
-        admin_password: data.admin_password !== undefined ? (data.admin_password ? this.encryptPassword(data.admin_password) : '') : undefined,
+        admin_password: pw(data.admin_password, ''),
         cpanel_url: data.cpanel_url,
         cpanel_username: data.cpanel_username,
-        cpanel_password: data.cpanel_password !== undefined ? (data.cpanel_password ? this.encryptPassword(data.cpanel_password) : '') : undefined,
+        cpanel_password: pw(data.cpanel_password, ''),
         ftp_host: data.ftp_host,
         ftp_username: data.ftp_username,
-        ftp_password: data.ftp_password !== undefined ? (data.ftp_password ? this.encryptPassword(data.ftp_password) : '') : undefined,
+        ftp_password: pw(data.ftp_password, ''),
         contact_form_email: data.contact_form_email,
         client_email: data.client_email,
-        client_email_password: data.client_email_password !== undefined ? (data.client_email_password ? this.encryptPassword(data.client_email_password) : '') : undefined,
+        client_email_password: pw(data.client_email_password, ''),
         business_email: data.business_email,
-        business_email_password: data.business_email_password !== undefined ? (data.business_email_password ? this.encryptPassword(data.business_email_password) : null) : undefined,
+        business_email_password: pw(data.business_email_password, null),
         business_email_type: data.business_email_type,
         notes: data.notes,
       },
       include: { project: true, domain: true },
     });
 
-    return {
-      ...cred,
-      project: cred.project_id,
-      domain: cred.domain_id,
-      project_name: cred.project?.name || null,
-      domain_name: cred.domain?.domain_name || null,
-    };
+    // Same masking/decryption as reads (previously returned the stored ciphertext)
+    return this.formatCredential(cred, this.isAdmin(user));
   }
 
   async deleteCredential(user: any, id: number) {

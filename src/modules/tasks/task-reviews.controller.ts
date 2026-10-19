@@ -18,8 +18,8 @@ export class TaskReviewsController {
 
   @Get(':id')
   @Permissions('VIEW_TASKS')
-  async findOne(@Param('id', ParseIntPipe) id: number) {
-    return this.taskReviewsService.findOne(id);
+  async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
+    return this.taskReviewsService.findOne(id, user);
   }
 
   @Post()

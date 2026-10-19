@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, ForbiddenException, BadRequestException 
 import { PrismaService } from '../../core/prisma.service';
 import { ProjectActivityLogsService } from './services/project-activity-logs.service';
 import { formatUserResponse } from '../users/user.serializer';
+import { canAccessProject, projectScopeFor } from '../../core/utils/project-scope.util';
 
 @Injectable()
 export class ProjectMembersService {
@@ -31,13 +32,10 @@ export class ProjectMembersService {
 
     if (roleName === 'CLIENT') {
       return query.project ? [] : { count: 0, next: null, previous: null, results: [] };
-    } else if (roleName === 'TEAM_MEMBER') {
-      where.project = {
-        members: {
-          some: { user_id: user.id },
-        },
-      };
     }
+    // Members of projects in the caller's scope only (previously only TEAM_MEMBER was scoped)
+    const scope = await projectScopeFor(this.prisma, user);
+    if (scope) where.project = scope;
 
     const members = await this.prisma.projectMember.findMany({
       where,
@@ -63,12 +61,18 @@ export class ProjectMembersService {
     };
   }
 
-  async findOne(id: number) {
+  /** The membership's project must be inside the caller's scope; 404 otherwise. */
+  private async assertProjectInScope(user: any, projectId: number, message = 'Project member not found') {
+    if (!(await canAccessProject(this.prisma, user, projectId))) throw new NotFoundException(message);
+  }
+
+  async findOne(id: number, user: any) {
     const member = await this.prisma.projectMember.findUnique({
       where: { id },
       include: { user: { include: { role: true, department: true, client: true } } },
     });
     if (!member) throw new NotFoundException('Project member not found');
+    await this.assertProjectInScope(user, member.project_id);
     return this.formatMember(member);
   }
 
@@ -80,6 +84,14 @@ export class ProjectMembersService {
 
     const projectId = Number(body.project || body.project_id);
     const userId = Number(body.user || body.user_id);
+
+    // Project and user ids come from the form: the project must be one the caller manages
+    // (in scope), and the user must be an existing, non-deleted, non-client account
+    await this.assertProjectInScope(user, projectId, 'Project not found');
+    const member = await this.prisma.user.findFirst({ where: { id: userId, deleted_at: null }, include: { role: true } });
+    if (!member || member.role?.name === 'CLIENT') {
+      throw new BadRequestException({ user: 'User not found.' });
+    }
 
     const existing = await this.prisma.projectMember.findFirst({
       where: { project_id: projectId, user_id: userId },
@@ -119,6 +131,7 @@ export class ProjectMembersService {
       include: { user: true },
     });
     if (!existing) throw new NotFoundException('Project member not found');
+    await this.assertProjectInScope(user, existing.project_id);
 
     const updated = await this.prisma.projectMember.update({
       where: { id },
@@ -149,6 +162,7 @@ export class ProjectMembersService {
       include: { user: true },
     });
     if (!existing) throw new NotFoundException('Project member not found');
+    await this.assertProjectInScope(user, existing.project_id);
 
     await this.prisma.projectMember.delete({ where: { id } });
 

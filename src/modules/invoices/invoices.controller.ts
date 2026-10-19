@@ -4,24 +4,32 @@ import { InvoicesService } from './invoices.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 import { Public } from '../../core/decorators/public.decorator';
+import { PermissionsGuard } from '../../core/guards/permissions.guard';
+import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
+import { INVOICE_READ_PERMISSIONS, INVOICE_WRITE_PERMISSIONS } from '../../core/utils/permission-catalog';
 
 @Controller('api/v1/invoices')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
 export class InvoicesController {
   constructor(private readonly invoicesService: InvoicesService) {}
 
   @Get()
+  @Permissions(...INVOICE_READ_PERMISSIONS)
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.invoicesService.findAll(user, query);
   }
 
   @Get('next-number')
+  @Permissions(...INVOICE_READ_PERMISSIONS)
   async nextNumber() {
     const invoiceNumber = await this.invoicesService.getNextInvoiceNumber();
     return { invoice_number: invoiceNumber };
   }
 
   @Get('analytics')
+  @Permissions(...INVOICE_READ_PERMISSIONS)
   async getAnalytics(@CurrentUser() user: any) {
     return this.invoicesService.getAnalytics(user);
   }
@@ -40,11 +48,14 @@ export class InvoicesController {
   }
 
   @Get([':id/secure-link', ':id/secure-link/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async getSecureLink(@Param('id', ParseIntPipe) id: number, @Req() req: any) {
     return this.invoicesService.generateSecureLink(id, req);
   }
 
   @Get([':id/download', ':id/download/'])
+  @Permissions(...INVOICE_READ_PERMISSIONS)
+  @ClientAccess()
   async downloadPdf(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -60,6 +71,7 @@ export class InvoicesController {
   }
 
   @Post(['preview', 'preview/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async previewPdf(@Body() body: any, @Res() res: Response) {
     const pdfBuffer = await this.invoicesService.previewPdf(body);
     res.setHeader('Content-Type', 'application/pdf');
@@ -68,16 +80,20 @@ export class InvoicesController {
   }
 
   @Get([':id', ':id/'])
+  @Permissions(...INVOICE_READ_PERMISSIONS)
+  @ClientAccess()
   async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicesService.findOne(id, user);
   }
 
   @Post()
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async create(@CurrentUser() user: any, @Body() body: any) {
     return this.invoicesService.create(user, body);
   }
 
   @Put([':id', ':id/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async updatePut(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -87,6 +103,7 @@ export class InvoicesController {
   }
 
   @Patch([':id', ':id/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async update(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -97,12 +114,14 @@ export class InvoicesController {
 
 
   @Delete([':id', ':id/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicesService.remove(id, user);
   }
 
   @Post([':id/send_email', ':id/send-email', ':id/send_email/', ':id/send-email/'])
+  @Permissions(...INVOICE_WRITE_PERMISSIONS)
   async sendEmail(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.invoicesService.sendEmail(id, user);
   }

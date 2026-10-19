@@ -9,12 +9,20 @@ describe('InfrastructureService - Domains', () => {
   const mockPrismaService = {
     domain: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
+      count: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+    },
+    projectMember: {
+      findMany: jest.fn(),
     },
     reminder: {
       create: jest.fn(),
     },
+    // Domain writes run the duplicate-name check (raw query, no clash here) in a transaction
+    $queryRaw: jest.fn(async () => []),
+    $transaction: jest.fn(async (fn: any) => fn(mockPrismaService)),
   };
 
   const mockUser = { id: 1, name: 'Admin User', role: { name: 'SUPER_ADMIN' } };
@@ -41,6 +49,59 @@ describe('InfrastructureService - Domains', () => {
     service = module.get<InfrastructureService>(InfrastructureService);
 
     jest.clearAllMocks();
+  });
+
+  describe('searching domains (GET /infrastructure/domains?search=)', () => {
+    const PARTIAL = (term: string) => [
+      { domain_name: { contains: term } },
+      { provider: { contains: term } },
+      { project: { name: { contains: term } } },
+      { server: { name: { contains: term } } },
+    ];
+    const lastWhere = () => mockPrismaService.domain.findMany.mock.calls.at(-1)[0].where;
+
+    beforeEach(() => {
+      mockPrismaService.domain.findMany.mockResolvedValue([buildDomain({ domain_name: 'tresbonelectrolysis.com' })]);
+      mockPrismaService.domain.count.mockResolvedValue(1);
+    });
+
+    it.each(['tre', 'TRES', 'electro'])('"%s": partial match on domain name, provider, project name and server name', async (term) => {
+      const res: any = await service.getDomains(mockUser, { search: term });
+      expect(lastWhere()).toEqual({ OR: PARTIAL(term) });
+      expect(res.results.map((d: any) => d.domain_name)).toEqual(['tresbonelectrolysis.com']);
+    });
+
+    it('never uses mode: "insensitive" (Prisma rejects it on MySQL; the collation is case-insensitive)', async () => {
+      await service.getDomains(mockUser, { search: 'Tre' });
+      await service.getDomains(mockUser, { search: 'tre', all: 'true' });
+      for (const [args] of mockPrismaService.domain.findMany.mock.calls) expect(JSON.stringify(args.where)).not.toContain('mode');
+      for (const [args] of mockPrismaService.domain.count.mock.calls) expect(JSON.stringify(args.where)).not.toContain('mode');
+    });
+
+    it('trims the term; an empty or blank search (cleared box) lists every domain', async () => {
+      await service.getDomains(mockUser, { search: '  tre ' });
+      expect(lastWhere()).toEqual({ OR: PARTIAL('tre') });
+      for (const search of ['', '   ', undefined]) {
+        await service.getDomains(mockUser, { search });
+        expect(lastWhere()).toEqual({});
+      }
+    });
+
+    it('no match returns an empty page (not an error)', async () => {
+      mockPrismaService.domain.findMany.mockResolvedValue([]);
+      mockPrismaService.domain.count.mockResolvedValue(0);
+      await expect(service.getDomains(mockUser, { search: 'zzz-no-match' })).resolves.toMatchObject({ count: 0, results: [] });
+    });
+
+    it('keeps pagination and the non-admin project scope', async () => {
+      const staff = { id: 2, role: { name: 'DEVELOPER' } };
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+      await service.getDomains(staff, { search: 'tre', page: '2', limit: '5' });
+      const args = mockPrismaService.domain.findMany.mock.calls.at(-1)[0];
+      expect(args.where).toEqual({ project_id: { in: [3] }, OR: PARTIAL('tre') });
+      expect(args).toMatchObject({ skip: 5, take: 5 });
+      expect(mockPrismaService.domain.count).toHaveBeenLastCalledWith({ where: args.where });
+    });
   });
 
   describe('createDomain', () => {
@@ -188,6 +249,9 @@ describe('InfrastructureService - Servers', () => {
     projectMember: {
       findMany: jest.fn(),
     },
+    domain: {
+      count: jest.fn(),
+    },
   };
 
   const adminUser = { id: 1, role: { name: 'SUPER_ADMIN' } };
@@ -286,12 +350,22 @@ describe('InfrastructureService - Servers', () => {
       expect(server.password).toBe('s3cret!');
     });
 
-    it('masks the password for non-admins', async () => {
+    it('masks the password for non-admins (who are members of a linked project)', async () => {
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+      mockPrismaService.domain.count.mockResolvedValue(1);
       mockPrismaService.server.findUnique.mockResolvedValue(storedRow());
 
       const server = await service.getServerById(staffUser, 7);
 
       expect(server.password).toBe(MASK);
+    });
+
+    it('Phase 2.2: non-admins cannot read a server outside their projects (404)', async () => {
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+      mockPrismaService.domain.count.mockResolvedValue(0);
+      mockPrismaService.server.findUnique.mockResolvedValue(storedRow());
+
+      await expect(service.getServerById(staffUser, 7)).rejects.toThrow(NotFoundException);
     });
 
     it('masks passwords in the paginated list for non-admins', async () => {
@@ -302,6 +376,59 @@ describe('InfrastructureService - Servers', () => {
       const res: any = await service.getServers(staffUser, {});
 
       expect(res.results[0].password).toBe(MASK);
+    });
+
+    describe('fields=expiry (expiry notifications)', () => {
+      const expiryRow = { id: 7, name: 'Prod', expiry_date: new Date('2027-01-15') };
+
+      it('selects only id, name and expiry_date, never the password, and skips servers without a date', async () => {
+        mockPrismaService.server.findMany.mockResolvedValue([expiryRow]);
+
+        const res: any = await service.getServers(adminUser, { fields: 'expiry' });
+
+        const args = mockPrismaService.server.findMany.mock.calls[0][0];
+        expect(args.select).toEqual({ id: true, name: true, expiry_date: true });
+        expect(args.where).toEqual({ expiry_date: { not: null } });
+        expect(res).toEqual([expiryRow]);
+        expect(res[0]).not.toHaveProperty('password');
+        expect(mockPrismaService.server.count).not.toHaveBeenCalled();
+      });
+
+      it('does not decrypt passwords for super admins', async () => {
+        const decrypt = jest.spyOn(service as any, 'decryptPassword');
+        mockPrismaService.server.findMany.mockResolvedValue([expiryRow]);
+
+        await service.getServers(adminUser, { fields: 'expiry', all: 'true' });
+
+        expect(decrypt).not.toHaveBeenCalled();
+      });
+
+      it('keeps the non-admin project scope', async () => {
+        mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+        mockPrismaService.server.findMany.mockResolvedValue([expiryRow]);
+
+        await service.getServers(staffUser, { fields: 'expiry' });
+
+        const args = mockPrismaService.server.findMany.mock.calls[0][0];
+        expect(args.where).toEqual({ domains: { some: { project_id: { in: [3] } } }, expiry_date: { not: null } });
+        expect(args.select).toEqual({ id: true, name: true, expiry_date: true });
+      });
+
+      it('returns an empty list for non-admins without projects', async () => {
+        mockPrismaService.projectMember.findMany.mockResolvedValue([]);
+
+        await expect(service.getServers(staffUser, { fields: 'expiry' })).resolves.toEqual([]);
+        expect(mockPrismaService.server.findMany).not.toHaveBeenCalled();
+      });
+
+      it('leaves the normal all=true response unchanged', async () => {
+        mockPrismaService.server.findMany.mockResolvedValue([storedRow()]);
+
+        const res: any = await service.getServers(adminUser, { all: 'true' });
+
+        expect(mockPrismaService.server.findMany.mock.calls[0][0].select).toBeUndefined();
+        expect(res[0].password).toBe('s3cret!');
+      });
     });
   });
 
@@ -364,5 +491,84 @@ describe('InfrastructureService - Servers', () => {
 
       await expect(service.updateServer(adminUser, 999, {})).rejects.toThrow(NotFoundException);
     });
+  });
+});
+
+describe('InfrastructureService - Summary (overview cards)', () => {
+  let service: InfrastructureService;
+
+  // In-memory rows; count() applies the same where shapes the service builds
+  const servers = Array.from({ length: 8 }, (_, i) => ({ id: i + 1, password: 'enc' }));
+  // Domains 1-6 in project 1 (servers 1-3), 7 in project 2 (server 4), 8-9 unassigned
+  const domains = [
+    ...Array.from({ length: 6 }, (_, i) => ({ id: i + 1, project_id: 1, server_id: (i % 3) + 1 })),
+    { id: 7, project_id: 2, server_id: 4 },
+    { id: 8, project_id: null, server_id: 5 },
+    { id: 9, project_id: null, server_id: null },
+  ];
+  const credentials = [
+    ...Array.from({ length: 7 }, (_, i) => ({ id: i + 1, project_id: 1, password: 'enc' })),
+    { id: 8, project_id: 2, password: 'enc' },
+  ];
+  const inIds = (where: any, row: any) => !where?.project_id || where.project_id.in.includes(row.project_id);
+
+  const prisma = {
+    server: {
+      count: jest.fn(async (args?: any) =>
+        servers.filter((s) => {
+          const scope = args?.where?.domains?.some;
+          return !scope || domains.some((d) => d.server_id === s.id && inIds(scope, d));
+        }).length),
+      findMany: jest.fn(),
+    },
+    domain: { count: jest.fn(async (args?: any) => domains.filter((d) => inIds(args?.where, d)).length), findMany: jest.fn() },
+    websiteCredential: { count: jest.fn(async (args?: any) => credentials.filter((c) => inIds(args?.where, c)).length), findMany: jest.fn() },
+    projectMember: { findMany: jest.fn() },
+  };
+
+  const superAdmin = { id: 1, role: { name: 'SUPER_ADMIN' } };
+  const staff = { id: 2, role: { name: 'DEVELOPER' } };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [InfrastructureService, { provide: PrismaService, useValue: prisma }],
+    }).compile();
+    service = module.get(InfrastructureService);
+    jest.clearAllMocks();
+  });
+
+  it('super admins get true totals, beyond the old page size of 5', async () => {
+    await expect(service.getSummary(superAdmin)).resolves.toEqual({ servers: 8, domains: 9, credentials: 8 });
+  });
+
+  it('other users count only what the list endpoints would show them (their projects)', async () => {
+    prisma.projectMember.findMany.mockResolvedValue([{ project_id: 1 }]);
+    // servers 1-3 (linked to project 1 domains), domains 1-6, credentials 1-7
+    await expect(service.getSummary(staff)).resolves.toEqual({ servers: 3, domains: 6, credentials: 7 });
+  });
+
+  it('users without projects see zero of everything (no unscoped count)', async () => {
+    prisma.projectMember.findMany.mockResolvedValue([]);
+    await expect(service.getSummary(staff)).resolves.toEqual({ servers: 0, domains: 0, credentials: 0 });
+    expect(prisma.server.count).not.toHaveBeenCalled();
+    expect(prisma.domain.count).not.toHaveBeenCalled();
+    expect(prisma.websiteCredential.count).not.toHaveBeenCalled();
+  });
+
+  it('uses COUNT queries only: no rows (and so no passwords) are read', async () => {
+    prisma.projectMember.findMany.mockResolvedValue([{ project_id: 2 }]);
+    await service.getSummary(superAdmin);
+    await service.getSummary(staff);
+    expect(prisma.server.findMany).not.toHaveBeenCalled();
+    expect(prisma.domain.findMany).not.toHaveBeenCalled();
+    expect(prisma.websiteCredential.findMany).not.toHaveBeenCalled();
+  });
+
+  it('the scoped where clauses match the list endpoints', async () => {
+    prisma.projectMember.findMany.mockResolvedValue([{ project_id: 2 }]);
+    await expect(service.getSummary(staff)).resolves.toEqual({ servers: 1, domains: 1, credentials: 1 });
+    expect(prisma.server.count).toHaveBeenCalledWith({ where: { domains: { some: { project_id: { in: [2] } } } } });
+    expect(prisma.domain.count).toHaveBeenCalledWith({ where: { project_id: { in: [2] } } });
+    expect(prisma.websiteCredential.count).toHaveBeenCalledWith({ where: { project_id: { in: [2] } } });
   });
 });

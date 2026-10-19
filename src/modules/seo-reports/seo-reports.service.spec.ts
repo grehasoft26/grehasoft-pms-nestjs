@@ -460,6 +460,7 @@ describe('SeoReportsService', () => {
       pdf_file_size: 1024,
     };
     prisma.sEOReport.findUnique.mockResolvedValue(publishedPdfReport);
+    prisma.client.findFirst.mockResolvedValue(mockClient); // user client_id is 10
     jest.spyOn(fs, 'existsSync').mockReturnValue(true);
 
     const pdfInfo = await service.getReportPdf(1, mockUserClient);

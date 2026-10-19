@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, ForbiddenException 
 import { CompanyCredentialCategory } from '@prisma/client';
 import { PrismaService } from '../../core/prisma.service';
 import { EncryptionService } from '../../core/encryption.service';
+import { isSuperAdmin } from '../../core/utils/role-access.util';
 
 export const COMPANY_CREDENTIAL_CATEGORIES = Object.values(CompanyCredentialCategory);
 
@@ -21,8 +22,7 @@ export class CompanyCredentialsService {
   ) {}
 
   private isSuperAdmin(user: any): boolean {
-    const role = user?.role?.name || user?.role_name;
-    return !!user?.is_superuser || role === 'SUPER_ADMIN';
+    return isSuperAdmin(user);
   }
 
   /** Strips the stored password and exposes only whether one is set. */

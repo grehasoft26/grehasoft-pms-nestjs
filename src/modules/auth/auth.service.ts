@@ -2,6 +2,7 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../../core/prisma.service';
 import { PasswordUtil } from '../../core/utils/password.util';
+import { DEACTIVATED_ROLE_MESSAGE, applyRoleStatus } from '../../core/utils/role-access.util';
 import { formatUserResponse } from '../users/user.serializer';
 
 @Injectable()
@@ -38,6 +39,11 @@ export class AuthService {
       throw new UnauthorizedException('No active account found with the given credentials');
     }
 
+    // Same rule as JwtStrategy: no tokens for users on a soft-deleted role
+    if (!applyRoleStatus(user)) {
+      throw new UnauthorizedException(DEACTIVATED_ROLE_MESSAGE);
+    }
+
     // Update last_login
     const now = new Date();
     await this.prisma.user.update({
@@ -72,12 +78,20 @@ export class AuthService {
       const payload = this.jwtService.verify(refreshToken);
       const userId = Number(payload.sub || payload.user_id || payload.id);
 
-      const user = await this.prisma.user.findFirst({
+      const found = await this.prisma.user.findFirst({
         where: { id: userId, deleted_at: null, is_active: true },
+        include: { role: true },
       });
 
-      if (!user) {
+      if (!found) {
         throw new UnauthorizedException('User not found or inactive');
+      }
+
+      // Same rule as JwtStrategy: users still assigned to a soft-deleted role get no new token
+      // (is_superuser keeps access). Previously a token was issued that every request then refused.
+      const user = applyRoleStatus(found);
+      if (!user) {
+        throw new UnauthorizedException(DEACTIVATED_ROLE_MESSAGE);
       }
 
       const newPayload = {

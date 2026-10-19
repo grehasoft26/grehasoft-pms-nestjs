@@ -3,6 +3,7 @@ import { TasksService } from './tasks.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 
 @Controller('api/v1/tasks')
@@ -12,6 +13,7 @@ export class TasksController {
 
   @Get()
   @Permissions('VIEW_TASKS')
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.tasksService.findAll(user, query);
   }

@@ -20,6 +20,7 @@ import { SeoReportsService } from './seo-reports.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { ClientAccess } from '../../core/decorators/client-access.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
 import { CreateSeoReportDto } from './dto/create-seo-report.dto';
 import { UpdateSeoReportDto } from './dto/update-seo-report.dto';
@@ -44,12 +45,14 @@ export class SeoReportsController {
   // -------------------------------------------------------------
   @Get()
   @Permissions('VIEW_SEO_REPORTS')
+  @ClientAccess()
   async findAll(@CurrentUser() user: any, @Query() query: any) {
     return this.seoReportsService.findAll(user, query);
   }
 
   @Get(':id')
   @Permissions('VIEW_SEO_REPORTS')
+  @ClientAccess()
   async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: any) {
     return this.seoReportsService.findOne(id, user);
   }
@@ -112,6 +115,7 @@ export class SeoReportsController {
 
   @Get(':id/pdf')
   @Permissions('VIEW_SEO_REPORTS')
+  @ClientAccess()
   async downloadPdf(
     @Param('id', ParseIntPipe) id: number,
     @CurrentUser() user: any,
@@ -261,6 +265,7 @@ export class SeoReportsController {
 
   @Get(':reportId/files')
   @Permissions('VIEW_SEO_REPORTS')
+  @ClientAccess()
   async getEvidenceFiles(
     @Param('reportId', ParseIntPipe) reportId: number,
     @CurrentUser() user: any,
