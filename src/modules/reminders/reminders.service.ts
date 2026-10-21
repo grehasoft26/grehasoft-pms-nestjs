@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
+import { parseDateOnly } from '../../core/utils/date-only.util';
 
 /** Values of the ReminderType enum (prisma/schema.prisma). */
 const REMINDER_TYPES = ['general', 'invoice', 'payment', 'proposal', 'followup'] as const;
@@ -72,13 +73,23 @@ export class RemindersService {
     return reminder;
   }
 
+  /** due_date is a required DATE: date-only parsing, 400 when missing or invalid (was a 500). */
+  private parseDueDate(value: any, required: boolean): Date | undefined {
+    const date = parseDateOnly(value, 'Due date');
+    if (date === null || (required && date === undefined)) {
+      throw new BadRequestException('Due date is required.');
+    }
+    return date;
+  }
+
   async createReminder(user: any, data: any) {
+    const dueDate = this.parseDueDate(data.due_date, true);
     return this.prisma.reminder.create({
       data: {
         user_id: user.id,
         title: data.title,
         description: data.description || null,
-        due_date: new Date(data.due_date),
+        due_date: dueDate!,
         type: data.type || 'general',
         is_completed: data.is_completed || false,
         email_sent_created: false,
@@ -98,7 +109,7 @@ export class RemindersService {
       data: {
         title: data.title,
         description: data.description,
-        due_date: data.due_date ? new Date(data.due_date) : undefined,
+        due_date: this.parseDueDate(data.due_date, false),
         type: data.type,
         is_completed: data.is_completed !== undefined ? Boolean(data.is_completed) : undefined,
       },

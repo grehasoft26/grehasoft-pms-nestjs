@@ -4,6 +4,15 @@ import { PrismaService } from '../../core/prisma.service';
 import { isSuperAdmin } from '../../core/utils/role-access.util';
 import * as crypto from 'crypto';
 import { expiryFilterWhere, expiryOrderBy, parseToday, searchTerm } from './infrastructure-list.util';
+import { parseDateOnly, toDateKey } from '../../core/utils/date-only.util';
+import { RenewalPeriod, parseRenewalPeriod } from './renewal-period.util';
+import { lockAssetExpiry, recordManualExpiryChange, staleExpiryError } from './asset-renewals.service';
+
+/** Column values for a parsed renewal period: undefined (not sent) leaves both unchanged. */
+const renewalPeriodData = (period: RenewalPeriod | null | undefined) =>
+  period === undefined
+    ? {}
+    : { renewal_period_value: period?.value ?? null, renewal_period_unit: period?.unit ?? null };
 
 @Injectable()
 export class InfrastructureService {
@@ -162,6 +171,7 @@ export class InfrastructureService {
     const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date') ?? null;
     const expiryDate = this.parseDateOnly(data.expiry_date, 'Expiry date') ?? null;
     this.validateServerDetails(data.phone_number, purchaseDate, expiryDate);
+    const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
 
     const server = await this.prisma.server.create({
       data: {
@@ -176,6 +186,7 @@ export class InfrastructureService {
         phone_number: data.phone_number ? String(data.phone_number).trim() : '',
         purchase_date: purchaseDate,
         expiry_date: expiryDate,
+        ...renewalPeriodData(renewalPeriod),
       },
     });
     return this.formatServer(server, this.isAdmin(user));
@@ -192,6 +203,8 @@ export class InfrastructureService {
       purchaseDate !== undefined ? purchaseDate : server.purchase_date,
       expiryDate !== undefined ? expiryDate : server.expiry_date,
     );
+    const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
+    const expiry = this.expiryWrite(expiryDate, data.expected_expiry_date, server.expiry_date);
 
     // The masked placeholder sent back by non-admins must not overwrite the stored password
     const password =
@@ -199,7 +212,7 @@ export class InfrastructureService {
         ? undefined
         : data.password ? this.encryptPassword(data.password) : '';
 
-    const updated = await this.prisma.server.update({
+    const update = (client: any) => client.server.update({
       where: { id },
       data: {
         name: data.name,
@@ -212,10 +225,46 @@ export class InfrastructureService {
         password,
         phone_number: data.phone_number !== undefined ? (data.phone_number ? String(data.phone_number).trim() : '') : undefined,
         purchase_date: purchaseDate,
-        expiry_date: expiryDate,
+        expiry_date: expiry.value,
+        ...renewalPeriodData(renewalPeriod),
       },
     });
+    const updated = expiry.locked
+      ? await this.prisma.$transaction(async (tx: any) => {
+          const previous = await this.lockUnchangedExpiry(tx, 'server', id, expiry.baseline);
+          const row = await update(tx);
+          await recordManualExpiryChange(tx, { type: 'server', id, name: row.name ?? server.name, previous, next: expiry.value!, user });
+          return row;
+        })
+      : await update(this.prisma);
     return this.formatServer(updated, this.isAdmin(user));
+  }
+
+  /**
+   * How an ordinary edit (PUT/PATCH) writes the expiry date, without overwriting a renewal or
+   * another edit made meanwhile:
+   * - expected_expiry_date (optional) is the expiry the edit form loaded. When the submitted date
+   *   equals it, the user did not change the expiry: it is not written at all, so a renewal made
+   *   after the form was opened is kept and the other fields are still saved.
+   * - Any other expiry write runs in a transaction that locks the row (as renewals do) and is
+   *   refused with 409 when the stored expiry is no longer the one the form loaded (or, without
+   *   expected_expiry_date, the one read at the start of this request).
+   * - expiry_date not sent: the column is not written.
+   */
+  private expiryWrite(submitted: Date | null | undefined, expectedRaw: unknown, stored: Date | null) {
+    const expected = this.parseDateOnly(expectedRaw, 'Expected expiry date');
+    const untouched = expected !== undefined && submitted !== undefined && toDateKey(submitted) === toDateKey(expected);
+    const value = untouched ? undefined : submitted;
+    const locked = value !== undefined && (expected !== undefined || toDateKey(value) !== toDateKey(stored));
+    return { value, locked, baseline: expected !== undefined ? expected : stored };
+  }
+
+  /** Locks the row and checks the stored expiry is still `baseline` (409 otherwise); returns it. */
+  private async lockUnchangedExpiry(tx: any, type: 'domain' | 'server', id: number, baseline: Date | null) {
+    const current = await lockAssetExpiry(tx, type, id);
+    if (current === undefined) throw new NotFoundException(type === 'domain' ? 'Domain not found' : 'Server not found');
+    if (toDateKey(current) !== toDateKey(baseline)) throw staleExpiryError(type, current);
+    return current;
   }
 
   private static readonly PASSWORD_MASK = '••••••••';
@@ -228,26 +277,19 @@ export class InfrastructureService {
     };
   }
 
-  /**
-   * Parses a date-only value ("YYYY-MM-DD", optionally with a time part) to UTC midnight
-   * so the stored DATE matches the selected calendar day.
-   * undefined -> undefined (not provided), null/"" -> null (cleared).
-   */
+  /** Date-only parsing shared by servers and domains (see core/utils/date-only.util). */
   private parseDateOnly(value: any, label: string): Date | null | undefined {
-    if (value === undefined) return undefined;
-    if (value === null || value === '') return null;
-    const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})/);
-    const date = match ? new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))) : null;
-    if (!date || date.getUTCMonth() !== Number(match![2]) - 1 || date.getUTCDate() !== Number(match![3])) {
-      throw new BadRequestException(`${label} must be a valid date (YYYY-MM-DD).`);
-    }
-    return date;
+    return parseDateOnly(value, label);
   }
 
   private validateServerDetails(phoneNumber: any, purchaseDate: Date | null, expiryDate: Date | null) {
     if (phoneNumber && !/^\+?[0-9\s\-().]{7,20}$/.test(String(phoneNumber).trim())) {
       throw new BadRequestException('Phone number may contain only digits, spaces, +, -, ( ) and must be 7-20 characters.');
     }
+    this.validateDateOrder(purchaseDate, expiryDate);
+  }
+
+  private validateDateOrder(purchaseDate: Date | null | undefined, expiryDate: Date | null | undefined) {
     if (purchaseDate && expiryDate && expiryDate < purchaseDate) {
       throw new BadRequestException('Expiry date cannot be earlier than purchase date.');
     }
@@ -436,7 +478,12 @@ export class InfrastructureService {
   }
 
   async createDomain(user: any, data: any) {
-    const expiryDate = data.expiry_date ? new Date(data.expiry_date) : null;
+    // Same date-only parsing as servers: invalid dates are a 400 (previously new Date(), so a bad
+    // value reached Prisma as an Invalid Date and failed with a 500)
+    const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date') ?? null;
+    const expiryDate = this.parseDateOnly(data.expiry_date, 'Expiry date') ?? null;
+    this.validateDateOrder(purchaseDate, expiryDate);
+    const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
     const domainName = this.normalizeDomainName(data.domain_name);
 
     const domain = await this.writeUniqueDomainName(domainName, undefined, (tx) => tx.domain.create({
@@ -444,11 +491,12 @@ export class InfrastructureService {
         project_id: this.parseOptionalProjectId(data) ?? null,
         domain_name: domainName,
         provider: data.provider || '',
-        purchase_date: data.purchase_date ? new Date(data.purchase_date) : null,
+        purchase_date: purchaseDate,
         expiry_date: expiryDate,
         renewal_cost: data.renewal_cost ? Number(data.renewal_cost) : null,
         server_id: data.server_id || data.server ? Number(data.server_id || data.server) : null,
         notes: data.notes || '',
+        ...renewalPeriodData(renewalPeriod),
       },
       include: { project: true, server: true },
     }));
@@ -466,29 +514,53 @@ export class InfrastructureService {
     const existing = await this.prisma.domain.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Domain not found');
 
-    const expiryDate = data.expiry_date !== undefined ? (data.expiry_date ? new Date(data.expiry_date) : null) : existing.expiry_date;
+    const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date');
+    const parsedExpiry = this.parseDateOnly(data.expiry_date, 'Expiry date');
+    const expiryDate = parsedExpiry !== undefined ? parsedExpiry : existing.expiry_date;
+    // Checked only when a date is being saved, so editing other fields of a record with
+    // inconsistent legacy dates still works
+    if (purchaseDate !== undefined || parsedExpiry !== undefined) {
+      this.validateDateOrder(purchaseDate !== undefined ? purchaseDate : existing.purchase_date, expiryDate);
+    }
+    const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
+    const expiry = this.expiryWrite(parsedExpiry, data.expected_expiry_date, existing.expiry_date);
     // Only a real rename is checked: saving other fields (or re-sending the same name with other
     // spacing/case) never fails, even for a record that already has a duplicate
     const domainName = data.domain_name !== undefined ? this.normalizeDomainName(data.domain_name) : undefined;
     const renamed = domainName !== undefined && domainName.toLowerCase() !== String(existing.domain_name).trim().toLowerCase();
 
-    const updateDomain = (client: any) => client.domain.update({
+    const updateRow = (client: any) => client.domain.update({
       where: { id },
       data: {
         project_id: this.parseOptionalProjectId(data),
         domain_name: domainName,
         provider: data.provider,
-        purchase_date: data.purchase_date !== undefined ? (data.purchase_date ? new Date(data.purchase_date) : null) : undefined,
-        expiry_date: expiryDate,
+        purchase_date: purchaseDate,
+        // Not written unless it is being changed (writing back the value read above could undo a
+        // renewal committed meanwhile)
+        expiry_date: expiry.value,
         renewal_cost: data.renewal_cost !== undefined ? (data.renewal_cost ? Number(data.renewal_cost) : null) : undefined,
         server_id: data.server_id !== undefined ? (data.server_id || data.server ? Number(data.server_id || data.server) : null) : undefined,
         notes: data.notes,
+        ...renewalPeriodData(renewalPeriod),
       },
       include: { project: true, server: true },
     });
+    // An expiry change locks the row (see expiryWrite) and is recorded in the renewal history, in
+    // the same transaction as the update
+    const updateDomain = async (client: any) => {
+      const previous = expiry.locked ? await this.lockUnchangedExpiry(client, 'domain', id, expiry.baseline) : null;
+      const row = await updateRow(client);
+      if (expiry.locked) {
+        await recordManualExpiryChange(client, { type: 'domain', id, name: row.domain_name ?? existing.domain_name, previous, next: expiry.value!, user });
+      }
+      return row;
+    };
     const domain = renamed
       ? await this.writeUniqueDomainName(domainName!, id, updateDomain)
-      : await updateDomain(this.prisma);
+      : expiry.locked
+        ? await this.prisma.$transaction((tx: any) => updateDomain(tx))
+        : await updateDomain(this.prisma);
 
     return {
       ...domain,

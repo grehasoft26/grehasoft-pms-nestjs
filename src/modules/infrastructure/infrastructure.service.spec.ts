@@ -20,8 +20,17 @@ describe('InfrastructureService - Domains', () => {
     reminder: {
       create: jest.fn(),
     },
-    // Domain writes run the duplicate-name check (raw query, no clash here) in a transaction
-    $queryRaw: jest.fn(async () => []),
+    // Manual expiry changes are recorded in the renewal history
+    assetRenewal: {
+      create: jest.fn(async (args: any) => ({ id: 1, ...args.data })),
+    },
+    // Domain writes run the duplicate-name check (raw query, no clash here) in a transaction;
+    // expiry changes lock the row (SELECT id, expiry_date ... FOR UPDATE), answered from the stored domain
+    $queryRaw: jest.fn(async (sql: any): Promise<any[]> => {
+      if (!/expiry_date FROM domains/.test(sql.sql)) return [];
+      const row = await mockPrismaService.domain.findUnique({ where: { id: sql.values[0] } });
+      return row ? [{ id: row.id, expiry_date: row.expiry_date ?? null }] : [];
+    }),
     $transaction: jest.fn(async (fn: any) => fn(mockPrismaService)),
   };
 
@@ -152,14 +161,139 @@ describe('InfrastructureService - Domains', () => {
 
       await service.updateDomain(mockUser, 10, { notes: 'note only' });
 
+      // Not written at all (previously the value read at the start was written back, which could
+      // undo a renewal committed in between); the stored date is kept
       const updateArgs = mockPrismaService.domain.update.mock.calls[0][0];
-      expect(updateArgs.data.expiry_date).toBe(existing.expiry_date);
+      expect(updateArgs.data.expiry_date).toBeUndefined();
     });
 
     it('throws NotFoundException for a missing domain', async () => {
       mockPrismaService.domain.findUnique.mockResolvedValue(null);
 
       await expect(service.updateDomain(mockUser, 999, {})).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('domain dates (date-only, same parsing as servers)', () => {
+    const createData = () => mockPrismaService.domain.create.mock.calls[0][0].data;
+    const updateData = () => mockPrismaService.domain.update.mock.calls[0][0].data;
+    const day = (d: Date | null) => (d ? d.toISOString() : d);
+
+    beforeEach(() => {
+      mockPrismaService.domain.create.mockResolvedValue(buildDomain());
+      mockPrismaService.domain.findUnique.mockResolvedValue(
+        buildDomain({ purchase_date: new Date('2025-10-21'), expiry_date: new Date('2026-10-21') }),
+      );
+      mockPrismaService.domain.update.mockResolvedValue(buildDomain());
+    });
+
+    it('stores purchase and expiry dates as UTC midnight of the selected day', async () => {
+      await service.createDomain(mockUser, { domain_name: 'a.test', purchase_date: '2025-10-21', expiry_date: '2026-10-21' });
+      expect(day(createData().purchase_date)).toBe('2025-10-21T00:00:00.000Z');
+      expect(day(createData().expiry_date)).toBe('2026-10-21T00:00:00.000Z');
+    });
+
+    it('accepts the ISO timestamp the API returns for a DATE (the calendar day is kept)', async () => {
+      await service.updateDomain(mockUser, 10, { expiry_date: '2027-10-21T00:00:00.000Z' });
+      expect(day(updateData().expiry_date)).toBe('2027-10-21T00:00:00.000Z');
+    });
+
+    it.each(['not-a-date', '2026-02-30', '2026-13-01', '21-10-2026'])('rejects the invalid expiry date %s with 400 and saves nothing', async (value) => {
+      await expect(service.createDomain(mockUser, { domain_name: 'a.test', expiry_date: value })).rejects.toThrow(
+        'Expiry date must be a valid date (YYYY-MM-DD).',
+      );
+      await expect(service.updateDomain(mockUser, 10, { expiry_date: value })).rejects.toThrow(BadRequestException);
+      expect(mockPrismaService.domain.create).not.toHaveBeenCalled();
+      expect(mockPrismaService.domain.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid purchase date with 400', async () => {
+      await expect(service.createDomain(mockUser, { domain_name: 'a.test', purchase_date: '2026-02-29' })).rejects.toThrow(
+        'Purchase date must be a valid date (YYYY-MM-DD).',
+      );
+    });
+
+    it('accepts 29 February in a leap year', async () => {
+      await service.createDomain(mockUser, { domain_name: 'a.test', expiry_date: '2028-02-29' });
+      expect(day(createData().expiry_date)).toBe('2028-02-29T00:00:00.000Z');
+    });
+
+    it('null or "" clears a date; leaving it out keeps it', async () => {
+      await service.updateDomain(mockUser, 10, { expiry_date: '', purchase_date: null });
+      expect(updateData().expiry_date).toBeNull();
+      expect(updateData().purchase_date).toBeNull();
+
+      mockPrismaService.domain.update.mockClear();
+      await service.updateDomain(mockUser, 10, { notes: 'x' });
+      expect(updateData().purchase_date).toBeUndefined();
+      expect(updateData().expiry_date).toBeUndefined(); // not written: the stored date is kept
+    });
+
+    it('refuses an expiry date earlier than the purchase date (create and update, against the stored date)', async () => {
+      await expect(
+        service.createDomain(mockUser, { domain_name: 'a.test', purchase_date: '2026-10-21', expiry_date: '2026-10-20' }),
+      ).rejects.toThrow('Expiry date cannot be earlier than purchase date.');
+      // stored purchase date is 2025-10-21
+      await expect(service.updateDomain(mockUser, 10, { expiry_date: '2025-10-20' })).rejects.toThrow(
+        'Expiry date cannot be earlier than purchase date.',
+      );
+    });
+
+    it('records a manual expiry change in the renewal history inside a transaction', async () => {
+      mockPrismaService.domain.update.mockResolvedValue(buildDomain({ domain_name: 'example.com' }));
+      await service.updateDomain(mockUser, 10, { expiry_date: '2027-10-21' });
+      expect(mockPrismaService.$transaction).toHaveBeenCalledTimes(1);
+      const entry = mockPrismaService.assetRenewal.create.mock.calls[0][0].data;
+      expect(entry).toMatchObject({ asset_type: 'domain', asset_id: 10, domain_id: 10, asset_name: 'example.com', event: 'manual_change', performed_by_id: 1 });
+      expect(day(entry.previous_expiry_date)).toBe('2026-10-21T00:00:00.000Z');
+      expect(day(entry.new_expiry_date)).toBe('2027-10-21T00:00:00.000Z');
+    });
+
+    it('writes no history (and uses no transaction) when the expiry is unchanged or not sent', async () => {
+      await service.updateDomain(mockUser, 10, { notes: 'x' });
+      await service.updateDomain(mockUser, 10, { expiry_date: '2026-10-21T00:00:00.000Z' });
+      expect(mockPrismaService.assetRenewal.create).not.toHaveBeenCalled();
+      expect(mockPrismaService.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('records the change in the rename transaction when the domain is renamed at the same time', async () => {
+      await service.updateDomain(mockUser, 10, { domain_name: 'renamed.test', expiry_date: '2027-10-21' });
+      expect(mockPrismaService.$transaction).toHaveBeenCalledTimes(1);
+      expect(mockPrismaService.assetRenewal.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('stores and validates the default renewal period', async () => {
+      await service.createDomain(mockUser, { domain_name: 'a.test', renewal_period_value: 2, renewal_period_unit: 'year' });
+      expect(createData()).toMatchObject({ renewal_period_value: 2, renewal_period_unit: 'year' });
+      await expect(service.updateDomain(mockUser, 10, { renewal_period_value: 11, renewal_period_unit: 'year' })).rejects.toThrow(BadRequestException);
+    });
+
+    it('does not re-check stored dates when no date is being saved', async () => {
+      mockPrismaService.domain.findUnique.mockResolvedValue(
+        buildDomain({ purchase_date: new Date('2026-10-21'), expiry_date: new Date('2026-01-01') }),
+      );
+      await expect(service.updateDomain(mockUser, 10, { notes: 'legacy record' })).resolves.toBeDefined();
+    });
+  });
+
+  describe('domain server (server_id), as the Edit Domain form sends it', () => {
+    const updateData = () => mockPrismaService.domain.update.mock.calls[0][0].data;
+    beforeEach(() => {
+      mockPrismaService.domain.findUnique.mockResolvedValue(buildDomain({ server_id: 2 }));
+      mockPrismaService.domain.update.mockResolvedValue(buildDomain());
+    });
+
+    it('server_id sets the server', async () => {
+      await service.updateDomain(mockUser, 10, { server_id: 6, provider: 'Namecheap', notes: 'x' });
+      expect(updateData()).toMatchObject({ server_id: 6, provider: 'Namecheap', notes: 'x' });
+    });
+
+    it('server_id null clears it; not sent leaves it unchanged', async () => {
+      await service.updateDomain(mockUser, 10, { server_id: null });
+      expect(updateData().server_id).toBeNull();
+      mockPrismaService.domain.update.mockClear();
+      await service.updateDomain(mockUser, 10, { notes: 'only notes' });
+      expect(updateData().server_id).toBeUndefined();
     });
   });
 
@@ -252,6 +386,16 @@ describe('InfrastructureService - Servers', () => {
     domain: {
       count: jest.fn(),
     },
+    // Manual expiry changes: update + renewal history entry in one transaction
+    assetRenewal: {
+      create: jest.fn(async (args: any) => ({ id: 1, ...args.data })),
+    },
+    $transaction: jest.fn(async (fn: any): Promise<any> => fn(mockPrismaService)),
+    // Row lock for expiry changes (SELECT id, expiry_date ... FOR UPDATE), answered from the stored server
+    $queryRaw: jest.fn(async (sql: any): Promise<any[]> => {
+      const row = await mockPrismaService.server.findUnique({ where: { id: sql.values[0] } });
+      return row ? [{ id: row.id, expiry_date: row.expiry_date ?? null }] : [];
+    }),
   };
 
   const adminUser = { id: 1, role: { name: 'SUPER_ADMIN' } };
@@ -490,6 +634,58 @@ describe('InfrastructureService - Servers', () => {
       mockPrismaService.server.findUnique.mockResolvedValue(null);
 
       await expect(service.updateServer(adminUser, 999, {})).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('renewal period and manual expiry audit', () => {
+    const existing = { id: 7, name: 'Prod', purchase_date: null, expiry_date: new Date('2027-01-15') };
+    beforeEach(() => mockPrismaService.server.findUnique.mockResolvedValue(existing));
+
+    it('stores a validated default renewal period on create and update', async () => {
+      await service.createServer(adminUser, { name: 'New', renewal_period_value: '3', renewal_period_unit: 'Month' });
+      expect(mockPrismaService.server.create.mock.calls[0][0].data).toMatchObject({ renewal_period_value: 3, renewal_period_unit: 'month' });
+
+      await service.updateServer(adminUser, 7, { renewal_period_value: null, renewal_period_unit: null });
+      expect(mockPrismaService.server.update.mock.calls[0][0].data).toMatchObject({ renewal_period_value: null, renewal_period_unit: null });
+    });
+
+    it('leaves the renewal period unchanged when it is not sent', async () => {
+      await service.updateServer(adminUser, 7, { name: 'Prod' });
+      expect(mockPrismaService.server.update.mock.calls[0][0].data).not.toHaveProperty('renewal_period_value');
+    });
+
+    it('rejects an invalid renewal period with 400 and saves nothing', async () => {
+      await expect(service.updateServer(adminUser, 7, { renewal_period_value: 0, renewal_period_unit: 'year' })).rejects.toThrow(BadRequestException);
+      await expect(service.createServer(adminUser, { name: 'X', renewal_period_value: 1, renewal_period_unit: 'week' })).rejects.toThrow(BadRequestException);
+      expect(mockPrismaService.server.update).not.toHaveBeenCalled();
+      expect(mockPrismaService.server.create).not.toHaveBeenCalled();
+    });
+
+    it('records a manual expiry change in the renewal history, in the same transaction', async () => {
+      await service.updateServer({ ...adminUser, name: 'Admin User' }, 7, { expiry_date: '2028-01-15' });
+      expect(mockPrismaService.$transaction).toHaveBeenCalledTimes(1);
+      const entry = mockPrismaService.assetRenewal.create.mock.calls[0][0].data;
+      expect(entry).toMatchObject({ asset_type: 'server', asset_id: 7, server_id: 7, asset_name: 'Prod', event: 'manual_change', performed_by_id: 1, performed_by_name: 'Admin User' });
+      expect(dateKey(entry.previous_expiry_date)).toBe('2027-01-15');
+      expect(dateKey(entry.new_expiry_date)).toBe('2028-01-15');
+      expect(entry.cycle_key).toBeUndefined(); // a manual change never claims a renewal cycle
+    });
+
+    it('records clearing the expiry date', async () => {
+      await service.updateServer(adminUser, 7, { expiry_date: '' });
+      expect(mockPrismaService.assetRenewal.create.mock.calls[0][0].data).toMatchObject({ event: 'manual_change', new_expiry_date: null });
+    });
+
+    it('writes no history when the expiry date is not sent or unchanged', async () => {
+      await service.updateServer(adminUser, 7, { name: 'Renamed' });
+      await service.updateServer(adminUser, 7, { expiry_date: '2027-01-15' });
+      expect(mockPrismaService.assetRenewal.create).not.toHaveBeenCalled();
+      expect(mockPrismaService.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('if the history entry cannot be written, the update fails too', async () => {
+      mockPrismaService.assetRenewal.create.mockRejectedValueOnce(new Error('history write failed'));
+      await expect(service.updateServer(adminUser, 7, { expiry_date: '2028-01-15' })).rejects.toThrow('history write failed');
     });
   });
 });

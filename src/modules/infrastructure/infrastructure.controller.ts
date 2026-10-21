@@ -13,11 +13,20 @@ import {
   ParseIntPipe,
   HttpCode,
   HttpStatus,
+  Res,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
 import { InfrastructureService } from './infrastructure.service';
+import { AssetRenewalsService } from './asset-renewals.service';
+
+/** 201 for a new history entry, 200 when an idempotent retry returns the recorded one. */
+const renewalResponse = (res: Response, result: { replayed: boolean }) => {
+  res.status(result.replayed ? HttpStatus.OK : HttpStatus.CREATED);
+  return result;
+};
 
 // -------------------------------------------------------------
 // 0. SUMMARY (/api/v1/infrastructure/summary/) — overview card totals
@@ -41,7 +50,35 @@ export class InfrastructureSummaryController {
 @Controller('api/v1/infrastructure/servers')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 export class ServersController {
-  constructor(private readonly infraService: InfrastructureService) {}
+  constructor(
+    private readonly infraService: InfrastructureService,
+    private readonly renewals: AssetRenewalsService,
+  ) {}
+
+  // Renewals: confirmed renewal (extends the current expiry), failed attempt, history
+  @Post(':id/renew')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renew(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any, @Res({ passthrough: true }) res: Response) {
+    return renewalResponse(res, await this.renewals.renew(req.user, 'server', id, body));
+  }
+
+  @Post(':id/renewal-failed')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renewalFailed(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any, @Res({ passthrough: true }) res: Response) {
+    return renewalResponse(res, await this.renewals.recordFailure(req.user, 'server', id, body));
+  }
+
+  @Get(':id/renewals')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renewalHistory(@Param('id', ParseIntPipe) id: number) {
+    return this.renewals.getHistory('server', id);
+  }
+
+  @Get(':id/renewal-preview')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renewalPreview(@Param('id', ParseIntPipe) id: number, @Query() query: any) {
+    return this.renewals.preview('server', id, query);
+  }
 
   @Get()
   async findAll(@Request() req: any, @Query() query: any) {
@@ -85,7 +122,35 @@ export class ServersController {
 @Controller('api/v1/infrastructure/domains')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 export class DomainsController {
-  constructor(private readonly infraService: InfrastructureService) {}
+  constructor(
+    private readonly infraService: InfrastructureService,
+    private readonly renewals: AssetRenewalsService,
+  ) {}
+
+  // Renewals: confirmed renewal (extends the current expiry), failed attempt, history
+  @Post(':id/renew')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renew(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any, @Res({ passthrough: true }) res: Response) {
+    return renewalResponse(res, await this.renewals.renew(req.user, 'domain', id, body));
+  }
+
+  @Post(':id/renewal-failed')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renewalFailed(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any, @Res({ passthrough: true }) res: Response) {
+    return renewalResponse(res, await this.renewals.recordFailure(req.user, 'domain', id, body));
+  }
+
+  @Get(':id/renewals')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renewalHistory(@Param('id', ParseIntPipe) id: number) {
+    return this.renewals.getHistory('domain', id);
+  }
+
+  @Get(':id/renewal-preview')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async renewalPreview(@Param('id', ParseIntPipe) id: number, @Query() query: any) {
+    return this.renewals.preview('domain', id, query);
+  }
 
   @Get()
   async findAll(@Request() req: any, @Query() query: any) {

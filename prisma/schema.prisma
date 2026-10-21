@@ -163,6 +163,22 @@ enum ReminderType {
   followup
 }
 
+enum RenewalPeriodUnit {
+  month
+  year
+}
+
+enum InfrastructureAssetType {
+  domain
+  server
+}
+
+enum AssetRenewalEvent {
+  renewed
+  failed
+  manual_change
+}
+
 enum HRDocType {
   offer_letter
   appraisal_letter
@@ -364,8 +380,9 @@ model User {
   screenshots            Screenshot[]
   tracking_activity_logs TrackingActivityLog[]
 
-  reminders            Reminder[]
-  client_notifications ClientNotification[]
+  reminders                Reminder[]
+  performed_asset_renewals AssetRenewal[]       @relation("PerformedAssetRenewals")
+  client_notifications     ClientNotification[]
   created_backups      BackupRecord[]       @relation("CreatedBackups")
   created_expenses     Expense[]            @relation("CreatedExpenses")
   user_expenses        Expense[]            @relation("UserExpenses")
@@ -1028,8 +1045,20 @@ model Reminder {
   email_sent_reminder Boolean      @default(false)
   created_at          DateTime     @default(now()) @db.DateTime(3)
 
-  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  // The domain or server a renewal reminder is about (at most one: enforced by the
+  // reminders_single_asset_* triggers, as MySQL refuses CHECK constraints on these FK columns).
+  // Deleting the asset keeps the reminder and clears the link.
+  domain_id Int?
+  server_id Int?
 
+  user   User    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  domain Domain? @relation(fields: [domain_id], references: [id], onDelete: SetNull)
+  server Server? @relation(fields: [server_id], references: [id], onDelete: SetNull)
+
+  asset_renewals AssetRenewal[]
+
+  @@index([domain_id, is_completed])
+  @@index([server_id, is_completed])
   @@map("reminders")
 }
 
@@ -1049,7 +1078,13 @@ model Server {
   purchase_date DateTime? @db.Date
   expiry_date   DateTime? @db.Date
 
-  domains Domain[]
+  // Default renewal period (null: given with each renewal)
+  renewal_period_value Int?
+  renewal_period_unit  RenewalPeriodUnit?
+
+  domains        Domain[]
+  asset_renewals AssetRenewal[]
+  reminders      Reminder[]
 
   @@map("servers")
 }
@@ -1066,12 +1101,57 @@ model Domain {
   notes         String?   @db.Text
   created_at    DateTime  @default(now()) @db.DateTime(3)
 
+  // Default renewal period (null: 1 year)
+  renewal_period_value Int?
+  renewal_period_unit  RenewalPeriodUnit?
+
   project Project? @relation(fields: [project_id], references: [id], onDelete: Cascade)
   server  Server?  @relation(fields: [server_id], references: [id], onDelete: SetNull)
 
-  credentials WebsiteCredential[]
+  credentials    WebsiteCredential[]
+  asset_renewals AssetRenewal[]
+  reminders      Reminder[]
 
   @@map("domains")
+}
+
+// Renewal history of domains and servers: confirmed renewals, failed attempts and manual expiry
+// changes. asset_type/asset_id/asset_name and performed_by_name are copies, so the history stays
+// readable after the asset or user is deleted (the relations are then set to null).
+model AssetRenewal {
+  id                   Int                     @id @default(autoincrement())
+  asset_type           InfrastructureAssetType
+  asset_id             Int
+  asset_name           String                  @db.VarChar(255)
+  domain_id            Int?
+  server_id            Int?
+  event                AssetRenewalEvent
+  previous_expiry_date DateTime?               @db.Date
+  new_expiry_date      DateTime?               @db.Date
+  // Actual renewal date (or the date of a failed attempt)
+  renewal_date         DateTime?               @db.Date
+  period_value         Int?
+  period_unit          RenewalPeriodUnit?
+  cost                 Decimal?                @db.Decimal(10, 2)
+  payment_reference    String?                 @db.VarChar(255)
+  notes                String?                 @db.Text
+  failure_reason       String?                 @db.Text
+  reminder_id          Int?
+  performed_by_id      Int?
+  performed_by_name    String?                 @db.VarChar(150)
+  // Client-supplied key: a retried request returns the recorded result instead of renewing again
+  idempotency_key      String?                 @unique @db.VarChar(64)
+  // "<asset_type>:<asset_id>:<previous expiry>" on renewals only: one renewal per expiry cycle
+  cycle_key            String?                 @unique @db.VarChar(64)
+  created_at           DateTime                @default(now()) @db.DateTime(3)
+
+  domain       Domain?   @relation(fields: [domain_id], references: [id], onDelete: SetNull)
+  server       Server?   @relation(fields: [server_id], references: [id], onDelete: SetNull)
+  reminder     Reminder? @relation(fields: [reminder_id], references: [id], onDelete: SetNull)
+  performed_by User?     @relation("PerformedAssetRenewals", fields: [performed_by_id], references: [id], onDelete: SetNull)
+
+  @@index([asset_type, asset_id, created_at])
+  @@map("asset_renewals")
 }
 
 // Internal Grehasoft company credentials. Kept separate from client WebsiteCredential records.

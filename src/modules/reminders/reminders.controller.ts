@@ -15,13 +15,21 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../../core/guards/permissions.guard';
+import { Permissions } from '../../core/decorators/permissions.decorator';
 import { RemindersService } from './reminders.service';
+
+// Reminders are personal (the service scopes every query to the caller's own reminders). Every
+// route needs VIEW_REMINDERS or MANAGE_REMINDERS, the same permission the Reminders page and menu
+// require; holders of VIEW_REMINDERS keep managing their own reminders, as before.
+const REMINDER_ACCESS = ['VIEW_REMINDERS', 'MANAGE_REMINDERS'];
 
 // -------------------------------------------------------------
 // 1. REMINDERS CONTROLLER (/api/v1/reminders/)
 // -------------------------------------------------------------
 @Controller('api/v1/reminders')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@Permissions(...REMINDER_ACCESS)
 export class RemindersController {
   constructor(private readonly remindersService: RemindersService) {}
 
@@ -66,7 +74,8 @@ export class RemindersController {
 // 2. DASHBOARD SUMMARY CONTROLLER (/api/v1/dashboard-summary/)
 // -------------------------------------------------------------
 @Controller('api/v1/dashboard-summary')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@Permissions(...REMINDER_ACCESS)
 export class DashboardSummaryController {
   constructor(private readonly remindersService: RemindersService) {}
 

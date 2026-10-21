@@ -56,6 +56,7 @@ const ENTITY_DISPLAY_NAMES: Record<string, string> = {
   reminders: 'Reminders',
   servers: 'Servers',
   domains: 'Domains',
+  asset_renewals: 'Domain & Server Renewal History',
   website_credentials: 'Website Credentials',
   seo_website: 'SEO Websites',
   seo_keyword: 'SEO Keywords',
@@ -646,6 +647,7 @@ export class BackupsService {
     const reminders = await this.prisma.reminder.findMany();
     const servers = await this.prisma.server.findMany();
     const domains = await this.prisma.domain.findMany();
+    const assetRenewals = await this.prisma.assetRenewal.findMany();
     const websiteCredentials = await this.prisma.websiteCredential.findMany();
     const employees = await this.prisma.employee.findMany();
     const hrDocs = await this.prisma.hRDocument.findMany({ include: { employee: { include: { user: true } } } });
@@ -696,6 +698,9 @@ export class BackupsService {
     this.writeJsonSnapshot(dataDir, 'reminders', reminders, entityCounts);
     this.writeJsonSnapshot(dataDir, 'servers', servers, entityCounts);
     this.writeJsonSnapshot(dataDir, 'domains', domains, entityCounts);
+    // Restored with the rest of the database by the FULL (mysqldump) restore. Like servers and
+    // domains, it is in no backup category, so CATEGORY restores leave it untouched.
+    this.writeJsonSnapshot(dataDir, 'asset_renewals', assetRenewals, entityCounts);
     this.writeJsonSnapshot(dataDir, 'website_credentials', websiteCredentials, entityCounts);
     this.writeJsonSnapshot(dataDir, 'employees', employees, entityCounts);
     this.writeJsonSnapshot(dataDir, 'hr_documents', hrDocs, entityCounts);

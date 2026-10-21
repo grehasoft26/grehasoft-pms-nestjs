@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { InfrastructureService } from './infrastructure.service';
+import { AssetRenewalsService } from './asset-renewals.service';
 import {
   InfrastructureSummaryController,
   ServersController,
@@ -14,7 +15,7 @@ import {
     DomainsController,
     CredentialsController,
   ],
-  providers: [InfrastructureService],
-  exports: [InfrastructureService],
+  providers: [InfrastructureService, AssetRenewalsService],
+  exports: [InfrastructureService, AssetRenewalsService],
 })
 export class InfrastructureModule {}

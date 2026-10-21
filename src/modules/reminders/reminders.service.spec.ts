@@ -72,3 +72,49 @@ describe('RemindersService.getReminders', () => {
     expect(prisma.reminder.findMany.mock.calls[0][0]).not.toHaveProperty('take');
   });
 });
+
+describe('RemindersService due_date validation (create / update)', () => {
+  const build = () => {
+    const prisma = {
+      reminder: {
+        create: jest.fn(async (args: any) => ({ id: 1, ...args.data })),
+        findFirst: jest.fn(async () => ({ id: 5, user_id: 42 })),
+        update: jest.fn(async (args: any) => ({ id: 5, ...args.data })),
+      },
+    };
+    return { service: new RemindersService(prisma as any), prisma };
+  };
+
+  it('stores the due date as UTC midnight of the selected day', async () => {
+    const { service, prisma } = build();
+    await service.createReminder(user, { title: 'Renew', due_date: '2026-10-21' });
+    expect(prisma.reminder.create.mock.calls[0][0].data.due_date.toISOString()).toBe('2026-10-21T00:00:00.000Z');
+  });
+
+  it.each([undefined, null, ''])('refuses a missing due date (%p) with 400 instead of a database error', async (due_date) => {
+    const { service, prisma } = build();
+    await expect(service.createReminder(user, { title: 'Renew', due_date })).rejects.toThrow('Due date is required.');
+    expect(prisma.reminder.create).not.toHaveBeenCalled();
+  });
+
+  it.each(['soon', '2026-02-30', '2026-13-01'])('refuses the invalid due date %p on create and update', async (due_date) => {
+    const { service, prisma } = build();
+    await expect(service.createReminder(user, { title: 'Renew', due_date })).rejects.toThrow('Due date must be a valid date (YYYY-MM-DD).');
+    await expect(service.updateReminder(user, 5, { due_date })).rejects.toThrow('Due date must be a valid date (YYYY-MM-DD).');
+    expect(prisma.reminder.create).not.toHaveBeenCalled();
+    expect(prisma.reminder.update).not.toHaveBeenCalled();
+  });
+
+  it('completing a reminder (no due_date sent) leaves the due date unchanged', async () => {
+    const { service, prisma } = build();
+    await service.updateReminder(user, 5, { is_completed: true });
+    const data = prisma.reminder.update.mock.calls[0][0].data;
+    expect(data.due_date).toBeUndefined();
+    expect(data.is_completed).toBe(true);
+  });
+
+  it('an update cannot clear the (required) due date', async () => {
+    const { service } = build();
+    await expect(service.updateReminder(user, 5, { due_date: null })).rejects.toThrow('Due date is required.');
+  });
+});
