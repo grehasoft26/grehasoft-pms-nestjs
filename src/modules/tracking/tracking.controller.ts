@@ -13,10 +13,12 @@ import {
   ParseIntPipe,
   HttpCode,
   HttpStatus,
+  ForbiddenException,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { getActiveRolePermissions, isSuperAdmin } from '../../core/utils/role-access.util';
 import { TrackingService } from './tracking.service';
 
 // -------------------------------------------------------------
@@ -53,9 +55,14 @@ export class TrackingController {
     return this.trackingService.getEmployeeStatus();
   }
 
+  // Employees may read their own status (the desktop tracker reads productive_time here);
+  // other users' status needs MANAGE_SETTINGS, so no static @Permissions on this route
   @Get('employee-status/:userId')
-  @Permissions('MANAGE_SETTINGS')
-  async getSingleEmployeeStatus(@Param('userId', ParseIntPipe) userId: number) {
+  async getSingleEmployeeStatus(@Request() req: any, @Param('userId', ParseIntPipe) userId: number) {
+    const isSelf = Number(req.user?.id) === userId;
+    if (!isSelf && !isSuperAdmin(req.user) && !getActiveRolePermissions(req.user).includes('MANAGE_SETTINGS')) {
+      throw new ForbiddenException('You do not have permission to perform this action.');
+    }
     return this.trackingService.getEmployeeStatus(userId);
   }
 
