@@ -284,8 +284,9 @@ describe('InfrastructureService - Domains', () => {
     });
 
     it('server_id sets the server', async () => {
-      await service.updateDomain(mockUser, 10, { server_id: 6, provider: 'Namecheap', notes: 'x' });
-      expect(updateData()).toMatchObject({ server_id: 6, provider: 'Namecheap', notes: 'x' });
+      // (Providers are a fixed list since the Domain Status/Provider change)
+      await service.updateDomain(mockUser, 10, { server_id: 6, provider: 'Grehasoft Hostinger 1', notes: 'x' });
+      expect(updateData()).toMatchObject({ server_id: 6, provider: 'Grehasoft Hostinger 1', notes: 'x' });
     });
 
     it('server_id null clears it; not sent leaves it unchanged', async () => {

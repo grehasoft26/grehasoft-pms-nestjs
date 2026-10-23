@@ -163,6 +163,11 @@ enum ReminderType {
   followup
 }
 
+enum DomainStatus {
+  active
+  expired
+}
+
 enum RenewalPeriodUnit {
   month
   year
@@ -1094,6 +1099,8 @@ model Domain {
   project_id    Int?
   domain_name   String    @db.VarChar(255)
   provider      String?   @db.VarChar(255)
+  // Set by users (Active/Expired); not derived from expiry_date
+  status        DomainStatus @default(active)
   purchase_date DateTime? @db.Date
   expiry_date   DateTime? @db.Date
   renewal_cost  Decimal?  @db.Decimal(10, 2)

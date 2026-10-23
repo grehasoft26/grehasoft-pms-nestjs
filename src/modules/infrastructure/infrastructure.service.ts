@@ -6,6 +6,7 @@ import * as crypto from 'crypto';
 import { expiryFilterWhere, expiryOrderBy, parseToday, searchTerm } from './infrastructure-list.util';
 import { parseDateOnly, toDateKey } from '../../core/utils/date-only.util';
 import { RenewalPeriod, parseRenewalPeriod } from './renewal-period.util';
+import { domainStatusFilter, parseDomainProvider, parseDomainStatus } from './domain-options';
 import { lockAssetExpiry, recordManualExpiryChange, staleExpiryError } from './asset-renewals.service';
 
 /** Column values for a parsed renewal period: undefined (not sent) leaves both unchanged. */
@@ -306,14 +307,17 @@ export class InfrastructureService {
   // -------------------------------------------------------------
   async getDomains(
     user: any,
-    query: { page?: string; limit?: string; search?: string; all?: string; ordering?: string; expiry?: string; today?: string } | string = {},
+    query: { page?: string; limit?: string; search?: string; all?: string; ordering?: string; expiry?: string; today?: string; status?: string } | string = {},
   ) {
-    const queryObj: { page?: string; limit?: string; search?: string; all?: string; ordering?: string; expiry?: string; today?: string } =
+    const queryObj: { page?: string; limit?: string; search?: string; all?: string; ordering?: string; expiry?: string; today?: string; status?: string } =
       typeof query === 'string' ? { search: query } : query;
     const where: any = {};
     // Validated before any query (400 on bad values)
     const expiryWhere = expiryFilterWhere(queryObj.expiry, parseToday(queryObj.today));
     const orderBy = expiryOrderBy(queryObj.ordering);
+    // The stored status the user chose (not derived from the expiry date)
+    const status = domainStatusFilter(queryObj.status);
+    if (status) where.status = status;
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
@@ -485,12 +489,16 @@ export class InfrastructureService {
     this.validateDateOrder(purchaseDate, expiryDate);
     const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
     const domainName = this.normalizeDomainName(data.domain_name);
+    // Not sent (older clients): Active, the column default
+    const status = data.status === undefined || data.status === null || data.status === '' ? 'active' : parseDomainStatus(data.status);
+    const provider = parseDomainProvider(data.provider);
 
     const domain = await this.writeUniqueDomainName(domainName, undefined, (tx) => tx.domain.create({
       data: {
         project_id: this.parseOptionalProjectId(data) ?? null,
         domain_name: domainName,
-        provider: data.provider || '',
+        provider,
+        status,
         purchase_date: purchaseDate,
         expiry_date: expiryDate,
         renewal_cost: data.renewal_cost ? Number(data.renewal_cost) : null,
@@ -528,13 +536,17 @@ export class InfrastructureService {
     // spacing/case) never fails, even for a record that already has a duplicate
     const domainName = data.domain_name !== undefined ? this.normalizeDomainName(data.domain_name) : undefined;
     const renamed = domainName !== undefined && domainName.toLowerCase() !== String(existing.domain_name).trim().toLowerCase();
+    // Not sent: unchanged. A provider saved before the list existed may be re-sent as it is
+    const status = data.status !== undefined ? parseDomainStatus(data.status) : undefined;
+    const provider = data.provider !== undefined ? parseDomainProvider(data.provider, existing.provider) : undefined;
 
     const updateRow = (client: any) => client.domain.update({
       where: { id },
       data: {
         project_id: this.parseOptionalProjectId(data),
         domain_name: domainName,
-        provider: data.provider,
+        provider,
+        status,
         purchase_date: purchaseDate,
         // Not written unless it is being changed (writing back the value read above could undo a
         // renewal committed meanwhile)
