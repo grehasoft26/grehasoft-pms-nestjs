@@ -211,11 +211,17 @@ export class SeoReportsService {
     if (query.report_month) where.report_month = query.report_month;
     if (query.status && !this.isClient(user)) where.status = query.status;
 
-    if (query.search) {
+    // "Search title, client, domain...": the list shows the company (or client) name and the domain
+    // (or website name). Partial and case-insensitive through the columns' *_ci collation; the
+    // client scope above still applies.
+    const search = String(query.search ?? '').trim();
+    if (search) {
       where.OR = [
-        { report_title: { contains: query.search } },
-        { website: { website_name: { contains: query.search } } },
-        { client: { name: { contains: query.search } } },
+        { report_title: { contains: search } },
+        { website: { website_name: { contains: search } } },
+        { website: { domain_url: { contains: search } } },
+        { client: { name: { contains: search } } },
+        { client: { company_name: { contains: search } } },
       ];
     }
 

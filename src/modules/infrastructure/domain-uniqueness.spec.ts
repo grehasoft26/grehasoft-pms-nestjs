@@ -5,7 +5,7 @@ import { PrismaService } from '../../core/prisma.service';
 
 /**
  * Domain names are unique ignoring case and surrounding spaces. The in-memory fake evaluates the
- * service's duplicate-check SQL (LOWER(TRIM(domain_name)) = ? [AND id <> ?] [FOR UPDATE]) and
+ * service's duplicate-check SQL (LOWER(TRIM(TRAILING '.' FROM TRIM(domain_name))) = ? [AND id <> ?] [FOR UPDATE]) and
  * models FOR UPDATE as a lock held until the transaction ends, as InnoDB does (verified against
  * the local MySQL: a second locking read waits for the first transaction).
  */
@@ -183,11 +183,12 @@ describe('Domain name uniqueness', () => {
       await service.createDomain(admin, { domain_name: 'locked.example' });
       expect(fake.prisma.$transaction).toHaveBeenCalledTimes(1);
       expect(fake.txQueries).toHaveLength(1);
-      expect(fake.txQueries[0]).toMatch(/^SELECT id FROM domains WHERE LOWER\(TRIM\(domain_name\)\) = \? FOR UPDATE$/);
+      // (Stored names are compared without a trailing dot too, see duplicate-detection.spec)
+      expect(fake.txQueries[0]).toMatch(/^SELECT id FROM domains WHERE LOWER\(TRIM\(TRAILING '\.' FROM TRIM\(domain_name\)\)\) = \? FOR UPDATE$/);
       // the insert ran on the transaction client, not outside the transaction
       expect(fake.prisma.domain.create).not.toHaveBeenCalled();
       await service.updateDomain(admin, 2, { domain_name: 'renamed.example' });
-      expect(fake.txQueries[1]).toMatch(/LOWER\(TRIM\(domain_name\)\) = \? AND id <> \? FOR UPDATE$/);
+      expect(fake.txQueries[1]).toMatch(/LOWER\(TRIM\(TRAILING '\.' FROM TRIM\(domain_name\)\)\) = \? AND id <> \? FOR UPDATE$/);
     });
 
     it('a deadlock between concurrent saves is retried; a UNIQUE violation maps to 409', async () => {

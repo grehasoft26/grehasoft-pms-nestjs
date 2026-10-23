@@ -1,7 +1,13 @@
-import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import { computeInvoiceFinancials, dateOnlyKey } from '../invoices/invoice-status';
 import { resolveClientForUser } from '../../core/utils/client-scope.util';
+import { parseDateOnly } from '../../core/utils/date-only.util';
+
+/** Document types the vault page filters by (ClientDocumentsPage). */
+export const CLIENT_DOCUMENT_TYPES = ['proposal', 'invoice', 'taskfile', 'seo_report'] as const;
+/** The vault page shows 10 documents per page. */
+const CLIENT_DOCUMENTS_PAGE_SIZE = 10;
 
 @Injectable()
 export class ClientPortalService {
@@ -258,22 +264,80 @@ export class ClientPortalService {
   // -------------------------------------------------------------
   // 4. CLIENT DOCUMENTS LIST
   // -------------------------------------------------------------
-  async getClientDocuments(user: any, query: any) {
+  /**
+   * Document vault list (GET /dashboard/documents), paginated like the page expects
+   * ({ count, next, previous, results }, 10 per page). Filters, all combined:
+   * - search: file name (original or stored) or project name; partial and case-insensitive through
+   *   the columns' *_ci collation;
+   * - type: the page's types; the vault holds task deliverables only ("taskfile"), so the other
+   *   types have no documents here yet;
+   * - start_date / end_date: inclusive calendar days of the upload date shown (UTC).
+   * Always limited to the projects of the user's own client (no client or project id is read);
+   * soft-deleted projects, tasks and files are not listed.
+   */
+  async getClientDocuments(user: any, query: any = {}) {
     const client = await this.resolveAssociatedClient(user);
 
+    // Validated before any document query (400 on bad values)
+    const type = String(query.type ?? '').trim();
+    if (type && !(CLIENT_DOCUMENT_TYPES as readonly string[]).includes(type)) {
+      throw new BadRequestException(`type must be one of: ${CLIENT_DOCUMENT_TYPES.join(', ')}.`);
+    }
+    const start = parseDateOnly(query.start_date || undefined, 'Start date');
+    const end = parseDateOnly(query.end_date || undefined, 'End date');
+    if (start && end && start > end) throw new BadRequestException('Start date cannot be after end date.');
+    const page = Math.max(1, Math.floor(Number(query.page)) || 1);
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(query.limit)) || CLIENT_DOCUMENTS_PAGE_SIZE));
+    const search = String(query.search ?? '').trim();
+
+    const empty = { count: 0, next: null, previous: null, results: [] };
+    if (type && type !== 'taskfile') return empty;
+
+    // Soft-deleted projects, tasks and files are left out, like every other task-file read
     const projects = await this.prisma.project.findMany({
-      where: { client_id: client.id },
-      select: { id: true, name: true },
+      where: { client_id: client.id, deleted_at: null },
+      select: { id: true },
     });
     const projectIds = projects.map((p) => p.id);
+    if (projectIds.length === 0) return empty;
 
-    const taskFiles = await this.prisma.taskFile.findMany({
-      where: { task: { project_id: { in: projectIds } } },
-      include: { task: { include: { project: true } } },
-      orderBy: { uploaded_at: 'desc' },
-    });
+    const where: any = { deleted_at: null, task: { deleted_at: null, project_id: { in: projectIds } } };
+    if (search) {
+      where.OR = [
+        { file_path: { contains: search } },
+        { file: { contains: search } },
+        { task: { project: { name: { contains: search } } } },
+      ];
+    }
+    if (start || end) {
+      where.uploaded_at = {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lt: new Date(end.getTime() + 24 * 60 * 60 * 1000) } : {}),
+      };
+    }
 
-    return taskFiles.map((tf) => ({
+    const [count, taskFiles] = await Promise.all([
+      this.prisma.taskFile.count({ where }),
+      this.prisma.taskFile.findMany({
+        where,
+        include: { task: { include: { project: true } } },
+        orderBy: [{ uploaded_at: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+    ]);
+
+    const link = (p: number) => `/api/v1/dashboard/documents/?page=${p}`;
+    return {
+      count,
+      next: page * limit < count ? link(page + 1) : null,
+      previous: page > 1 ? link(page - 1) : null,
+      results: taskFiles.map((tf) => this.formatTaskFileDocument(tf)),
+    };
+  }
+
+  private formatTaskFileDocument(tf: any) {
+    return {
       id: `taskfile-${tf.id}`,
       name: tf.file ? tf.file.split('/').pop() : 'File',
       type: 'Task File',
@@ -282,6 +346,6 @@ export class ClientPortalService {
       url: tf.file_path || tf.file,
       download_url: tf.file_path || tf.file,
       file_size: 'Unknown',
-    }));
+    };
   }
 }

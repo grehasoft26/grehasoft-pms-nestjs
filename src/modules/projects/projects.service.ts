@@ -60,12 +60,15 @@ export class ProjectsService {
       where.client_id = Number(query.client);
     }
 
-    if (query.search) {
+    // Partial, case-insensitive through the columns' *_ci collation (Prisma's `mode: 'insensitive'`
+    // is not supported on MySQL and made every search fail with a 500)
+    const search = String(query.search ?? '').trim();
+    if (search) {
       where.OR = [
-        { name: { contains: query.search, mode: 'insensitive' } },
-        { description: { contains: query.search, mode: 'insensitive' } },
-        { client: { name: { contains: query.search, mode: 'insensitive' } } },
-        { client: { company_name: { contains: query.search, mode: 'insensitive' } } },
+        { name: { contains: search } },
+        { description: { contains: search } },
+        { client: { name: { contains: search } } },
+        { client: { company_name: { contains: search } } },
       ];
     }
 

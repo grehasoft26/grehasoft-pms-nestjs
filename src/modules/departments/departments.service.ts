@@ -20,8 +20,11 @@ export class DepartmentsService {
   async findAll(query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
     const where: any = { deleted_at: null };
 
-    if (query.search) {
-      where.name = { contains: query.search, mode: 'insensitive' };
+    // Partial, case-insensitive through the column's *_ci collation (Prisma's `mode: 'insensitive'`
+    // is not supported on MySQL and made every search fail with a 500)
+    const search = String(query.search ?? '').trim();
+    if (search) {
+      where.name = { contains: search };
     }
 
     if (query.all === 'true') {

@@ -83,6 +83,8 @@ describe('InfrastructureService list sorting, search and expiry filters', () => 
     server: { findMany: jest.fn(), count: jest.fn() },
     domain: { findMany: jest.fn(), count: jest.fn() },
     projectMember: { findMany: jest.fn() },
+    // Server names ignoring spaces (server-name-search.spec); no such matches here
+    $queryRaw: jest.fn(),
   };
   const admin = { id: 1, role: { name: 'SUPER_ADMIN' } };
   const staff = { id: 2, role: { name: 'DEVELOPER' } };
@@ -98,6 +100,7 @@ describe('InfrastructureService list sorting, search and expiry filters', () => 
     prisma.server.count.mockResolvedValue(12);
     prisma.domain.findMany.mockResolvedValue([]);
     prisma.domain.count.mockResolvedValue(12);
+    prisma.$queryRaw.mockResolvedValue([]);
   });
 
   describe('servers', () => {
@@ -110,6 +113,7 @@ describe('InfrastructureService list sorting, search and expiry filters', () => 
         { notes: { contains: 'Prod' } },
         { owner: { contains: 'Prod' } },
         { ip_address: { contains: 'Prod' } },
+        { server_ip: { contains: 'Prod' } },
       ]);
       const json = JSON.stringify(where);
       expect(json).not.toContain('mode');
@@ -137,7 +141,7 @@ describe('InfrastructureService list sorting, search and expiry filters', () => 
       const { where } = lastFindMany('server');
       expect(where.domains).toEqual({ some: { project_id: { in: [3] } } });
       expect(where.AND).toEqual([{ expiry_date: { lt: day('2026-10-19') } }]);
-      expect(where.OR).toHaveLength(5);
+      expect(where.OR).toHaveLength(6); // name, provider, notes, owner, ip_address, server_ip
     });
 
     it('bad ordering, filter or date values are rejected before any query', async () => {

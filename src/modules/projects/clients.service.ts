@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException, InternalServerErrorException } from '@nestjs/common';
 import * as crypto from 'crypto';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../core/prisma.service';
 import { PasswordUtil } from '../../core/utils/password.util';
 
@@ -44,6 +45,45 @@ export class ClientsService {
     if (existing) {
       throw new BadRequestException({ company_name: [DUPLICATE_COMPANY_MESSAGE] });
     }
+  }
+
+  /**
+   * GET /clients/check-duplicates for the Add/Edit Client form; booleans only. Active (not deleted)
+   * clients other than `exclude`:
+   * - company_name: the same rule create/update enforce (that duplicate is rejected on save);
+   * - email / gst_no: same value ignoring case and surrounding spaces; warnings only, never a
+   *   reason to reject a save.
+   */
+  async checkDuplicates(query: { company_name?: unknown; email?: unknown; gst_no?: unknown; exclude?: unknown }) {
+    const exclude = query.exclude === undefined || query.exclude === null || query.exclude === '' ? undefined : Number(query.exclude);
+    if (exclude !== undefined && (!Number.isInteger(exclude) || exclude <= 0)) {
+      throw new BadRequestException({ exclude: ['exclude must be a client id.'] });
+    }
+    const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+    const companyName = text(query.company_name);
+    const email = text(query.email).toLowerCase();
+    const gstNo = text(query.gst_no).toUpperCase();
+    const notSelf = exclude ? Prisma.sql` AND id <> ${exclude}` : Prisma.empty;
+
+    const [company, byEmail, byGst] = await Promise.all([
+      companyName
+        ? this.prisma.client.findFirst({
+            where: { company_name: companyName, deleted_at: null, ...(exclude ? { id: { not: exclude } } : {}) },
+            select: { id: true },
+          })
+        : null,
+      email
+        ? this.prisma.$queryRaw<Array<{ id: number }>>(
+            Prisma.sql`SELECT id FROM clients WHERE deleted_at IS NULL AND LOWER(TRIM(email)) = ${email}${notSelf} LIMIT 1`,
+          )
+        : [],
+      gstNo
+        ? this.prisma.$queryRaw<Array<{ id: number }>>(
+            Prisma.sql`SELECT id FROM clients WHERE deleted_at IS NULL AND UPPER(TRIM(gst_no)) = ${gstNo}${notSelf} LIMIT 1`,
+          )
+        : [],
+    ]);
+    return { company_name: !!company, email: byEmail.length > 0, gst_no: byGst.length > 0 };
   }
 
   private async withCompanyNameLock<T>(companyName: string, fn: () => Promise<T>): Promise<T> {

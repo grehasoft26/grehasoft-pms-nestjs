@@ -78,3 +78,17 @@ export const searchTerm = (search: unknown): string | undefined => {
   const term = String(search ?? '').trim();
   return term ? term : undefined;
 };
+
+/**
+ * LIKE pattern for a name compared with its spaces removed ("server1" finds "server 1" and the
+ * other way round), for use as `LIKE <pattern> ESCAPE '!'`: the term without whitespace,
+ * lower-case, with `%`, `_` and `!` escaped by `!` so they match literally (with ESCAPE '!' a
+ * backslash is an ordinary character). Undefined when fewer than 2 characters remain.
+ */
+export const compactLikePattern = (search: unknown): string | undefined => {
+  const compact = String(search ?? '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+  if (compact.length < 2) return undefined;
+  return `%${compact.replace(/[!%_]/g, '!$&')}%`;
+};

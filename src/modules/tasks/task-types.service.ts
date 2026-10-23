@@ -8,10 +8,13 @@ export class TaskTypesService {
   async findAll(query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
     const where: any = { deleted_at: null };
 
-    if (query.search) {
+    // Partial, case-insensitive through the columns' *_ci collation (Prisma's `mode: 'insensitive'`
+    // is not supported on MySQL and made every search fail with a 500)
+    const search = String(query.search ?? '').trim();
+    if (search) {
       where.OR = [
-        { name: { contains: query.search, mode: 'insensitive' } },
-        { description: { contains: query.search, mode: 'insensitive' } },
+        { name: { contains: search } },
+        { description: { contains: search } },
       ];
     }
 

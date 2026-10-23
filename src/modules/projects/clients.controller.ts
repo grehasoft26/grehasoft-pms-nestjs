@@ -24,6 +24,14 @@ export class ClientsController {
     return this.clientsService.getDashboardStats(user);
   }
 
+  // Add/Edit Client form: { company_name, email, gst_no } booleans. Same permission as saving a
+  // client; not open to client portal users (no @ClientAccess).
+  @Get('check-duplicates')
+  @Permissions('VIEW_CLIENTS')
+  async checkDuplicates(@Query() query: any) {
+    return this.clientsService.checkDuplicates(query);
+  }
+
   @Post(':id/create-portal-account')
   @Permissions('VIEW_CLIENTS')
   async createPortalAccount(

@@ -1418,6 +1418,14 @@ export class BackupsService {
     };
   }
 
+  /** The values of a (sanitized) snapshot row as text, at any depth (nested related records too); no field names. */
+  private recordValues(value: unknown, depth = 0): string[] {
+    if (depth > 8 || value === null || value === undefined) return [];
+    if (Array.isArray(value)) return value.flatMap((item) => this.recordValues(item, depth + 1));
+    if (typeof value === 'object') return Object.values(value as object).flatMap((item) => this.recordValues(item, depth + 1));
+    return [String(value)];
+  }
+
   /**
    * Explorer Entity Record List API (Paginated & Searchable)
    */
@@ -1440,13 +1448,20 @@ export class BackupsService {
       throw new InternalServerErrorException(`Failed to parse entity "${entityName}" snapshot data.`);
     }
 
-    if (query.search) {
-      const searchLower = query.search.toLowerCase();
-      records = records.filter((r) => JSON.stringify(r).toLowerCase().includes(searchLower));
+    // Values only (field names, quotes and braces of the JSON never match), partial, ignoring case
+    const search = String(query.search ?? '').trim().toLowerCase();
+    if (search) {
+      records = records.filter((r) => this.recordValues(r).some((value) => value.toLowerCase().includes(search)));
     }
 
-    const page = Math.max(1, parseInt(query.page || '1', 10));
-    const limit = Math.max(1, parseInt(query.limit || '10', 10));
+    // Invalid values fall back to the defaults (a NaN page/limit returned an empty page); at most
+    // 100 records per page (the explorer offers 10, 20 or 50)
+    const parsedPage = parseInt(String(query.page ?? ''), 10);
+    const parsedLimit = parseInt(String(query.limit ?? ''), 10);
+    const page = Number.isFinite(parsedPage) ? Math.max(1, parsedPage) : 1;
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.min(100, Math.max(1, parsedLimit))
+      : 10;
 
     const totalCount = records.length;
     const skip = (page - 1) * limit;

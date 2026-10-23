@@ -2,6 +2,21 @@ import { Injectable, ForbiddenException, NotFoundException, BadRequestException 
 import { PrismaService } from '../../core/prisma.service';
 import * as crypto from 'crypto';
 
+/**
+ * `ordering` values of the SEO Tasks list (the page's sort menu); anything else is the default,
+ * newest first. Priority is an enum declared low, medium, high, which MySQL sorts in that order,
+ * so descending puts high first. The id tie-breaker keeps paging stable.
+ */
+const SEO_TASK_ORDERING: Record<string, any[]> = {
+  newest: [{ created_at: 'desc' }, { id: 'desc' }],
+  oldest: [{ created_at: 'asc' }, { id: 'asc' }],
+  due_date: [{ due_date: 'asc' }, { id: 'desc' }],
+  priority: [{ priority: 'desc' }, { due_date: 'asc' }, { id: 'desc' }],
+  title: [{ title: 'asc' }, { id: 'desc' }],
+};
+/** User columns returned with SEO tasks (labels only, no contact or HR details). */
+const SEO_TASK_USER_SELECT = { id: true, name: true, username: true } as const;
+
 @Injectable()
 export class SeoService {
   constructor(private readonly prisma: PrismaService) {}
@@ -228,8 +243,11 @@ export class SeoService {
     const websiteId = query.website || query.website_id;
     if (websiteId) where.website_id = Number(websiteId);
 
-    if (query.search) {
-      where.keyword = { contains: query.search, mode: 'insensitive' };
+    // Partial, case-insensitive through the column's *_ci collation (Prisma's `mode: 'insensitive'`
+    // is not supported on MySQL and made every search fail with a 500)
+    const search = String(query.search ?? '').trim();
+    if (search) {
+      where.keyword = { contains: search };
     }
 
     if (this.isClient(user)) {
@@ -952,21 +970,33 @@ export class SeoService {
   // 7. SEO TASKS
   // -------------------------------------------------------------
   async getTasks(user: any, query: any) {
-    const where: any = {};
-    if (this.isExecutive(user)) {
-      where.assigned_executive_id = user.id;
-    }
+    // Mandatory access scope, for the list and the stats alike: an SEO executive only ever sees
+    // their own tasks, whatever the request parameters
+    const scope: any = this.isExecutive(user)
+      ? { assigned_executive_id: user.id }
+      : {};
+    const where: any = { ...scope };
 
     if (query.website) where.website_id = Number(query.website);
-    if (query.executive) where.assigned_executive_id = Number(query.executive);
+    // Filtering by executive is for roles that may see other executives' tasks (the same rule as
+    // the daily logs); it can never replace an executive's own scope
+    if (query.executive && !this.isExecutive(user) && !this.isClient(user)) {
+      where.assigned_executive_id = Number(query.executive);
+    }
     if (query.priority) where.priority = query.priority;
     if (query.activity_type) where.activity_type_id = Number(query.activity_type);
 
-    if (query.search) {
+    // "Search by task title, website, or executive...": the executive is shown as name (or
+    // username). Partial and case-insensitive through the columns' *_ci collation; an executive's
+    // own-tasks restriction above still applies.
+    const search = String(query.search ?? '').trim();
+    if (search) {
       where.OR = [
-        { title: { contains: query.search } },
-        { description: { contains: query.search } },
-        { website: { website_name: { contains: query.search } } },
+        { title: { contains: search } },
+        { description: { contains: search } },
+        { website: { website_name: { contains: search } } },
+        { assigned_executive: { name: { contains: search } } },
+        { assigned_executive: { username: { contains: search } } },
       ];
     }
 
@@ -984,25 +1014,33 @@ export class SeoService {
 
     const page = Number(query.page || 1);
     const pageSize = Number(query.page_size || 10);
+    // Own keys only: "constructor" and the like fall back to the default too
+    const orderBy = Object.prototype.hasOwnProperty.call(
+      SEO_TASK_ORDERING,
+      query.ordering,
+    )
+      ? SEO_TASK_ORDERING[query.ordering]
+      : SEO_TASK_ORDERING.newest;
 
     const [tasks, total] = await Promise.all([
       this.prisma.sEOTask.findMany({
         where,
         include: {
           website: true,
-          assigned_executive: true,
-          created_by: true,
+          assigned_executive: { select: SEO_TASK_USER_SELECT },
+          created_by: { select: SEO_TASK_USER_SELECT },
           activity_type: true,
           timeline: { orderBy: { event_time: 'asc' } },
         },
         skip: (page - 1) * pageSize,
         take: pageSize,
-        orderBy: { created_at: 'desc' },
+        orderBy,
       }),
       this.prisma.sEOTask.count({ where }),
     ]);
 
-    const stats_qs: any = { ...(where.status ? {} : where) };
+    // With a status filter the stats cover every status, but never beyond the caller's scope
+    const stats_qs: any = { ...(where.status ? scope : where) };
     const statsTotal = await this.prisma.sEOTask.count({ where: stats_qs });
     const pending = await this.prisma.sEOTask.count({ where: { ...stats_qs, status: 'pending' } });
     const in_progress = await this.prisma.sEOTask.count({ where: { ...stats_qs, status: 'in_progress' } });
@@ -1016,7 +1054,14 @@ export class SeoService {
       count: total,
       next: page * pageSize < total ? `/api/v1/seo-tasks/?page=${page + 1}` : null,
       previous: page > 1 ? `/api/v1/seo-tasks/?page=${page - 1}` : null,
-      results: tasks,
+      // The labels the task cards show (executive shown by name, or username when it has none)
+      results: tasks.map((t: any) => ({
+        ...t,
+        assigned_executive_name:
+          t.assigned_executive?.name || t.assigned_executive?.username || '',
+        website_name: t.website?.website_name ?? '',
+        activity_type_name: t.activity_type?.name ?? null,
+      })),
       stats: {
         total: statsTotal,
         pending,

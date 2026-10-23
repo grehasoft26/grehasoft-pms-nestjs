@@ -3,7 +3,13 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../core/prisma.service';
 import { isSuperAdmin } from '../../core/utils/role-access.util';
 import * as crypto from 'crypto';
-import { expiryFilterWhere, expiryOrderBy, parseToday, searchTerm } from './infrastructure-list.util';
+import {
+  compactLikePattern,
+  expiryFilterWhere,
+  expiryOrderBy,
+  parseToday,
+  searchTerm,
+} from './infrastructure-list.util';
 import { parseDateOnly, toDateKey } from '../../core/utils/date-only.util';
 import { RenewalPeriod, parseRenewalPeriod } from './renewal-period.util';
 import { domainStatusFilter, parseDomainProvider, parseDomainStatus } from './domain-options';
@@ -14,6 +20,9 @@ const renewalPeriodData = (period: RenewalPeriod | null | undefined) =>
   period === undefined
     ? {}
     : { renewal_period_value: period?.value ?? null, renewal_period_unit: period?.unit ?? null };
+
+/** Server columns the form suggestions may show (never username or password). */
+const SERVER_SUMMARY_SELECT = { id: true, name: true, provider: true, owner: true, ip_address: true, server_ip: true } as const;
 
 @Injectable()
 export class InfrastructureService {
@@ -78,6 +87,8 @@ export class InfrastructureService {
     const orderBy = expiryOrderBy(query.ordering);
     // fields=expiry: unpaginated list of id/name/expiry_date for expiry notifications (no credentials)
     const expiryOnly = query.fields === 'expiry';
+    // fields=summary: the form suggestions; only these columns are read (no username or password)
+    const summary: { select?: typeof SERVER_SUMMARY_SELECT } = query.fields === 'summary' ? { select: SERVER_SUMMARY_SELECT } : {};
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
@@ -96,6 +107,17 @@ export class InfrastructureService {
     // (username, password) are never searched.
     const search = searchTerm(query.search);
     if (search) {
+      // The name also matches with spaces ignored ("server1" finds "server 1"). Prisma cannot
+      // compare REPLACE(name), so the ids come from a parameterized query and are added as one
+      // more alternative: the project scope above still applies to them, and only ids are read.
+      const namePattern = compactLikePattern(search);
+      const compactNameIds = namePattern
+        ? (
+            await this.prisma.$queryRaw<Array<{ id: number }>>(
+              Prisma.sql`SELECT id FROM servers WHERE REPLACE(LOWER(name), ' ', '') LIKE ${namePattern} ESCAPE '!'`,
+            )
+          ).map((row) => Number(row.id))
+        : [];
       where.OR = [
         { name: { contains: search } },
         { provider: { contains: search } },
@@ -103,6 +125,9 @@ export class InfrastructureService {
         // also matched by the page's previous (client-side) search
         { owner: { contains: search } },
         { ip_address: { contains: search } },
+        // A server's IP may be stored in server_ip instead (set through the API, as in the original app)
+        { server_ip: { contains: search } },
+        ...(compactNameIds.length ? [{ id: { in: compactNameIds } }] : []),
       ];
     }
     if (expiryWhere) where.AND = [expiryWhere];
@@ -117,13 +142,15 @@ export class InfrastructureService {
     }
 
     const isAdm = this.isAdmin(user);
+    const shape = (s: any) => (query.fields === 'summary' ? s : this.formatServer(s, isAdm));
 
     if (query.all === 'true') {
       const servers = await this.prisma.server.findMany({
         where,
         orderBy: { name: 'asc' },
+        ...summary,
       });
-      return servers.map((s) => this.formatServer(s, isAdm));
+      return servers.map(shape);
     }
 
     const pageNum = Math.max(1, Number(query.page) || 1);
@@ -137,14 +164,38 @@ export class InfrastructureService {
       orderBy,
       skip,
       take: limitNum,
+      ...summary,
     });
 
     return {
       count,
       next: pageNum * limitNum < count ? `/api/infrastructure/servers?page=${pageNum + 1}` : null,
       previous: pageNum > 1 ? `/api/infrastructure/servers?page=${pageNum - 1}` : null,
-      results: results.map((s) => this.formatServer(s, isAdm)),
+      results: results.map(shape),
     };
+  }
+
+  /**
+   * GET /infrastructure/servers/check-duplicates: warnings for the Add/Edit Server form, never a
+   * rejection (server names and IPs may legitimately repeat). Checked across all servers, like
+   * domain names; only booleans are returned, so nothing about other servers is revealed.
+   * name: same name ignoring case and surrounding spaces; ip: the IP in ip_address or server_ip.
+   */
+  async checkServerDuplicates(query: { name?: unknown; ip?: unknown; exclude?: unknown }): Promise<{ name: boolean; ip: boolean }> {
+    const exclude = query.exclude === undefined || query.exclude === null || query.exclude === '' ? undefined : Number(query.exclude);
+    if (exclude !== undefined && (!Number.isInteger(exclude) || exclude <= 0)) {
+      throw new BadRequestException('exclude must be a server id.');
+    }
+    const name = typeof query.name === 'string' ? query.name.trim().toLowerCase() : '';
+    const ip = typeof query.ip === 'string' ? query.ip.trim() : '';
+    const notSelf = exclude ? Prisma.sql` AND id <> ${exclude}` : Prisma.empty;
+    const [byName, byIp] = await Promise.all([
+      name ? this.prisma.$queryRaw<Array<{ id: number }>>(Prisma.sql`SELECT id FROM servers WHERE LOWER(TRIM(name)) = ${name}${notSelf} LIMIT 1`) : [],
+      ip
+        ? this.prisma.$queryRaw<Array<{ id: number }>>(Prisma.sql`SELECT id FROM servers WHERE (TRIM(ip_address) = ${ip} OR TRIM(server_ip) = ${ip})${notSelf} LIMIT 1`)
+        : [],
+    ]);
+    return { name: byName.length > 0, ip: byIp.length > 0 };
   }
 
   async getServerById(user: any, id: number) {
@@ -424,9 +475,21 @@ export class InfrastructureService {
 
   static readonly DOMAIN_EXISTS_MESSAGE = 'Domain already exists.';
 
-  /** The stored form of a domain name: trimmed (case kept for display). Required. */
+  /**
+   * The stored form of a domain name (case kept for display; comparisons ignore it): trimmed; a
+   * pasted http(s):// address is reduced to its host (scheme, user info, port, path, query and
+   * fragment removed); one trailing dot removed. "www." is kept: www.example.com and example.com
+   * are different domains. Required.
+   */
   normalizeDomainName(value: unknown): string {
-    const name = typeof value === 'string' ? value.trim() : '';
+    let name = typeof value === 'string' ? value.trim() : '';
+    const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(name);
+    if (scheme && !/^https?$/i.test(scheme[1])) {
+      const message = 'Enter a domain name (an http:// or https:// address is also accepted).';
+      throw new BadRequestException({ statusCode: 400, error: 'Bad Request', message, domain_name: message });
+    }
+    if (scheme) name = name.slice(scheme[0].length).replace(/^[^/?#@]*@/, '');
+    name = name.split(/[/?#]/)[0].replace(/:\d+$/, '').replace(/\.$/, '').trim();
     if (!name) throw new BadRequestException({ statusCode: 400, error: 'Bad Request', message: 'Domain name is required.', domain_name: 'Domain name is required.' });
     if (name.length > 255) throw new BadRequestException({ statusCode: 400, error: 'Bad Request', message: 'Domain name is too long.', domain_name: 'Domain name is too long.' });
     return name;
@@ -438,11 +501,24 @@ export class InfrastructureService {
     return new ConflictException({ statusCode: 409, error: 'Conflict', message, domain_name: message });
   }
 
-  /** Whether another domain has the same normalized name (optionally excluding one record). */
+  /** Comparison key of a domain name: normalized and lower-case (a stored legacy value that no longer parses falls back to trim/lower-case). */
+  private domainKey(value: unknown): string {
+    try {
+      return this.normalizeDomainName(value).toLowerCase();
+    } catch {
+      return String(value ?? '').trim().toLowerCase();
+    }
+  }
+
+  /**
+   * Whether another domain has the same normalized name (optionally excluding one record). Stored
+   * names are compared trimmed, lower-case and without a trailing dot, so rows saved before the
+   * trailing-dot rule still count.
+   */
   private async domainNameTaken(client: any, name: string, excludeId?: number, lock = false): Promise<boolean> {
-    const key = name.trim().toLowerCase();
+    const key = this.domainKey(name);
     const rows: Array<{ id: number }> = await client.$queryRaw(
-      Prisma.sql`SELECT id FROM domains WHERE LOWER(TRIM(domain_name)) = ${key}${
+      Prisma.sql`SELECT id FROM domains WHERE LOWER(TRIM(TRAILING '.' FROM TRIM(domain_name))) = ${key}${
         excludeId ? Prisma.sql` AND id <> ${excludeId}` : Prisma.empty
       }${lock ? Prisma.sql` FOR UPDATE` : Prisma.empty}`,
     );
@@ -535,7 +611,7 @@ export class InfrastructureService {
     // Only a real rename is checked: saving other fields (or re-sending the same name with other
     // spacing/case) never fails, even for a record that already has a duplicate
     const domainName = data.domain_name !== undefined ? this.normalizeDomainName(data.domain_name) : undefined;
-    const renamed = domainName !== undefined && domainName.toLowerCase() !== String(existing.domain_name).trim().toLowerCase();
+    const renamed = domainName !== undefined && this.domainKey(domainName) !== this.domainKey(existing.domain_name);
     // Not sent: unchanged. A provider saved before the list existed may be re-sent as it is
     const status = data.status !== undefined ? parseDomainStatus(data.status) : undefined;
     const provider = data.provider !== undefined ? parseDomainProvider(data.provider, existing.provider) : undefined;

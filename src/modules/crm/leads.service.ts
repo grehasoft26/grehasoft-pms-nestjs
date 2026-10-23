@@ -61,12 +61,15 @@ export class LeadsService {
       where.status = query.status;
     }
 
-    if (query.search) {
+    // Partial, case-insensitive through the columns' *_ci collation (Prisma's `mode: 'insensitive'`
+    // is not supported on MySQL and made every search fail with a 500)
+    const search = String(query.search ?? '').trim();
+    if (search) {
       where.OR = [
-        { name: { contains: query.search, mode: 'insensitive' } },
-        { company_name: { contains: query.search, mode: 'insensitive' } },
-        { email: { contains: query.search, mode: 'insensitive' } },
-        { phone: { contains: query.search, mode: 'insensitive' } },
+        { name: { contains: search } },
+        { company_name: { contains: search } },
+        { email: { contains: search } },
+        { phone: { contains: search } },
       ];
     }
 

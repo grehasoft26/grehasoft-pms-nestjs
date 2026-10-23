@@ -85,6 +85,14 @@ export class ServersController {
     return this.infraService.getServers(req.user, query);
   }
 
+  // Add/Edit Server form warnings: { name, ip } booleans only, never a rejection. Same permission
+  // as saving a server.
+  @Get('check-duplicates')
+  @Permissions('MANAGE_INFRASTRUCTURE')
+  async checkDuplicates(@Query() query: any) {
+    return this.infraService.checkServerDuplicates(query);
+  }
+
   @Get(':id')
   async findOne(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
     return this.infraService.getServerById(req.user, id);
