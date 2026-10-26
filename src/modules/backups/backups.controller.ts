@@ -22,6 +22,7 @@ import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
 import { CurrentUser } from '../../core/decorators/current-user.decorator';
+import { contentDisposition } from '../../core/utils/content-disposition.util';
 
 @Controller('api/v1/backups')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
@@ -175,7 +176,8 @@ export class BackupsController {
     this.checkAdminPermission(user);
     const { filePath, filename } = await this.backupsService.getExplorerDocumentPath(id, relPath);
 
-    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    // Raw non-Latin-1 names (e.g. Malayalam) made Node reject the header with a 500
+    res.setHeader('Content-Disposition', contentDisposition('inline', filename));
     res.sendFile(filePath);
   }
 

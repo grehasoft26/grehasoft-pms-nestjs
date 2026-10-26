@@ -78,6 +78,56 @@ const ENTITY_DISPLAY_NAMES: Record<string, string> = {
   client_notifications: 'Client Notifications',
 };
 
+/** Entities the backup explorer can open: exactly the data/<name>.json files the exports write. */
+const EXPLORER_ENTITIES: readonly string[] = Object.freeze(Object.keys(ENTITY_DISPLAY_NAMES));
+
+/** Outcome of a category restore that finished without failures. */
+interface CategoryRestoreResult {
+  restored_tables: string[];
+  attempted: number;
+  restored: number;
+  skipped: number;
+  failed: number;
+}
+
+/** Placeholder sanitizeRecordForSnapshot writes instead of a password; never restored. */
+const SNAPSHOT_REDACTED = '[REDACTED]';
+
+/**
+ * Fields left out of JSON snapshots and explorer responses entirely (not even a placeholder, so no
+ * restore can write one back). servers.password holds credential ciphertext; the SQL dump keeps it
+ * for a full restore (keys are never in a backup).
+ */
+const SNAPSHOT_OMITTED_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  servers: ['password'],
+};
+
+/**
+ * Tables a CATEGORY restore may write for each category: the tables
+ * exportCategorySnapshotsAndDocuments exports for it. The reference records it adds for foreign
+ * keys (users, roles, departments, task_types, and clients outside CLIENTS) are never restored:
+ * users and roles carry passwords and permissions, which need a separate, deliberately authorized
+ * workflow. DOCUMENTS has documents only, no tables; CUSTOM has nothing to restore.
+ */
+const CATEGORY_RESTORE_TABLES: Readonly<Record<Exclude<BackupCategory, BackupCategory.CUSTOM>, readonly string[]>> = {
+  [BackupCategory.FINANCE]: ['invoices', 'invoice_items', 'invoice_payments', 'proposals', 'proposal_items'],
+  [BackupCategory.CLIENTS]: ['clients', 'leads', 'lead_assignments', 'lead_followups', 'portal_user_audit'],
+  [BackupCategory.OPERATIONS]: [
+    'projects',
+    'milestones',
+    'project_members',
+    'project_activity_logs',
+    'tasks',
+    'task_assignments',
+    'task_progress',
+    'task_files',
+    'task_reviews',
+    'task_comments',
+  ],
+  [BackupCategory.HR]: ['employees', 'hr_documents'],
+  [BackupCategory.DOCUMENTS]: [],
+};
+
 @Injectable()
 export class BackupsService {
   private readonly logger = new Logger(BackupsService.name);
@@ -112,10 +162,8 @@ export class BackupsService {
     { childProcess?: any; workDir?: string; isCancelled?: boolean }
   >();
 
+  // Restore order (parents first) of the tables in CATEGORY_RESTORE_TABLES
   private readonly categoryTopologicalTables: string[] = [
-    'roles',
-    'departments',
-    'users',
     'clients',
     'leads',
     'lead_assignments',
@@ -125,7 +173,6 @@ export class BackupsService {
     'milestones',
     'project_members',
     'project_activity_logs',
-    'task_types',
     'tasks',
     'task_assignments',
     'task_progress',
@@ -240,22 +287,34 @@ export class BackupsService {
   }
 
   /**
-   * Redact sensitive credentials/passwords for JSON snapshot output
+   * Redact sensitive credentials/passwords for JSON snapshot output (and explorer responses).
+   * Returns a copy; the source row is not modified.
    */
   private sanitizeRecordForSnapshot(tableName: string, row: Record<string, any>): Record<string, any> {
     const clean = { ...row };
+    // "servers", "servers.json" and, on case-insensitive file systems, "SERVERS" name the same file
+    tableName = tableName.replace(/\.json$/i, '').toLowerCase();
+    for (const field of SNAPSHOT_OMITTED_FIELDS[tableName] ?? []) delete clean[field];
     if (tableName === 'users' || tableName === 'users.json') {
-      if (clean.password) clean.password = '[REDACTED]';
+      if (clean.password) clean.password = SNAPSHOT_REDACTED;
     } else if (tableName === 'website_credentials' || tableName === 'website_credentials.json') {
-      if (clean.admin_password) clean.admin_password = '[REDACTED]';
-      if (clean.cpanel_password) clean.cpanel_password = '[REDACTED]';
-      if (clean.ftp_password) clean.ftp_password = '[REDACTED]';
-      if (clean.client_email_password) clean.client_email_password = '[REDACTED]';
-      if (clean.business_email_password) clean.business_email_password = '[REDACTED]';
+      if (clean.admin_password) clean.admin_password = SNAPSHOT_REDACTED;
+      if (clean.cpanel_password) clean.cpanel_password = SNAPSHOT_REDACTED;
+      if (clean.ftp_password) clean.ftp_password = SNAPSHOT_REDACTED;
+      if (clean.client_email_password) clean.client_email_password = SNAPSHOT_REDACTED;
+      if (clean.business_email_password) clean.business_email_password = SNAPSHOT_REDACTED;
     } else if (tableName === 'seo_credential' || tableName === 'seo_credential.json') {
-      if (clean.password) clean.password = '[REDACTED]';
+      if (clean.password) clean.password = SNAPSHOT_REDACTED;
     } else if (tableName === 'seo_daily_work_log_item' || tableName === 'seo_daily_work_log_item.json') {
-      if (clean.password) clean.password = '[REDACTED]';
+      if (clean.password) clean.password = SNAPSHOT_REDACTED;
+    } else if (tableName === 'hr_documents') {
+      // Exported with employee.user (the full user row): the password hash is omitted, the rest kept
+      const user = clean.employee?.user;
+      if (user && typeof user === 'object' && 'password' in user) {
+        const userWithoutPassword = { ...user };
+        delete userWithoutPassword.password;
+        clean.employee = { ...clean.employee, user: userWithoutPassword };
+      }
     }
     return clean;
   }
@@ -1418,6 +1477,28 @@ export class BackupsService {
     };
   }
 
+  /**
+   * Rows of a snapshot file as the explorer returns them: sanitized again on read, by the name of
+   * the file actually read, so archives written before a field was omitted never expose it.
+   */
+  private readExplorerRows(jsonPath: string): any[] {
+    const rows = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row) => this.sanitizeRecordForSnapshot(path.basename(jsonPath), row));
+  }
+
+  /**
+   * The allowlisted explorer entity for a requested name. Only an exact, case-sensitive name from
+   * EXPLORER_ENTITIES is accepted; anything else (unknown names, paths, separators, dot segments,
+   * encoded or case variants) is a 404 that does not echo the input. Callers build the snapshot
+   * path from the returned allowlist entry, never from the request.
+   */
+  private explorerEntity(entityName: unknown): string {
+    const entity = typeof entityName === 'string' ? EXPLORER_ENTITIES.find((name) => name === entityName) : undefined;
+    if (!entity) throw new NotFoundException('Unknown backup explorer entity.');
+    return entity;
+  }
+
   /** The values of a (sanitized) snapshot row as text, at any depth (nested related records too); no field names. */
   private recordValues(value: unknown, depth = 0): string[] {
     if (depth > 8 || value === null || value === undefined) return [];
@@ -1434,6 +1515,7 @@ export class BackupsService {
     entityName: string,
     query: { page?: string; limit?: string; search?: string },
   ): Promise<any> {
+    entityName = this.explorerEntity(entityName); // validated before any file access
     const cacheDir = await this.ensureExtractedCache(id);
     const jsonPath = path.join(cacheDir, 'data', `${entityName}.json`);
 
@@ -1443,7 +1525,8 @@ export class BackupsService {
 
     let records: any[] = [];
     try {
-      records = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      // Sanitized before searching, so omitted values cannot be probed through search either
+      records = this.readExplorerRows(jsonPath);
     } catch {
       throw new InternalServerErrorException(`Failed to parse entity "${entityName}" snapshot data.`);
     }
@@ -1481,6 +1564,7 @@ export class BackupsService {
    * Explorer Detailed Record View API (Strictly Live-DB Independent)
    */
   async getExplorerRecordDetail(id: number, entityName: string, recordId: number): Promise<any> {
+    entityName = this.explorerEntity(entityName); // validated before any file access
     const cacheDir = await this.ensureExtractedCache(id);
     const jsonPath = path.join(cacheDir, 'data', `${entityName}.json`);
 
@@ -1488,7 +1572,7 @@ export class BackupsService {
       throw new NotFoundException(`Entity "${entityName}" does not exist in backup snapshot #${id}.`);
     }
 
-    const records = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    const records = this.readExplorerRows(jsonPath);
     const targetRecord = records.find((r: any) => Number(r.id) === Number(recordId));
 
     if (!targetRecord) {
@@ -1501,7 +1585,7 @@ export class BackupsService {
       const p = path.join(cacheDir, 'data', `${file}.json`);
       if (fs.existsSync(p)) {
         try {
-          return JSON.parse(fs.readFileSync(p, 'utf8'));
+          return this.readExplorerRows(p);
         } catch {}
       }
       return [];
@@ -1653,23 +1737,47 @@ export class BackupsService {
   /**
    * Explorer Stream / Download Document File Provider with Path Traversal Protection
    */
-  async getExplorerDocumentPath(id: number, relativePath: string): Promise<{ filePath: string; filename: string }> {
-    if (!relativePath) {
+  async getExplorerDocumentPath(id: number, relativePath: unknown): Promise<{ filePath: string; filename: string }> {
+    if (relativePath === undefined || relativePath === null || relativePath === '') {
       throw new BadRequestException('Query parameter "path" is required.');
     }
+    // Validated before the archive is extracted or any file is touched
+    const segments = this.documentPathSegments(relativePath);
 
     const cacheDir = await this.ensureExtractedCache(id);
-    const safeFilePath = path.resolve(cacheDir, relativePath);
+    const docsRoot = path.resolve(cacheDir, 'documents');
+    const filePath = path.resolve(docsRoot, ...segments);
+    if (!this.isInside(docsRoot, filePath)) throw new BadRequestException('Invalid document path.');
 
-    if (!safeFilePath.startsWith(cacheDir)) {
-      throw new ForbiddenException('Invalid document path traversal attempt.');
-    }
+    const notFound = () => new NotFoundException(`Requested document was not found in backup #${id}.`);
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) throw notFound();
+    // A link inside documents/ must not lead out of this backup's documents/ either
+    if (!this.isInside(fs.realpathSync(docsRoot), fs.realpathSync(filePath))) throw notFound();
 
-    if (!fs.existsSync(safeFilePath)) {
-      throw new NotFoundException(`Requested document "${relativePath}" was not found in backup #${id}.`);
-    }
+    return { filePath, filename: path.basename(filePath) };
+  }
 
-    return { filePath: safeFilePath, filename: path.basename(safeFilePath) };
+  /**
+   * The segments below documents/ of a document path from the explorer listing
+   * ("documents/<category>/.../<file>", forward slashes). Anything else is a 400 that does not echo
+   * the input: other backup files (data/, manifest.json, database/), absolute, drive or UNC paths,
+   * backslashes, empty, "." or ".." segments, control characters, and percent-encoded dots,
+   * separators or percent signs (double encoding).
+   */
+  private documentPathSegments(relativePath: unknown): string[] {
+    const invalid = () => new BadRequestException('Invalid document path.');
+    if (typeof relativePath !== 'string' || relativePath.length > 1024) throw invalid();
+    if (/[\x00-\x1f\x7f\\]/.test(relativePath) || /%(2e|2f|5c|25|00)/i.test(relativePath)) throw invalid();
+    const [root, ...segments] = relativePath.split('/');
+    if (root !== 'documents' || segments.length === 0) throw invalid();
+    if (segments.some((s) => s === '' || s === '.' || s === '..' || /^[a-z]:/i.test(s))) throw invalid();
+    return segments;
+  }
+
+  /** True when `target` is strictly below `root` (whole path segments, not a string prefix). */
+  private isInside(root: string, target: string): boolean {
+    const rel = path.relative(root, target);
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
   }
 
   // ============================================================================
@@ -1685,6 +1793,7 @@ export class BackupsService {
     if (record.status !== BackupStatus.COMPLETED) {
       throw new BadRequestException(`Backup #${id} is not COMPLETED (status: ${record.status}).`);
     }
+    const categorySelection = dto.restoreMode === 'CATEGORY' ? this.resolveCategoryRestore(record, dto.categories) : null;
 
     const isProduction = process.env.NODE_ENV === 'production';
     const allowProd = process.env.ALLOW_PRODUCTION_RESTORE === 'true';
@@ -1715,6 +1824,8 @@ export class BackupsService {
       const files = fs.readdirSync(dataDir).filter((f) => f.endsWith('.json'));
       for (const file of files) {
         const tableName = file.replace('.json', '');
+        // A category restore writes only the selected categories' tables
+        if (categorySelection && !categorySelection.tables.includes(tableName)) continue;
         tablesAffected.push(tableName);
         try {
           const rows = JSON.parse(fs.readFileSync(path.join(dataDir, file), 'utf8'));
@@ -1728,7 +1839,7 @@ export class BackupsService {
       filename: record.filename,
       backup_type: record.backup_type,
       restore_mode: dto.restoreMode,
-      selected_categories: dto.categories || record.selected_categories || null,
+      selected_categories: categorySelection ? categorySelection.categories : dto.categories || record.selected_categories || null,
       is_legacy: isLegacy,
       production_blocked: productionBlocked,
       production_warning: productionBlocked
@@ -1779,6 +1890,9 @@ export class BackupsService {
     if (!['UPSERT', 'SKIP_EXISTING'].includes(dto.conflictStrategy)) {
       throw new BadRequestException('Invalid conflictStrategy. Must be UPSERT or SKIP_EXISTING.');
     }
+
+    // 4b. Category selection: validated before the safety backup and any write
+    const categorySelection = dto.restoreMode === 'CATEGORY' ? this.resolveCategoryRestore(record, dto.categories) : null;
 
     // 5. Active Concurrency Lock Check
     const running = await this.prisma.backupRecord.findFirst({
@@ -1835,6 +1949,7 @@ export class BackupsService {
 
     // 8. Execute Database & File Restore
     try {
+      let categoryResult: CategoryRestoreResult | null = null;
       if (dto.restoreMode === 'FULL') {
         const sqlPath = path.join(cacheDir, 'database', 'database.sql');
         if (!fs.existsSync(sqlPath)) {
@@ -1843,7 +1958,7 @@ export class BackupsService {
         await this.runFullSqlRestore(sqlPath);
         await this.restoreMediaFiles(cacheDir, 'FULL');
       } else {
-        await this.runCategoryJsonRestore(cacheDir, dto.categories || record.selected_categories || [], dto.conflictStrategy);
+        categoryResult = await this.runCategoryJsonRestore(cacheDir, categorySelection!.tables, dto.conflictStrategy);
         await this.restoreMediaFiles(cacheDir, 'CATEGORY');
       }
 
@@ -1853,6 +1968,7 @@ export class BackupsService {
         pre_restore_backup_id: preRestoreRecord.id,
         restore_mode: dto.restoreMode,
         conflict_strategy: dto.conflictStrategy,
+        ...(categoryResult ? { selected_categories: categorySelection!.categories, ...categoryResult } : {}),
         completed_at: new Date().toISOString(),
       };
     } catch (err) {
@@ -1957,26 +2073,82 @@ export class BackupsService {
   }
 
   /**
-   * Run Record-Scoped Category JSON Restore in Topological Dependency Order with strict Audit Tracking & Error Reporting
+   * Validates a CATEGORY restore selection; returns the (de-duplicated) categories and the tables
+   * they may write, in restore order. A missing or empty selection is rejected (there is no
+   * fallback to every table), as are unknown values, CUSTOM, and categories that a CATEGORY backup
+   * does not contain.
+   */
+  private resolveCategoryRestore(
+    record: { id: number; backup_type?: BackupType; selected_categories?: unknown },
+    raw: unknown,
+  ): { categories: BackupCategory[]; tables: string[] } {
+    if (!Array.isArray(raw) || raw.length === 0) {
+      throw new BadRequestException('Select at least one category for a category restore.');
+    }
+    const restorable = Object.keys(CATEGORY_RESTORE_TABLES);
+    const categories = [...new Set(raw as unknown[])];
+    for (const category of categories) {
+      // The value is not echoed back: it is arbitrary request input
+      if (typeof category !== 'string' || !(Object.values(BackupCategory) as string[]).includes(category)) {
+        throw new BadRequestException(`Invalid category. Must be one of: ${restorable.join(', ')}.`);
+      }
+      if (!restorable.includes(category)) {
+        throw new BadRequestException(`The ${category} category cannot be restored.`);
+      }
+    }
+    if (record.backup_type === BackupType.CATEGORY) {
+      const contained = Array.isArray(record.selected_categories) ? (record.selected_categories as unknown[]) : [];
+      const missing = categories.filter((c) => !contained.includes(c));
+      if (missing.length > 0) {
+        throw new BadRequestException(
+          `Backup #${record.id} does not contain: ${missing.join(', ')}. It contains: ${contained.join(', ') || 'no categories'}.`,
+        );
+      }
+    }
+    const allowed = new Set(categories.flatMap((c) => CATEGORY_RESTORE_TABLES[c as keyof typeof CATEGORY_RESTORE_TABLES]));
+    return {
+      categories: categories as BackupCategory[],
+      tables: this.categoryTopologicalTables.filter((table) => allowed.has(table)),
+    };
+  }
+
+  /** Rows of data/<table>.json in an extracted backup; null when the backup has no such file. Throws when unreadable. */
+  private readSnapshotRows(dataDir: string, table: string): any[] | null {
+    const jsonPath = path.join(dataDir, `${table}.json`);
+    if (!fs.existsSync(jsonPath)) return null;
+    const rows = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    if (!Array.isArray(rows)) throw new Error(`${table}.json is not an array`);
+    return rows;
+  }
+
+  /** Snapshot row -> write data: relation fields removed, and never a password or the redaction placeholder. */
+  private toCategoryRestoreData(row: Record<string, any>): Record<string, any> {
+    const data = this.stripRelationFields(row);
+    delete data.password;
+    for (const key of Object.keys(data)) {
+      if (data[key] === SNAPSHOT_REDACTED) delete data[key];
+    }
+    return data;
+  }
+
+  /**
+   * Restores `tables` (from resolveCategoryRestore) from the backup's JSON snapshots, parents first.
+   * Rows are written one at a time without a transaction, so the result counts exactly what was
+   * restored, skipped and failed. Failures name the table and the Prisma error code only: database
+   * messages can quote row values.
    */
   private async runCategoryJsonRestore(
     cacheDir: string,
-    selectedCategories: string[],
+    tables: string[],
     strategy: ConflictStrategy,
-  ): Promise<void> {
+  ): Promise<CategoryRestoreResult> {
     const dataDir = path.join(cacheDir, 'data');
-    if (!fs.existsSync(dataDir)) return;
+    const result: CategoryRestoreResult = { restored_tables: [], attempted: 0, restored: 0, skipped: 0, failed: 0 };
+    const failedByTable: Record<string, number> = {};
+    const unreadable: string[] = [];
 
-    let attemptedCount = 0;
-    let restoredCount = 0;
-    let skippedCount = 0;
-    let failedCount = 0;
-    const errors: string[] = [];
-
+    // users, roles, departments and task_types are deliberately absent (see CATEGORY_RESTORE_TABLES)
     const modelMap: Record<string, any> = {
-      roles: this.prisma.role,
-      departments: this.prisma.department,
-      users: this.prisma.user,
       clients: this.prisma.client,
       leads: this.prisma.lead,
       lead_assignments: this.prisma.leadAssignment,
@@ -1986,7 +2158,6 @@ export class BackupsService {
       milestones: this.prisma.milestone,
       project_members: this.prisma.projectMember,
       project_activity_logs: this.prisma.projectActivityLog,
-      task_types: this.prisma.taskType,
       tasks: this.prisma.task,
       task_assignments: this.prisma.taskAssignment,
       task_progress: this.prisma.taskProgress,
@@ -2003,55 +2174,63 @@ export class BackupsService {
     };
 
     for (const table of this.categoryTopologicalTables) {
-      const jsonPath = path.join(dataDir, `${table}.json`);
-      if (!fs.existsSync(jsonPath)) continue;
-
+      if (!tables.includes(table)) continue;
       const delegate = modelMap[table];
       if (!delegate) continue;
 
-      let rows: any[] = [];
+      let rows: any[] | null;
       try {
-        rows = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-      } catch (err) {
-        this.logger.warn(`Failed to parse snapshot file ${table}.json: ${err.message}`);
+        rows = this.readSnapshotRows(dataDir, table);
+      } catch {
+        this.logger.warn(`Category restore: snapshot file ${table}.json could not be read; table not restored.`);
+        unreadable.push(table);
         continue;
       }
+      if (rows === null) continue; // not in this backup
+      result.restored_tables.push(table);
 
       for (const row of rows) {
-        attemptedCount++;
-        const cleanRow = this.stripRelationFields(row);
+        result.attempted++;
+        const data = this.toCategoryRestoreData(row);
 
         try {
-          const existing = await delegate.findUnique({ where: { id: cleanRow.id } });
+          const existing = await delegate.findUnique({ where: { id: data.id } });
           if (existing) {
             if (strategy === 'UPSERT') {
-              await delegate.update({ where: { id: cleanRow.id }, data: cleanRow });
-              restoredCount++;
+              await delegate.update({ where: { id: data.id }, data });
+              result.restored++;
             } else {
-              skippedCount++;
+              result.skipped++;
             }
           } else {
-            await delegate.create({ data: cleanRow });
-            restoredCount++;
+            await delegate.create({ data });
+            result.restored++;
           }
-        } catch (rowErr) {
-          failedCount++;
-          const errDetail = `Table ${table} row #${cleanRow.id}: ${rowErr.message}`;
-          this.logger.warn(`Category restore error: ${errDetail}`);
-          errors.push(errDetail);
+        } catch (rowErr: any) {
+          result.failed++;
+          failedByTable[table] = (failedByTable[table] || 0) + 1;
+          this.logger.warn(`Category restore: ${table} row #${Number(data.id) || '?'} failed (${rowErr?.code || rowErr?.name || 'error'}).`);
         }
       }
     }
 
     this.logger.log(
-      `Category Restore Completed: Attempted=${attemptedCount}, Restored=${restoredCount}, Skipped=${skippedCount}, Failed=${failedCount}`,
+      `Category Restore Completed: Attempted=${result.attempted}, Restored=${result.restored}, Skipped=${result.skipped}, Failed=${result.failed}, Unreadable=${unreadable.length}`,
     );
 
-    if (failedCount > 0) {
+    if (result.failed > 0 || unreadable.length > 0) {
+      const problems = [
+        result.failed > 0
+          ? `${result.failed} of ${result.attempted} record(s) could not be restored (${Object.entries(failedByTable).map(([table, n]) => `${table}: ${n}`).join(', ')})`
+          : null,
+        unreadable.length > 0 ? `unreadable snapshot file(s): ${unreadable.join(', ')}` : null,
+      ].filter(Boolean);
       throw new InternalServerErrorException(
-        `Category restore failed for ${failedCount} record(s):\n${errors.slice(0, 5).join('\n')}`,
+        `Category restore partially failed: ${problems.join('; ')}. ${result.restored} record(s) were restored and ` +
+          `${result.skipped} skipped; restored records were not rolled back.`,
       );
     }
+    return result;
   }
 
   /**
