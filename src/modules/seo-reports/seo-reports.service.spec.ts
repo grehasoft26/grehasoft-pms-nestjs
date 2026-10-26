@@ -9,11 +9,21 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import * as fs from 'fs';
+import * as path from 'path';
+
+// The service writes below <cwd>/media; tests must never touch the real project files there
+const REAL_MEDIA = path.resolve(process.cwd(), 'media');
+const inRealMedia = (p: fs.PathLike) => {
+  const rel = path.relative(REAL_MEDIA, path.resolve(String(p)));
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+};
 
 describe('SeoReportsService', () => {
   let service: SeoReportsService;
   let prisma: any;
   let pdfService: any;
+  /** Files the service wrote under media/, captured in memory instead (path relative to cwd -> bytes). */
+  let mediaWrites: Map<string, Buffer>;
 
   const mockUserAdmin = { id: 1, name: 'Admin', role_name: 'SUPER_ADMIN', is_superuser: true };
   const mockUserExecutive = { id: 2, name: 'Executive', role_name: 'SEO_EXECUTIVE' };
@@ -108,6 +118,32 @@ describe('SeoReportsService', () => {
     }).compile();
 
     service = module.get<SeoReportsService>(SeoReportsService);
+
+    // Writes into media/ go to memory; directory creation there is a no-op; deleting, renaming or
+    // copying anything there fails the test. Paths outside media/ use the real file system.
+    mediaWrites = new Map();
+    const actual = jest.requireActual('fs');
+    jest.spyOn(fs, 'writeFileSync').mockImplementation(((p: any, data: any, ...rest: any[]) => {
+      if (!inRealMedia(p)) return actual.writeFileSync(p, data, ...rest);
+      mediaWrites.set(path.relative(process.cwd(), path.resolve(String(p))).replace(/\\/g, '/'), Buffer.from(data));
+    }) as any);
+    jest.spyOn(fs, 'mkdirSync').mockImplementation(((p: any, ...rest: any[]) => {
+      if (!inRealMedia(p)) return actual.mkdirSync(p, ...rest);
+      return undefined;
+    }) as any);
+    for (const op of ['rmSync', 'unlinkSync', 'renameSync', 'copyFileSync', 'appendFileSync'] as const) {
+      jest.spyOn(fs, op).mockImplementation(((p: any, ...rest: any[]) => {
+        if (inRealMedia(p) || (op === 'renameSync' || op === 'copyFileSync') && inRealMedia(rest[0])) {
+          throw new Error(`test attempted ${op} in the real media directory`);
+        }
+        return actual[op](p, ...rest);
+      }) as any);
+    }
+  });
+
+  afterEach(() => {
+    // Also undoes per-test fs stubs (test 29 used to leave existsSync returning true)
+    jest.restoreAllMocks();
   });
 
   it('should be defined', () => {
@@ -378,6 +414,23 @@ describe('SeoReportsService', () => {
       { section_name: 'keywords', file_path: 'media/test.png', original_filename: 'test.png' },
     );
     expect(fileRecord.section_name).toBe('keywords');
+    expect(mediaWrites.size).toBe(0); // no uploaded file, nothing written
+  });
+
+  it('23b. stores an uploaded evidence file under media/seo_reports/evidence (captured, not written)', async () => {
+    prisma.sEOReport.findUnique.mockResolvedValue({ ...mockReport, status: 'draft' });
+    prisma.sEOReportFile.create.mockImplementation(async ({ data }: any) => data);
+
+    const record = await service.uploadEvidenceFile(1, mockUserAdmin, { section_name: 'gsc' }, {
+      originalname: 'gsc screenshot.png',
+      mimetype: 'image/png',
+      size: 4,
+      buffer: Buffer.from('PNG!'),
+    });
+
+    expect(record.file_path).toMatch(/^media\/seo_reports\/evidence\/ev_\d+_[a-z0-9]+_gsc_screenshot\.png$/);
+    expect([...mediaWrites.keys()]).toEqual([record.file_path]);
+    expect(mediaWrites.get(record.file_path)!.toString()).toBe('PNG!');
   });
 
   // 24. Evidence deletion authorization
@@ -430,6 +483,12 @@ describe('SeoReportsService', () => {
       }),
     );
     expect(result.status).toBe('generated');
+
+    // Same file the service has always written, captured instead of written to the real media/
+    const pdfPath = 'media/seo_reports/pdfs/seo_report_2026-08_Al_Bayan.pdf';
+    expect([...mediaWrites.keys()]).toEqual([pdfPath]);
+    expect(mediaWrites.get(pdfPath)!.toString()).toBe('%PDF-1.4 Mock SEO Report PDF Content');
+    expect(prisma.sEOReport.update.mock.calls[0][0].data).toMatchObject({ pdf_file_path: pdfPath, pdf_file_size: 36 });
   });
 
   // 27. Reject PDF generation for draft report
