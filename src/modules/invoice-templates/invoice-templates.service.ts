@@ -5,6 +5,10 @@ import { UpdateInvoiceTemplateDto } from './dto/update-invoice-template.dto';
 import { CreateInvoiceServiceDto } from './dto/create-invoice-service.dto';
 import { UpdateInvoiceServiceDto } from './dto/update-invoice-service.dto';
 
+const DUPLICATE_TEMPLATE_NAME = 'An invoice template with this name already exists.';
+/** Largest value of the DECIMAL(10,2) rate column. */
+const MAX_RATE = 99999999.99;
+
 @Injectable()
 export class InvoiceTemplatesService implements OnModuleInit {
   constructor(private readonly prisma: PrismaService) {}
@@ -176,17 +180,46 @@ export class InvoiceTemplatesService implements OnModuleInit {
       throw new BadRequestException({ error: 'Template description is required.' });
     }
 
-    return this.prisma.invoiceDescriptionTemplate.create({
-      data: {
-        name,
-        description,
-        rate: dto.rate !== undefined && dto.rate !== null && !isNaN(Number(dto.rate)) ? Number(dto.rate) : 0,
-        is_active: dto.is_active !== undefined ? Boolean(dto.is_active) : true,
-      },
-      include: {
-        services: true,
-      },
+    // Optional: the template form sends no rate (rates belong to the template's services)
+    const rate = this.parseRate(dto.rate) ?? 0;
+
+    const existing = await this.prisma.invoiceDescriptionTemplate.findFirst({
+      where: { name: { equals: name } },
     });
+    if (existing) {
+      throw new BadRequestException({ error: DUPLICATE_TEMPLATE_NAME });
+    }
+
+    try {
+      return await this.prisma.invoiceDescriptionTemplate.create({
+        data: {
+          name,
+          description,
+          rate,
+          is_active: dto.is_active !== undefined ? Boolean(dto.is_active) : true,
+        },
+        include: {
+          services: true,
+        },
+      });
+    } catch (error: any) {
+      // A concurrent save of the same name hits the unique index after the check above
+      if (error?.code === 'P2002') throw new BadRequestException({ error: DUPLICATE_TEMPLATE_NAME });
+      throw error;
+    }
+  }
+
+  /**
+   * A template rate from the request: undefined when omitted (undefined, null or ''), otherwise a
+   * non-negative number that fits the DECIMAL(10,2) column; anything else is a 400.
+   */
+  private parseRate(raw: unknown): number | undefined {
+    if (raw === undefined || raw === null || raw === '') return undefined;
+    const rate = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
+    if (!Number.isFinite(rate) || rate < 0 || rate > MAX_RATE) {
+      throw new BadRequestException({ error: 'Rate must be a non-negative number.' });
+    }
+    return rate;
   }
 
   async update(id: number, dto: UpdateInvoiceTemplateDto) {
@@ -207,7 +240,7 @@ export class InvoiceTemplatesService implements OnModuleInit {
       });
 
       if (existing) {
-        throw new BadRequestException({ error: 'An invoice template with this name already exists.' });
+        throw new BadRequestException({ error: DUPLICATE_TEMPLATE_NAME });
       }
       data.name = name;
     }
@@ -220,8 +253,10 @@ export class InvoiceTemplatesService implements OnModuleInit {
       data.description = description;
     }
 
-    if (dto.rate !== undefined && dto.rate !== null) {
-      data.rate = Number(dto.rate);
+    // Omitted rate: the stored rate is kept
+    const rate = this.parseRate(dto.rate);
+    if (rate !== undefined) {
+      data.rate = rate;
     }
 
     if (dto.is_active !== undefined) {
