@@ -4,6 +4,7 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma.service';
 import { DEACTIVATED_ROLE_MESSAGE, applyRoleStatus } from '../utils/role-access.util';
+import { requireJwtSecret } from '../utils/jwt-secret.util';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
@@ -12,12 +13,13 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     private readonly prisma: PrismaService,
   ) {
     super({
-      jwtFromRequest: ExtractJwt.fromExtractors([
-        ExtractJwt.fromAuthHeaderAsBearerToken(),
-        ExtractJwt.fromUrlQueryParameter('token'),
-      ]),
+      // Authorization: Bearer only. A token in the URL (?token=) leaks into server and proxy logs,
+      // browser history and Referer headers, so it is never accepted; downloads use authenticated
+      // requests (axios + blob) or their own signed, purpose-limited links (invoice public links).
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: configService.get<string>('JWT_SECRET') || 'grehasoft-jwt-secret-key-production-change-me',
+      // No fallback: a missing JWT_SECRET stops the application from starting
+      secretOrKey: requireJwtSecret(configService),
     });
   }
 
