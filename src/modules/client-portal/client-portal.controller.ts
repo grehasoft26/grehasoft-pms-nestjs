@@ -7,8 +7,13 @@ import {
   UseGuards,
   Request,
   ParseIntPipe,
+  Res,
+  StreamableFile,
 } from '@nestjs/common';
+import { Response } from 'express';
+import * as fs from 'fs';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
+import { contentDisposition } from '../../core/utils/content-disposition.util';
 import { ClientPortalService } from './client-portal.service';
 
 @Controller()
@@ -46,5 +51,31 @@ export class ClientPortalController {
   @Get('api/v1/dashboard/documents')
   async getDocuments(@Request() req: any, @Query() query: any) {
     return this.clientPortalService.getClientDocuments(req.user, query);
+  }
+
+  // One vault document (Authorization header only, like every route; the page downloads it as a
+  // blob). Always an attachment of opaque type, so an uploaded HTML/SVG file can never render.
+  @Get([
+    'api/v1/dashboard/documents/:id/download',
+    'api/v1/dashboard/documents/:id/download/',
+  ])
+  async downloadDocument(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const file = await this.clientPortalService.getClientDocumentFile(
+      req.user,
+      id,
+    );
+    res.set({
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': contentDisposition('attachment', file.filename),
+      'Content-Length': String(file.size),
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Cache-Control': 'private, no-store',
+    });
+    return new StreamableFile(fs.createReadStream(file.absolute));
   }
 }

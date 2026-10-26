@@ -114,8 +114,9 @@ describe('Client document vault', () => {
         type: 'Task File',
         project_name: 'Royal Kangan Website',
         date: '2026-10-07',
-        url: 'Homepage-Design-FINAL.pdf',
-        download_url: 'Homepage-Design-FINAL.pdf',
+        // The authenticated download route (GET /dashboard/documents/:id/download), never a storage path
+        url: '/api/v1/dashboard/documents/taskfile-7/download/',
+        download_url: '/api/v1/dashboard/documents/taskfile-7/download/',
         file_size: 'Unknown',
       });
     });

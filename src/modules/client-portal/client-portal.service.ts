@@ -1,4 +1,6 @@
 import { Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../../core/prisma.service';
 import { computeInvoiceFinancials, dateOnlyKey } from '../invoices/invoice-status';
 import { resolveClientForUser } from '../../core/utils/client-scope.util';
@@ -8,6 +10,12 @@ import { parseDateOnly } from '../../core/utils/date-only.util';
 export const CLIENT_DOCUMENT_TYPES = ['proposal', 'invoice', 'taskfile', 'seo_report'] as const;
 /** The vault page shows 10 documents per page. */
 const CLIENT_DOCUMENTS_PAGE_SIZE = 10;
+/** Task files are stored as `task_files/<name>` under media/ (same layout as TaskFilesService). */
+const MEDIA_ROOT = path.resolve(process.cwd(), 'media');
+const TASK_FILES_DIR = path.join(MEDIA_ROOT, 'task_files');
+/** Authenticated download of one vault document (the API never hands out storage paths). */
+export const clientDocumentDownloadPath = (taskFileId: number) =>
+  `/api/v1/dashboard/documents/taskfile-${taskFileId}/download/`;
 
 @Injectable()
 export class ClientPortalService {
@@ -197,8 +205,8 @@ export class ClientPortalService {
         type: 'Task File',
         project_name: 'Project',
         date: tf.uploaded_at.toISOString().split('T')[0],
-        url: tf.file_path || tf.file,
-        download_url: tf.file_path || tf.file,
+        url: clientDocumentDownloadPath(tf.id),
+        download_url: clientDocumentDownloadPath(tf.id),
       })),
       recent_notifications: unreadNotifications.map((n) => ({
         id: n.id,
@@ -343,9 +351,70 @@ export class ClientPortalService {
       type: 'Task File',
       project_name: tf.task?.project?.name || 'Project',
       date: tf.uploaded_at.toISOString().split('T')[0],
-      url: tf.file_path || tf.file,
-      download_url: tf.file_path || tf.file,
+      url: clientDocumentDownloadPath(tf.id),
+      download_url: clientDocumentDownloadPath(tf.id),
       file_size: 'Unknown',
     };
+  }
+
+  /**
+   * One vault document's content (GET /dashboard/documents/:id/download), for CLIENT users only.
+   * The file, its task and its project must not be deleted and the project must belong to the
+   * user's own client; another client's document and an unknown id are the same 404, so ids
+   * cannot be probed. The stored path is used only when it resolves (symlinks included) to a
+   * regular file inside media/task_files.
+   */
+  async getClientDocumentFile(user: any, documentId: unknown) {
+    const client = await this.resolveAssociatedClient(user);
+    const notFound = () => new NotFoundException('Document not found.');
+    // "taskfile-<id>" as listed (a bare id is accepted too); the vault holds task files only
+    const match = /^(?:taskfile-)?([1-9]\d{0,9})$/.exec(
+      String(documentId ?? ''),
+    );
+    const id = match ? Number(match[1]) : NaN;
+    if (!Number.isSafeInteger(id) || id > 2147483647) throw notFound();
+
+    const file = await this.prisma.taskFile.findFirst({
+      where: {
+        id,
+        deleted_at: null,
+        task: {
+          deleted_at: null,
+          project: { client_id: client.id, deleted_at: null },
+        },
+      },
+      select: { id: true, file: true, file_path: true },
+    });
+    if (!file) throw notFound();
+
+    const absolute = this.resolveTaskFilePath(file.file);
+    if (!absolute)
+      throw new NotFoundException('The file content is not available.');
+    // Only the base name is used for the download name (never a directory from the record)
+    const filename =
+      path.basename(String(file.file_path || absolute).replace(/\\/g, '/')) ||
+      'download';
+    return { absolute, size: fs.statSync(absolute).size, filename };
+  }
+
+  /** Real path of a stored task file, or null when missing, not a file or outside media/task_files. */
+  private resolveTaskFilePath(stored: unknown): string | null {
+    if (!stored) return null;
+    const relative = String(stored)
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '')
+      .replace(/^media\//, '');
+    const absolute = path.resolve(MEDIA_ROOT, relative);
+    if (!absolute.startsWith(TASK_FILES_DIR + path.sep)) return null;
+    try {
+      // A symlink inside task_files must not lead anywhere else
+      const real = fs.realpathSync(absolute);
+      const realDir = fs.realpathSync(TASK_FILES_DIR);
+      if (!real.startsWith(realDir + path.sep) || !fs.statSync(real).isFile())
+        return null;
+      return real;
+    } catch {
+      return null;
+    }
   }
 }
