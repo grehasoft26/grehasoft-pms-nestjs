@@ -21,6 +21,7 @@ export const PERMISSION_CATEGORIES = [
   'Reminders',
   'SEO',
   'HR',
+  'Credentials',
   'Administration',
 ] as const;
 
@@ -76,6 +77,10 @@ export const PERMISSION_DEFINITIONS: readonly PermissionDefinition[] = [
 
   { id: 'GENERATE_HR_DOCS', label: 'Generate HR documents', category: 'HR', description: 'Generate HR documents such as letters.' },
 
+  { id: 'MANAGE_CREDENTIALS', label: 'Manage credentials', category: 'Credentials', description: 'Manage credential records and replace stored secrets.' },
+  { id: 'REVEAL_CREDENTIALS', label: 'Reveal credentials', category: 'Credentials', description: 'Reveal stored credentials through authorized endpoints.' },
+  { id: 'VIEW_CREDENTIAL_AUDIT', label: 'View credential audit', category: 'Credentials', description: 'View credential access and permission-change audit records.' },
+
   { id: 'MANAGE_USERS', label: 'Manage users', category: 'Administration', description: 'Create, edit, deactivate users and assign roles.' },
   { id: 'MANAGE_ROLES', label: 'Manage roles', category: 'Administration', description: 'Create, edit and delete roles and their permissions.' },
   { id: 'MANAGE_DEPARTMENTS', label: 'Manage departments', category: 'Administration', description: 'Create and edit departments.' },
@@ -100,6 +105,22 @@ export const ROLE_MANAGEMENT_PERMISSION = 'MANAGE_ROLES';
  * VIEW_LEADS is included because the frontend Finance > Invoices menu is gated on it, so users
  * who could reach invoices through the UI keep access. Tightening this is a pending decision.
  */
+/**
+ * Credential Vault permissions. Only super admins may grant or revoke them: through role
+ * create/update (RolesService) and through user role assignment (UsersService).
+ */
+export const CREDENTIAL_PERMISSIONS = ['MANAGE_CREDENTIALS', 'REVEAL_CREDENTIALS', 'VIEW_CREDENTIAL_AUDIT'] as const;
+
+const CREDENTIAL_PERMISSION_SET: ReadonlySet<string> = new Set(CREDENTIAL_PERMISSIONS);
+
+export const isCredentialPermission = (value: string): boolean => CREDENTIAL_PERMISSION_SET.has(String(value).toUpperCase());
+
+/** Credential permissions (upper-cased, unique) in a role's stored permissions; [] for non-arrays. */
+export const credentialPermissionsIn = (permissions: unknown): string[] =>
+  Array.isArray(permissions)
+    ? [...new Set(permissions.filter((p): p is string => typeof p === 'string').map((p) => p.toUpperCase()).filter(isCredentialPermission))]
+    : [];
+
 export const INVOICE_READ_PERMISSIONS = ['MANAGE_INVOICES', 'VIEW_INVOICES', 'VIEW_LEADS'] as const;
 export const INVOICE_WRITE_PERMISSIONS = ['MANAGE_INVOICES', 'VIEW_LEADS'] as const;
 

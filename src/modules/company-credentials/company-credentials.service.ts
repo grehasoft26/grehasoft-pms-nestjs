@@ -1,29 +1,40 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+  UnprocessableEntityException,
+} from '@nestjs/common';
 import { CompanyCredentialCategory } from '@prisma/client';
 import { PrismaService } from '../../core/prisma.service';
-import { EncryptionService } from '../../core/encryption.service';
-import { isSuperAdmin } from '../../core/utils/role-access.util';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { canRevealCredentials, credentialCryptoHttpError } from '../../core/utils/credential-access.util';
+import { CredentialAuditContext, CredentialAuditService } from '../credential-audit/credential-audit.service';
 
 export const COMPANY_CREDENTIAL_CATEGORIES = Object.values(CompanyCredentialCategory);
+
+/** AAD identifiers for company_credentials.password; must match on encrypt and decrypt. */
+const PASSWORD_AAD = { table: 'company_credentials', field: 'password' } as const;
 
 /**
  * Internal Grehasoft company credentials.
  * Separate from client WebsiteCredential records (InfrastructureService), which are untouched.
  *
- * Passwords are encrypted with EncryptionService (AES-256-CBC, random IV, key from SECRET_KEY)
- * and are never included in list/detail responses; only super admins can reveal them
- * through the dedicated password endpoint.
+ * New passwords are encrypted with CredentialCryptoService (AES-256-GCM, AAD bound to the record
+ * id). Existing EncryptionService values ("ivhex:cthex", key from SECRET_KEY) stay readable; any
+ * other stored value is refused for manual review, never returned as if it were the password.
+ * Passwords never appear in list/detail/create/update responses; they are revealed one at a time
+ * through POST /:id/reveal, which requires REVEAL_CREDENTIALS and is audited (as are denials,
+ * creates, secret changes and deletes).
  */
 @Injectable()
 export class CompanyCredentialsService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly encryption: EncryptionService,
+    private readonly crypto: CredentialCryptoService,
+    private readonly audit: CredentialAuditService,
   ) {}
 
-  private isSuperAdmin(user: any): boolean {
-    return isSuperAdmin(user);
-  }
 
   /** Strips the stored password and exposes only whether one is set. */
   private format(credential: any) {
@@ -78,28 +89,53 @@ export class CompanyCredentialsService {
     return this.format(await this.getOrThrow(id));
   }
 
-  /** Decrypted password; super admins only. */
-  async revealPassword(user: any, id: number) {
-    if (!this.isSuperAdmin(user)) {
-      throw new ForbiddenException('Only super admins can view Grehasoft credential passwords.');
+  /**
+   * Decrypted password for an explicit reveal request. Permission is checked here rather than by
+   * the guard so refused attempts are audited (REVEAL_DENIED) before the record is even looked up.
+   * The secret is returned only after the REVEAL audit row is written.
+   */
+  async revealPassword(user: any, id: number, context: CredentialAuditContext) {
+    if (!canRevealCredentials(user)) {
+      await this.audit
+        .record(context, { credentialType: 'company', credentialId: id, action: 'REVEAL_DENIED' })
+        .catch(() => undefined); // the request is refused either way
+      throw new ForbiddenException('You do not have permission to reveal credentials.');
     }
     const credential = await this.getOrThrow(id);
-    return { password: credential.password ? this.encryption.decrypt(credential.password) : '' };
+    const password = credential.password ? this.readPassword(credential.password, id) : '';
+    await this.audit.record(context, { credentialType: 'company', credentialId: id, action: 'REVEAL' });
+    return { password };
   }
 
-  async create(data: any) {
+  async create(data: any, context: CredentialAuditContext) {
     const input = this.validate(data, true);
-    const credential = await this.prisma.companyCredential.create({
-      data: {
-        name: input.name!,
-        category: input.category ?? CompanyCredentialCategory.OTHER,
-        provider: input.provider ?? null,
-        login_url: input.login_url ?? null,
-        username: input.username ?? null,
-        password: input.password ? this.encryption.encrypt(input.password) : null,
-        notes: input.notes ?? null,
-      },
-    });
+    if (input.password) this.assertCryptoReady();
+
+    const credential = await this.withCrypto(() =>
+      this.prisma.$transaction(async (tx: any) => {
+        // The record id is part of the AAD, so the row is created first and the secret added in
+        // the same transaction; a failure rolls both back (plaintext is never written)
+        let row = await tx.companyCredential.create({
+          data: {
+            name: input.name!,
+            category: input.category ?? CompanyCredentialCategory.OTHER,
+            provider: input.provider ?? null,
+            login_url: input.login_url ?? null,
+            username: input.username ?? null,
+            password: null,
+            notes: input.notes ?? null,
+          },
+        });
+        if (input.password) {
+          row = await tx.companyCredential.update({
+            where: { id: row.id },
+            data: { password: this.crypto.encrypt(input.password, { ...PASSWORD_AAD, recordId: row.id }) },
+          });
+        }
+        await this.audit.record(context, { credentialType: 'company', credentialId: row.id, action: 'CREATE' }, tx);
+        return row;
+      }),
+    );
     return this.format(credential);
   }
 
@@ -107,7 +143,7 @@ export class CompanyCredentialsService {
    * Partial update. Password: omitted/empty keeps the stored value,
    * a new value replaces it, `clear_password: true` removes it.
    */
-  async update(id: number, data: any) {
+  async update(id: number, data: any, context: CredentialAuditContext) {
     await this.getOrThrow(id);
     const input = this.validate(data, false);
 
@@ -115,27 +151,70 @@ export class CompanyCredentialsService {
     if (data?.clear_password === true) {
       password = null;
     } else if (input.password) {
-      password = this.encryption.encrypt(input.password);
+      this.assertCryptoReady();
+      password = this.withCryptoSync(() => this.crypto.encrypt(input.password!, { ...PASSWORD_AAD, recordId: id }));
     }
+    const secretChanged = password !== undefined;
 
-    const credential = await this.prisma.companyCredential.update({
-      where: { id },
-      data: {
-        name: input.name,
-        category: input.category,
-        provider: input.provider,
-        login_url: input.login_url,
-        username: input.username,
-        password,
-        notes: input.notes,
-      },
+    const credential = await this.prisma.$transaction(async (tx: any) => {
+      const row = await tx.companyCredential.update({
+        where: { id },
+        data: {
+          name: input.name,
+          category: input.category,
+          provider: input.provider,
+          login_url: input.login_url,
+          username: input.username,
+          password,
+          notes: input.notes,
+        },
+      });
+      if (secretChanged) {
+        await this.audit.record(context, { credentialType: 'company', credentialId: id, action: 'UPDATE_SECRET' }, tx);
+      }
+      return row;
     });
     return this.format(credential);
   }
 
-  async remove(id: number) {
+  async remove(id: number, context: CredentialAuditContext) {
     await this.getOrThrow(id);
-    await this.prisma.companyCredential.delete({ where: { id } });
+    await this.prisma.$transaction(async (tx: any) => {
+      await tx.companyCredential.delete({ where: { id } });
+      await this.audit.record(context, { credentialType: 'company', credentialId: id, action: 'DELETE' }, tx);
+    });
+  }
+
+  /** gcm1 values and verified legacy EncryptionService values; anything else needs manual review. */
+  private readPassword(stored: string, id: number): string {
+    return this.withCryptoSync(() => {
+      const format = this.crypto.classify(stored);
+      if (format === 'gcm1') return this.crypto.decrypt(stored, { ...PASSWORD_AAD, recordId: id });
+      if (format === 'legacy-cbc-secret-key') return this.crypto.decryptLegacy(stored).plaintext;
+      throw new UnprocessableEntityException(
+        'The stored password is not in a recognised encrypted format and needs manual review. Replace it to continue.',
+      );
+    });
+  }
+
+  private assertCryptoReady() {
+    this.withCryptoSync(() => this.crypto.assertReady());
+  }
+
+  private withCryptoSync<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (error) {
+      throw credentialCryptoHttpError(error);
+    }
+  }
+
+  private async withCrypto<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (error) {
+      throw credentialCryptoHttpError(error);
+    }
   }
 
   private async getOrThrow(id: number) {

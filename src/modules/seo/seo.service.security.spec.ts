@@ -1,10 +1,16 @@
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import * as nodeCrypto from 'crypto';
 import { SeoService } from './seo.service';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { CredentialAuditService } from '../credential-audit/credential-audit.service';
 
 /**
  * Phase 2.2: SEO record-level authorization. Daily-log IDOR, item password exposure,
- * self-approval, task/reminder writes and decrypted SEO credentials.
+ * self-approval, task/reminder writes and SEO credentials. Since Stage 7 no response carries a
+ * password (seo-credentials.http.spec covers the audited reveal endpoints).
  */
+const CTX = { actorId: 1, actorUsername: 'tester', ipAddress: null, userAgent: null };
+const MASK = '••••••••';
 const manager = { id: 10, role: { name: 'SEO_MANAGER' } };
 const exec = { id: 20, role: { name: 'SEO_EXECUTIVE' } };
 const otherExec = { id: 21, role: { name: 'SEO_EXECUTIVE' } };
@@ -14,7 +20,7 @@ const otherClient = { id: 41, client_id: 2, role: { name: 'CLIENT' } };
 
 const buildPrisma = () => ({
   sEODailyWorkLog: {
-    findUnique: jest.fn(),
+    findUnique: jest.fn(async ({ where }: any) => ({ id: where.id, items: [] })),
     findFirst: jest.fn().mockResolvedValue(null),
     findMany: jest.fn().mockResolvedValue([]),
     count: jest.fn().mockResolvedValue(0),
@@ -22,7 +28,13 @@ const buildPrisma = () => ({
     update: jest.fn(async ({ where, data }: any) => ({ id: where.id, items: [], ...data })),
     delete: jest.fn(async () => ({})),
   },
-  sEODailyWorkLogItem: { create: jest.fn(async () => ({})) },
+  sEODailyWorkLogItem: {
+    create: jest.fn(async ({ data }: any) => ({ id: 1, ...data })),
+    update: jest.fn(async ({ where, data }: any) => ({ id: where.id, ...data })),
+    findMany: jest.fn().mockResolvedValue([]),
+  },
+  credentialAuditLog: { create: jest.fn(async ({ data }: any) => data) },
+  $transaction: jest.fn(),
   sEOTask: {
     findUnique: jest.fn(async ({ where }: any) => (where.id === 1 ? { id: 1, assigned_executive_id: exec.id } : null)),
     update: jest.fn(async ({ where, data }: any) => ({ id: where.id, ...data })),
@@ -40,6 +52,8 @@ describe('SeoService security (Phase 2.2)', () => {
   let prisma: ReturnType<typeof buildPrisma>;
   let service: SeoService;
   let encrypted: string;
+  let crypto: CredentialCryptoService;
+  const KEY = nodeCrypto.randomBytes(32).toString('base64');
 
   const log = (overrides: any = {}) => ({
     id: 5,
@@ -54,8 +68,11 @@ describe('SeoService security (Phase 2.2)', () => {
 
   beforeEach(() => {
     prisma = buildPrisma();
-    service = new SeoService(prisma as any);
-    encrypted = (service as any).encryptPassword('s3cret');
+    prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+    const config: any = { get: (k: string) => ({ CREDENTIAL_KEYS: `1:${KEY}`, CREDENTIAL_ACTIVE_KEY_VERSION: '1' } as any)[k] };
+    crypto = new CredentialCryptoService(config);
+    service = new SeoService(prisma as any, crypto, new CredentialAuditService(prisma as any));
+    encrypted = crypto.encrypt('s3cret', { table: 'seo_daily_work_log_item', field: 'password', recordId: 1 });
   });
 
   describe('GET /seo-daily-logs/:id scope', () => {
@@ -79,18 +96,21 @@ describe('SeoService security (Phase 2.2)', () => {
   describe('daily-log item passwords', () => {
     beforeEach(() => prisma.sEODailyWorkLog.findUnique.mockResolvedValue(log()));
 
-    it('are decrypted for managers and the log executive', async () => {
+    it('are never returned, even to managers and the log executive (masked; no decrypted_password)', async () => {
       for (const viewer of [manager, exec]) {
         const result: any = await service.getDailyLogById(viewer, 5);
-        expect(result.items[0]).toMatchObject({ password: 's3cret', decrypted_password: 's3cret' });
+        expect(result.items[0].password).toBe(MASK);
+        expect(result.items[0]).not.toHaveProperty('decrypted_password');
+        expect(JSON.stringify(result)).not.toMatch(/s3cret|gcm1/);
       }
     });
 
     it('are blank for clients and other staff', async () => {
       for (const viewer of [client, member]) {
         const result: any = await service.getDailyLogById(viewer, 5);
-        expect(result.items[0]).toMatchObject({ password: '', decrypted_password: '' });
-        expect(JSON.stringify(result)).not.toContain('s3cret');
+        expect(result.items[0].password).toBe('');
+        expect(result.items[0]).not.toHaveProperty('decrypted_password');
+        expect(JSON.stringify(result)).not.toMatch(/s3cret|gcm1/);
       }
     });
 
@@ -98,6 +118,7 @@ describe('SeoService security (Phase 2.2)', () => {
       prisma.sEODailyWorkLog.findMany.mockResolvedValue([log()]);
       const rows: any = await service.getDailyLogs(client, { all: 'true' });
       expect(rows[0].items[0].password).toBe('');
+      expect(JSON.stringify(rows)).not.toMatch(/s3cret|gcm1/);
     });
   });
 
@@ -124,28 +145,28 @@ describe('SeoService security (Phase 2.2)', () => {
     const body = { website: 3, log_date: '2026-10-17', items: [{ activity_type: 1, count: 1 }] };
 
     it('executives cannot log work for another executive', async () => {
-      await expect(service.createDailyLog(exec, { ...body, executive: otherExec.id })).rejects.toThrow(ForbiddenException);
+      await expect(service.createDailyLog(exec, { ...body, executive: otherExec.id }, CTX)).rejects.toThrow(ForbiddenException);
       expect(prisma.sEODailyWorkLog.create).not.toHaveBeenCalled();
     });
 
     it('executives cannot self-approve', async () => {
-      await expect(service.createDailyLog(exec, { ...body, status: 'approved' })).rejects.toThrow(BadRequestException);
-      await expect(service.addItemsToDailyLog(exec, { ...body, status: 'approved' })).rejects.toThrow(BadRequestException);
+      await expect(service.createDailyLog(exec, { ...body, status: 'approved' }, CTX)).rejects.toThrow(BadRequestException);
+      await expect(service.addItemsToDailyLog(exec, { ...body, status: 'approved' }, CTX)).rejects.toThrow(BadRequestException);
       expect(prisma.sEODailyWorkLog.create).not.toHaveBeenCalled();
     });
 
     it('executives can still save their own drafts and submissions', async () => {
-      await expect(service.createDailyLog(exec, { ...body, status: 'submitted' })).resolves.toBeTruthy();
+      await expect(service.createDailyLog(exec, { ...body, status: 'submitted' }, CTX)).resolves.toBeTruthy();
       expect(prisma.sEODailyWorkLog.create.mock.calls[0][0].data).toMatchObject({ executive_id: exec.id, status: 'submitted' });
     });
 
     it('managers can log on behalf of an executive', async () => {
-      await service.createDailyLog(manager, { ...body, executive: exec.id, status: 'approved' });
+      await service.createDailyLog(manager, { ...body, executive: exec.id, status: 'approved' }, CTX);
       expect(prisma.sEODailyWorkLog.create.mock.calls[0][0].data).toMatchObject({ executive_id: exec.id, status: 'approved' });
     });
 
     it('clients cannot add items', async () => {
-      await expect(service.addItemsToDailyLog(client, body)).rejects.toThrow(ForbiddenException);
+      await expect(service.addItemsToDailyLog(client, body, CTX)).rejects.toThrow(ForbiddenException);
     });
   });
 
@@ -163,11 +184,11 @@ describe('SeoService security (Phase 2.2)', () => {
     });
 
     it('only managers or the log executive can delete', async () => {
-      await expect(service.deleteDailyLog(otherExec, 5)).rejects.toThrow(ForbiddenException);
-      await expect(service.deleteDailyLog(member, 5)).rejects.toThrow(ForbiddenException);
+      await expect(service.deleteDailyLog(otherExec, 5, CTX)).rejects.toThrow(ForbiddenException);
+      await expect(service.deleteDailyLog(member, 5, CTX)).rejects.toThrow(ForbiddenException);
       expect(prisma.sEODailyWorkLog.delete).not.toHaveBeenCalled();
-      await expect(service.deleteDailyLog(exec, 5)).resolves.not.toThrow();
-      await expect(service.deleteDailyLog(manager, 5)).resolves.not.toThrow();
+      await expect(service.deleteDailyLog(exec, 5, CTX)).resolves.not.toThrow();
+      await expect(service.deleteDailyLog(manager, 5, CTX)).resolves.not.toThrow();
     });
   });
 
@@ -197,7 +218,7 @@ describe('SeoService security (Phase 2.2)', () => {
     });
   });
 
-  describe('decrypted SEO credentials', () => {
+  describe('SEO credential metadata', () => {
     beforeEach(() => prisma.sEOCredential.findMany.mockResolvedValue([{ id: 1, website_id: 3, password: encrypted }]));
 
     it('are refused to clients and other staff', async () => {
@@ -209,7 +230,8 @@ describe('SeoService security (Phase 2.2)', () => {
     it('are limited to assigned websites for executives', async () => {
       const rows = await service.getCredentials(exec);
       expect(prisma.sEOCredential.findMany.mock.calls[0][0].where).toEqual({ website: { assigned_executive_id: exec.id } });
-      expect(rows[0].password).toBe('s3cret');
+      expect(rows[0].password).toBe(MASK);
+      expect(JSON.stringify(rows)).not.toMatch(/s3cret|gcm1/);
     });
 
     it('are returned in full to managers', async () => {

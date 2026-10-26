@@ -4,7 +4,9 @@ import { getActiveRolePermissions, isSuperAdmin, isSuperAdminRole } from '../../
 import {
   PERMISSION_CATEGORIES,
   PERMISSION_DEFINITIONS,
+  credentialPermissionsIn,
   isBuiltInRoleName,
+  isCredentialPermission,
   isKnownPermission,
 } from '../../core/utils/permission-catalog';
 import { PermissionCatalogResponseDto } from './dto/permission-catalog.dto';
@@ -60,7 +62,8 @@ export class RolesService {
 
   /**
    * Canonical permission catalog for the role UI. `assignable` reflects the delegation
-   * rule: super admins may grant everything; other role managers only what they hold.
+   * rule: super admins may grant everything; other role managers only what they hold,
+   * never credential permissions.
    */
   getPermissionCatalog(reqUser?: any): PermissionCatalogResponseDto {
     const superAdmin = isSuperAdmin(reqUser);
@@ -72,7 +75,7 @@ export class RolesService {
         label: p.label,
         category: p.category,
         description: p.description,
-        assignable: superAdmin || held.has(p.id),
+        assignable: superAdmin || (held.has(p.id) && !isCredentialPermission(p.id)),
       })),
     };
   }
@@ -196,9 +199,19 @@ export class RolesService {
    * Delegation rule: a non-super-admin role manager may only ADD permissions they hold
    * themselves (removing permissions is allowed). Prevents granting a role more access
    * than the manager has and then using it, e.g. via a user created with that role.
+   * Credential permissions are stricter: only super admins may add OR remove them.
    */
   private assertCanGrant(reqUser: any, permissions: string[], previous: string[] = []) {
     if (isSuperAdmin(reqUser)) return;
+    const credentialBefore = credentialPermissionsIn(previous);
+    const credentialAfter = credentialPermissionsIn(permissions);
+    const credentialChanged = [
+      ...credentialAfter.filter((p) => !credentialBefore.includes(p)),
+      ...credentialBefore.filter((p) => !credentialAfter.includes(p)),
+    ];
+    if (credentialChanged.length > 0) {
+      throw new ForbiddenException(`Only Super Admins can grant or revoke credential permissions: ${credentialChanged.join(', ')}.`);
+    }
     const held = new Set(getActiveRolePermissions(reqUser));
     const before = new Set(previous.map((p) => String(p).toUpperCase()));
     const notHeld = permissions.filter((p) => !before.has(p) && !held.has(p));

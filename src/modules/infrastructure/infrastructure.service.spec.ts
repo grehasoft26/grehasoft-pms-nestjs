@@ -1,7 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { InfrastructureService } from './infrastructure.service';
 import { PrismaService } from '../../core/prisma.service';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { CredentialAuditService } from '../credential-audit/credential-audit.service';
+import { ConfigService } from '@nestjs/config';
+import * as nodeCrypto from 'crypto';
+
+/** Audit context for server writes (the controller passes the request's). */
+const CTX = { actorId: 1, actorUsername: 'admin', ipAddress: null, userAgent: null };
+const SERVER_TEST_ENV: Record<string, string> = {
+  CREDENTIAL_KEYS: `1:${nodeCrypto.randomBytes(32).toString('base64')}`,
+  CREDENTIAL_ACTIVE_KEY_VERSION: '1',
+};
 
 describe('InfrastructureService - Domains', () => {
   let service: InfrastructureService;
@@ -52,6 +63,9 @@ describe('InfrastructureService - Domains', () => {
       providers: [
         InfrastructureService,
         { provide: PrismaService, useValue: mockPrismaService },
+        // Server passwords are not exercised here
+        { provide: CredentialCryptoService, useValue: {} },
+        { provide: CredentialAuditService, useValue: {} },
       ],
     }).compile();
 
@@ -380,17 +394,21 @@ describe('InfrastructureService - Servers', () => {
       count: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      delete: jest.fn(async (args: any) => ({ id: args.where.id })),
     },
     projectMember: {
       findMany: jest.fn(),
     },
     domain: {
       count: jest.fn(),
+      // Projects of the domains using a server (write scope)
+      findMany: jest.fn(),
     },
     // Manual expiry changes: update + renewal history entry in one transaction
     assetRenewal: {
       create: jest.fn(async (args: any) => ({ id: 1, ...args.data })),
     },
+    credentialAuditLog: { create: jest.fn(async (args: any) => args.data) },
     $transaction: jest.fn(async (fn: any): Promise<any> => fn(mockPrismaService)),
     // Row lock for expiry changes (SELECT id, expiry_date ... FOR UPDATE), answered from the stored server
     $queryRaw: jest.fn(async (sql: any): Promise<any[]> => {
@@ -402,6 +420,8 @@ describe('InfrastructureService - Servers', () => {
   const adminUser = { id: 1, role: { name: 'SUPER_ADMIN' } };
   const staffUser = { id: 2, role: { name: 'DEVELOPER' } };
   const MASK = '••••••••';
+  const AAD = (id: number) => ({ table: 'servers', field: 'password', recordId: id });
+  let crypto: CredentialCryptoService;
 
   // Echo create/update payloads back as the stored row
   const echoRow = (args: any) => Promise.resolve({ id: 7, created_at: new Date(), ...args.data });
@@ -413,10 +433,14 @@ describe('InfrastructureService - Servers', () => {
       providers: [
         InfrastructureService,
         { provide: PrismaService, useValue: mockPrismaService },
+        CredentialCryptoService,
+        CredentialAuditService,
+        { provide: ConfigService, useValue: { get: (k: string) => SERVER_TEST_ENV[k] } },
       ],
     }).compile();
 
     service = module.get<InfrastructureService>(InfrastructureService);
+    crypto = module.get(CredentialCryptoService);
 
     jest.clearAllMocks();
     mockPrismaService.server.create.mockImplementation(echoRow);
@@ -432,22 +456,34 @@ describe('InfrastructureService - Servers', () => {
         phone_number: ' +91 98765 43210 ',
         purchase_date: '2026-01-15',
         expiry_date: '2027-01-15',
-      });
+      }, CTX);
 
       const data = mockPrismaService.server.create.mock.calls[0][0].data;
       expect(data.username).toBe('root');
-      expect(data.password).not.toBe('s3cret!');
-      expect(data.password).toMatch(/^[0-9a-f]+$/);
+      // Row created without the password, then the gcm1 value for that id in the same transaction
+      expect(data.password).toBe('');
+      const stored = mockPrismaService.server.update.mock.calls[0][0].data.password;
+      expect(stored).toMatch(/^gcm1:1:/);
+      expect(crypto.decrypt(stored, AAD(7))).toBe('s3cret!');
+      expect(() => crypto.decrypt(stored, AAD(8))).toThrow();
       expect(data.phone_number).toBe('+91 98765 43210');
       expect(dateKey(data.purchase_date)).toBe('2026-01-15');
       expect(dateKey(data.expiry_date)).toBe('2027-01-15');
 
-      // Admin receives the decrypted password back
-      expect(result.password).toBe('s3cret!');
+      // Nobody receives the password back, super admins included
+      expect(result.password).toBe(MASK);
+      expect(JSON.stringify(result)).not.toMatch(/s3cret!|gcm1/);
+      expect(mockPrismaService.credentialAuditLog.create.mock.calls.map((c: any) => c[0].data.action)).toEqual(['CREATE']);
+    });
+
+    it('creating a server without a password is not a credential event', async () => {
+      await service.createServer(adminUser, { name: 'No secret' }, CTX);
+      expect(mockPrismaService.server.update).not.toHaveBeenCalled();
+      expect(mockPrismaService.credentialAuditLog.create).not.toHaveBeenCalled();
     });
 
     it('keeps the new fields optional', async () => {
-      await service.createServer(adminUser, { name: 'Minimal', purchase_date: '', expiry_date: '' });
+      await service.createServer(adminUser, { name: 'Minimal', purchase_date: '', expiry_date: '' }, CTX);
 
       const data = mockPrismaService.server.create.mock.calls[0][0].data;
       expect(data.password).toBe('');
@@ -456,26 +492,26 @@ describe('InfrastructureService - Servers', () => {
     });
 
     it('accepts ISO timestamps without shifting the calendar day', async () => {
-      await service.createServer(adminUser, { name: 'S', expiry_date: '2026-12-15T00:00:00.000Z' });
+      await service.createServer(adminUser, { name: 'S', expiry_date: '2026-12-15T00:00:00.000Z' }, CTX);
 
       const data = mockPrismaService.server.create.mock.calls[0][0].data;
       expect(dateKey(data.expiry_date)).toBe('2026-12-15');
     });
 
     it('rejects an invalid date', async () => {
-      await expect(service.createServer(adminUser, { name: 'S', purchase_date: '2026-02-30' })).rejects.toThrow(BadRequestException);
-      await expect(service.createServer(adminUser, { name: 'S', expiry_date: 'tomorrow' })).rejects.toThrow(BadRequestException);
+      await expect(service.createServer(adminUser, { name: 'S', purchase_date: '2026-02-30' }, CTX)).rejects.toThrow(BadRequestException);
+      await expect(service.createServer(adminUser, { name: 'S', expiry_date: 'tomorrow' }, CTX)).rejects.toThrow(BadRequestException);
       expect(mockPrismaService.server.create).not.toHaveBeenCalled();
     });
 
     it('rejects an expiry date before the purchase date', async () => {
       await expect(
-        service.createServer(adminUser, { name: 'S', purchase_date: '2026-05-01', expiry_date: '2026-04-30' }),
+        service.createServer(adminUser, { name: 'S', purchase_date: '2026-05-01', expiry_date: '2026-04-30' }, CTX),
       ).rejects.toThrow('Expiry date cannot be earlier than purchase date.');
     });
 
     it('rejects an invalid phone number', async () => {
-      await expect(service.createServer(adminUser, { name: 'S', phone_number: 'call me' })).rejects.toThrow(BadRequestException);
+      await expect(service.createServer(adminUser, { name: 'S', phone_number: 'call me' }, CTX)).rejects.toThrow(BadRequestException);
     });
   });
 
@@ -483,16 +519,17 @@ describe('InfrastructureService - Servers', () => {
     const storedRow = () => ({
       id: 7,
       name: 'Prod',
-      password: (service as any).encryptPassword('s3cret!'),
+      password: crypto.encrypt('s3cret!', AAD(7)),
       expiry_date: new Date('2027-01-15'),
     });
 
-    it('returns the decrypted password to admins', async () => {
+    it('masks the password for super admins too (reveal is a separate endpoint)', async () => {
       mockPrismaService.server.findUnique.mockResolvedValue(storedRow());
 
       const server = await service.getServerById(adminUser, 7);
 
-      expect(server.password).toBe('s3cret!');
+      expect(server.password).toBe(MASK);
+      expect(JSON.stringify(server)).not.toMatch(/s3cret!|gcm1/);
     });
 
     it('masks the password for non-admins (who are members of a linked project)', async () => {
@@ -540,7 +577,7 @@ describe('InfrastructureService - Servers', () => {
       });
 
       it('does not decrypt passwords for super admins', async () => {
-        const decrypt = jest.spyOn(service as any, 'decryptPassword');
+        const decrypt = jest.spyOn(crypto, 'decrypt');
         mockPrismaService.server.findMany.mockResolvedValue([expiryRow]);
 
         await service.getServers(adminUser, { fields: 'expiry', all: 'true' });
@@ -572,7 +609,7 @@ describe('InfrastructureService - Servers', () => {
         const res: any = await service.getServers(adminUser, { all: 'true' });
 
         expect(mockPrismaService.server.findMany.mock.calls[0][0].select).toBeUndefined();
-        expect(res[0].password).toBe('s3cret!');
+        expect(res[0].password).toBe(MASK);
       });
     });
   });
@@ -596,30 +633,34 @@ describe('InfrastructureService - Servers', () => {
         password: 'new-pass',
         phone_number: '0123 456 789',
         expiry_date: '2028-01-15',
-      });
+      }, CTX);
 
       const data = mockPrismaService.server.update.mock.calls[0][0].data;
       expect(data.username).toBe('admin');
-      expect((service as any).decryptPassword(data.password)).toBe('new-pass');
+      expect(crypto.decrypt(data.password, AAD(7))).toBe('new-pass');
+      expect(mockPrismaService.credentialAuditLog.create.mock.calls.map((c: any) => c[0].data.action)).toEqual(['UPDATE_SECRET']);
       expect(data.phone_number).toBe('0123 456 789');
       expect(dateKey(data.expiry_date)).toBe('2028-01-15');
       expect(data.purchase_date).toBeUndefined();
     });
 
     it('does not overwrite the password with the masked placeholder', async () => {
-      await service.updateServer(staffUser, 7, { name: 'Prod', password: MASK });
+      // Staff member of the only project using this server
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+      mockPrismaService.domain.findMany.mockResolvedValue([{ project_id: 3 }]);
+      await service.updateServer(staffUser, 7, { name: 'Prod', password: MASK }, CTX);
 
       expect(mockPrismaService.server.update.mock.calls[0][0].data.password).toBeUndefined();
     });
 
     it('leaves the password unchanged when it is not sent', async () => {
-      await service.updateServer(adminUser, 7, { name: 'Prod' });
+      await service.updateServer(adminUser, 7, { name: 'Prod' }, CTX);
 
       expect(mockPrismaService.server.update.mock.calls[0][0].data.password).toBeUndefined();
     });
 
     it('clears dates when empty values are sent', async () => {
-      await service.updateServer(adminUser, 7, { purchase_date: '', expiry_date: '' });
+      await service.updateServer(adminUser, 7, { purchase_date: '', expiry_date: '' }, CTX);
 
       const data = mockPrismaService.server.update.mock.calls[0][0].data;
       expect(data.purchase_date).toBeNull();
@@ -627,14 +668,14 @@ describe('InfrastructureService - Servers', () => {
     });
 
     it('validates date order against the existing purchase date', async () => {
-      await expect(service.updateServer(adminUser, 7, { expiry_date: '2025-12-31' })).rejects.toThrow(BadRequestException);
+      await expect(service.updateServer(adminUser, 7, { expiry_date: '2025-12-31' }, CTX)).rejects.toThrow(BadRequestException);
       expect(mockPrismaService.server.update).not.toHaveBeenCalled();
     });
 
     it('throws NotFoundException for a missing server', async () => {
       mockPrismaService.server.findUnique.mockResolvedValue(null);
 
-      await expect(service.updateServer(adminUser, 999, {})).rejects.toThrow(NotFoundException);
+      await expect(service.updateServer(adminUser, 999, {}, CTX)).rejects.toThrow(NotFoundException);
     });
   });
 
@@ -643,27 +684,27 @@ describe('InfrastructureService - Servers', () => {
     beforeEach(() => mockPrismaService.server.findUnique.mockResolvedValue(existing));
 
     it('stores a validated default renewal period on create and update', async () => {
-      await service.createServer(adminUser, { name: 'New', renewal_period_value: '3', renewal_period_unit: 'Month' });
+      await service.createServer(adminUser, { name: 'New', renewal_period_value: '3', renewal_period_unit: 'Month' }, CTX);
       expect(mockPrismaService.server.create.mock.calls[0][0].data).toMatchObject({ renewal_period_value: 3, renewal_period_unit: 'month' });
 
-      await service.updateServer(adminUser, 7, { renewal_period_value: null, renewal_period_unit: null });
+      await service.updateServer(adminUser, 7, { renewal_period_value: null, renewal_period_unit: null }, CTX);
       expect(mockPrismaService.server.update.mock.calls[0][0].data).toMatchObject({ renewal_period_value: null, renewal_period_unit: null });
     });
 
     it('leaves the renewal period unchanged when it is not sent', async () => {
-      await service.updateServer(adminUser, 7, { name: 'Prod' });
+      await service.updateServer(adminUser, 7, { name: 'Prod' }, CTX);
       expect(mockPrismaService.server.update.mock.calls[0][0].data).not.toHaveProperty('renewal_period_value');
     });
 
     it('rejects an invalid renewal period with 400 and saves nothing', async () => {
-      await expect(service.updateServer(adminUser, 7, { renewal_period_value: 0, renewal_period_unit: 'year' })).rejects.toThrow(BadRequestException);
-      await expect(service.createServer(adminUser, { name: 'X', renewal_period_value: 1, renewal_period_unit: 'week' })).rejects.toThrow(BadRequestException);
+      await expect(service.updateServer(adminUser, 7, { renewal_period_value: 0, renewal_period_unit: 'year' }, CTX)).rejects.toThrow(BadRequestException);
+      await expect(service.createServer(adminUser, { name: 'X', renewal_period_value: 1, renewal_period_unit: 'week' }, CTX)).rejects.toThrow(BadRequestException);
       expect(mockPrismaService.server.update).not.toHaveBeenCalled();
       expect(mockPrismaService.server.create).not.toHaveBeenCalled();
     });
 
     it('records a manual expiry change in the renewal history, in the same transaction', async () => {
-      await service.updateServer({ ...adminUser, name: 'Admin User' }, 7, { expiry_date: '2028-01-15' });
+      await service.updateServer({ ...adminUser, name: 'Admin User' }, 7, { expiry_date: '2028-01-15' }, CTX);
       expect(mockPrismaService.$transaction).toHaveBeenCalledTimes(1);
       const entry = mockPrismaService.assetRenewal.create.mock.calls[0][0].data;
       expect(entry).toMatchObject({ asset_type: 'server', asset_id: 7, server_id: 7, asset_name: 'Prod', event: 'manual_change', performed_by_id: 1, performed_by_name: 'Admin User' });
@@ -673,20 +714,113 @@ describe('InfrastructureService - Servers', () => {
     });
 
     it('records clearing the expiry date', async () => {
-      await service.updateServer(adminUser, 7, { expiry_date: '' });
+      await service.updateServer(adminUser, 7, { expiry_date: '' }, CTX);
       expect(mockPrismaService.assetRenewal.create.mock.calls[0][0].data).toMatchObject({ event: 'manual_change', new_expiry_date: null });
     });
 
     it('writes no history when the expiry date is not sent or unchanged', async () => {
-      await service.updateServer(adminUser, 7, { name: 'Renamed' });
-      await service.updateServer(adminUser, 7, { expiry_date: '2027-01-15' });
+      await service.updateServer(adminUser, 7, { name: 'Renamed' }, CTX);
+      await service.updateServer(adminUser, 7, { expiry_date: '2027-01-15' }, CTX);
       expect(mockPrismaService.assetRenewal.create).not.toHaveBeenCalled();
       expect(mockPrismaService.$transaction).not.toHaveBeenCalled();
     });
 
     it('if the history entry cannot be written, the update fails too', async () => {
       mockPrismaService.assetRenewal.create.mockRejectedValueOnce(new Error('history write failed'));
-      await expect(service.updateServer(adminUser, 7, { expiry_date: '2028-01-15' })).rejects.toThrow('history write failed');
+      await expect(service.updateServer(adminUser, 7, { expiry_date: '2028-01-15' }, CTX)).rejects.toThrow('history write failed');
+    });
+  });
+
+  describe('write scope (non-super-admins)', () => {
+    const existing = { id: 7, name: 'Prod', password: '', purchase_date: null, expiry_date: null };
+    beforeEach(() => {
+      mockPrismaService.server.findUnique.mockResolvedValue(existing);
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+    });
+
+    it('cannot update or delete a server not used by their projects (404), nothing written', async () => {
+      mockPrismaService.domain.findMany.mockResolvedValue([{ project_id: 9 }]);
+      await expect(service.updateServer(staffUser, 7, { name: 'X', password: 'hijack' }, CTX)).rejects.toThrow(NotFoundException);
+      await expect(service.deleteServer(staffUser, 7, CTX)).rejects.toThrow(NotFoundException);
+      expect(mockPrismaService.server.update).not.toHaveBeenCalled();
+      expect(mockPrismaService.server.delete).not.toHaveBeenCalled();
+    });
+
+    it('cannot change a server shared with a project they cannot access', async () => {
+      mockPrismaService.domain.findMany.mockResolvedValue([{ project_id: 3 }, { project_id: 9 }]);
+      await expect(service.updateServer(staffUser, 7, { name: 'X' }, CTX)).rejects.toThrow(NotFoundException);
+    });
+
+    it('cannot change a server no domain uses (it is not visible to them either)', async () => {
+      mockPrismaService.domain.findMany.mockResolvedValue([]);
+      await expect(service.deleteServer(staffUser, 7, CTX)).rejects.toThrow(NotFoundException);
+    });
+
+    it('can change a server used only by their projects; super admins are not scoped', async () => {
+      mockPrismaService.domain.findMany.mockResolvedValue([{ project_id: 3 }]);
+      await service.updateServer(staffUser, 7, { name: 'Renamed' }, CTX);
+      mockPrismaService.domain.findMany.mockResolvedValue([{ project_id: 9 }]);
+      await service.updateServer(adminUser, 7, { name: 'Again' }, CTX);
+      expect(mockPrismaService.server.update).toHaveBeenCalledTimes(2);
+    });
+
+    it('deleting a server audits DELETE only when it held a password', async () => {
+      await service.deleteServer(adminUser, 7, CTX);
+      expect(mockPrismaService.credentialAuditLog.create).not.toHaveBeenCalled();
+      mockPrismaService.server.findUnique.mockResolvedValue({ ...existing, password: 'gcm1:x' });
+      await service.deleteServer(adminUser, 7, CTX);
+      expect(mockPrismaService.credentialAuditLog.create.mock.calls.map((c: any) => c[0].data)).toEqual([
+        expect.objectContaining({ action: 'DELETE', credential_type: 'server', credential_id: 7 }),
+      ]);
+    });
+  });
+
+  describe('revealServerPassword', () => {
+    const revealer = { id: 4, role: { name: 'VAULT', permissions: ['REVEAL_CREDENTIALS'] } };
+    const actions = () => mockPrismaService.credentialAuditLog.create.mock.calls.map((c: any) => c[0].data.action);
+
+    it('returns the password after auditing REVEAL (gcm1 and the former static-key format)', async () => {
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+      mockPrismaService.domain.count.mockResolvedValue(1);
+      mockPrismaService.server.findUnique.mockResolvedValue({ id: 7, password: crypto.encrypt('s3cret!', AAD(7)) });
+      await expect(service.revealServerPassword(revealer, 7, CTX)).resolves.toEqual({ password: 's3cret!' });
+      // Static-key hex as the former helper wrote it (frozen fixture, see credential-crypto.service.spec)
+      mockPrismaService.server.findUnique.mockResolvedValue({ id: 7, password: '7712cdc078d0ac9d5cf600170c2091e424d1124a9cb9f8acd6ac52bf7444e727' });
+      await expect(service.revealServerPassword(adminUser, 7, CTX)).resolves.toEqual({ password: 'legacy-cpanel-password' });
+      expect(actions()).toEqual(['REVEAL', 'REVEAL']);
+    });
+
+    it('refuses users without REVEAL_CREDENTIALS and audits REVEAL_DENIED', async () => {
+      await expect(service.revealServerPassword(staffUser, 7, CTX)).rejects.toThrow('You do not have permission to reveal credentials.');
+      expect(mockPrismaService.server.findUnique).not.toHaveBeenCalled();
+      expect(actions()).toEqual(['REVEAL_DENIED']);
+    });
+
+    it('refuses revealers outside the projects using the server (404) and audits REVEAL_DENIED', async () => {
+      mockPrismaService.projectMember.findMany.mockResolvedValue([{ project_id: 3 }]);
+      mockPrismaService.domain.count.mockResolvedValue(0);
+      mockPrismaService.server.findUnique.mockResolvedValue({ id: 7, password: crypto.encrypt('s3cret!', AAD(7)) });
+      await expect(service.revealServerPassword(revealer, 7, CTX)).rejects.toThrow(NotFoundException);
+      expect(actions()).toEqual(['REVEAL_DENIED']);
+    });
+
+    it.each([
+      ['plaintext', () => 'stored-in-plaintext'],
+      ['a value bound to another server', () => crypto.encrypt('s3cret!', AAD(8))],
+      ['a Django Fernet value (never used for servers)', () => 'gAAAAABq2aizYmoIVxLZHKAecPVpNyXWrlAAhLAkbcUXXynTqPjYHyZ1diN0lElEy7CBIWMuGJSJhM-rdDmczHUR7gJ8b8cpwHpQ2-VGmqdm7JEQMxsRM5c='],
+    ])('refuses %s with 422 and never returns it', async (_label, make) => {
+      const stored = make();
+      mockPrismaService.server.findUnique.mockResolvedValue({ id: 7, password: stored });
+      const error = await service.revealServerPassword(adminUser, 7, CTX).catch((e) => e);
+      expect(error).toBeInstanceOf(UnprocessableEntityException);
+      expect(JSON.stringify(error.getResponse())).not.toContain(stored);
+      expect(actions()).toEqual([]);
+    });
+
+    it('does not return the password when the REVEAL audit cannot be written', async () => {
+      mockPrismaService.server.findUnique.mockResolvedValue({ id: 7, password: crypto.encrypt('s3cret!', AAD(7)) });
+      mockPrismaService.credentialAuditLog.create.mockRejectedValueOnce(new Error('audit table missing'));
+      await expect(service.revealServerPassword(adminUser, 7, CTX)).rejects.toThrow('audit table missing');
     });
   });
 });
@@ -728,7 +862,13 @@ describe('InfrastructureService - Summary (overview cards)', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
-      providers: [InfrastructureService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        InfrastructureService,
+        { provide: PrismaService, useValue: prisma },
+        // Server passwords are not exercised here
+        { provide: CredentialCryptoService, useValue: {} },
+        { provide: CredentialAuditService, useValue: {} },
+      ],
     }).compile();
     service = module.get(InfrastructureService);
     jest.clearAllMocks();

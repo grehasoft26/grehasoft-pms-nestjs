@@ -10,12 +10,14 @@ import {
   Query,
   UseGuards,
   Request,
+  Header,
   ParseIntPipe,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { SeoService } from './seo.service';
+import { auditContextFrom } from '../credential-audit/credential-audit.service';
 
 // -------------------------------------------------------------
 // 1. WEBSITES CONTROLLER (/api/v1/websites/)
@@ -147,12 +149,12 @@ export class SeoDailyLogsController {
 
   @Post()
   async create(@Request() req: any, @Body() body: any) {
-    return this.seoService.createDailyLog(req.user, body);
+    return this.seoService.createDailyLog(req.user, body, auditContextFrom(req));
   }
 
   @Post('add-items')
   async addItems(@Request() req: any, @Body() body: any) {
-    return this.seoService.addItemsToDailyLog(req.user, body);
+    return this.seoService.addItemsToDailyLog(req.user, body, auditContextFrom(req));
   }
 
   @Patch(':id')
@@ -173,7 +175,21 @@ export class SeoDailyLogsController {
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
-    await this.seoService.deleteDailyLog(req.user, id);
+    await this.seoService.deleteDailyLog(req.user, id, auditContextFrom(req));
+  }
+
+  // Work-log item passwords are never in log responses. No @Permissions on purpose:
+  // REVEAL_CREDENTIALS and the log scope are checked in the service so refusals are audited too
+  @Post(':logId/items/:itemId/reveal')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  async revealItemPassword(
+    @Request() req: any,
+    @Param('logId', ParseIntPipe) logId: number,
+    @Param('itemId', ParseIntPipe) itemId: number,
+  ) {
+    return this.seoService.revealWorkLogItemPassword(req.user, logId, itemId, auditContextFrom(req));
   }
 }
 
@@ -297,17 +313,27 @@ export class SeoCredentialsController {
 
   @Post()
   async create(@Request() req: any, @Body() body: any) {
-    return this.seoService.createCredential(req.user, body);
+    return this.seoService.createCredential(req.user, body, auditContextFrom(req));
   }
 
   @Put(':id')
   async updatePut(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.seoService.updateCredential(req.user, id, body);
+    return this.seoService.updateCredential(req.user, id, body, auditContextFrom(req));
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
-    await this.seoService.deleteCredential(req.user, id);
+    await this.seoService.deleteCredential(req.user, id, auditContextFrom(req));
+  }
+
+  // Passwords are never in list/create/update responses. No @Permissions on purpose:
+  // REVEAL_CREDENTIALS and the SEO scope are checked in the service so refusals are audited too
+  @Post(':id/reveal')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  async reveal(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
+    return this.seoService.revealCredentialPassword(req.user, id, auditContextFrom(req));
   }
 }

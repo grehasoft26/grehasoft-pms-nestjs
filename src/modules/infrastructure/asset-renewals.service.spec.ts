@@ -147,7 +147,9 @@ const buildFake = (opts: { honourLocks?: boolean } = {}) => {
   return { prisma, db, failures };
 };
 
-const admin = { id: 1, name: 'Admin User', role: { name: 'SUPER_ADMIN' } };
+const admin = { id: 1, name: 'Admin User', role: { name: 'SUPER_ADMIN' } };/** Audit context for server writes (the controller passes the request's). */
+const CTX = { actorId: 1, actorUsername: 'admin', ipAddress: null, userAgent: null };
+
 const errorOf = (promise: Promise<unknown>) => promise.then(() => null, (e) => e);
 const renewBody = (overrides: any = {}) => ({ idempotency_key: 'renew-key-0001', expected_expiry_date: '2026-10-21', ...overrides });
 
@@ -562,7 +564,7 @@ describe('AssetRenewalsService', () => {
   describe('renewals vs. manual expiry edits (PUT/PATCH)', () => {
     let infra: InfrastructureService;
     beforeEach(() => {
-      infra = new InfrastructureService(fake.prisma);
+      infra = new InfrastructureService(fake.prisma, {} as any, {} as any);
     });
     const events = () => fake.db.assetRenewal.map((r) => r.event);
 
@@ -615,10 +617,10 @@ describe('AssetRenewalsService', () => {
 
     it('servers: a stale edit cannot undo a renewal; a deliberate edit with the current date works', async () => {
       await service.renew(admin, 'server', 7, renewBody()); // 2026-10-21 -> 2026-11-21
-      await expect(infra.updateServer(admin, 7, { expiry_date: '2026-10-25', expected_expiry_date: '2026-10-21' })).rejects.toThrow(ConflictException);
+      await expect(infra.updateServer(admin, 7, { expiry_date: '2026-10-25', expected_expiry_date: '2026-10-21' }, CTX)).rejects.toThrow(ConflictException);
       expect(key(server().expiry_date)).toBe('2026-11-21');
 
-      await infra.updateServer(admin, 7, { expiry_date: '2026-12-01', expected_expiry_date: '2026-11-21' });
+      await infra.updateServer(admin, 7, { expiry_date: '2026-12-01', expected_expiry_date: '2026-11-21' }, CTX);
       expect(key(server().expiry_date)).toBe('2026-12-01');
       expect(events()).toEqual(['renewed', 'manual_change']);
       const manual = fake.db.assetRenewal[1];

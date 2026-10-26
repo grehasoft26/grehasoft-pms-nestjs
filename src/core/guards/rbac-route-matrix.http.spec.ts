@@ -130,6 +130,13 @@ const CASES: Record<string, Case[]> = {
     ['get', '/api/v1/infrastructure/domains/check-name?name=a.test', ['ops', 'super'], ['member', 'client']],
     ['patch', '/api/v1/infrastructure/domains/1', ['ops'], ['member']],
     ['delete', '/api/v1/infrastructure/domains/1', ['ops'], ['member']],
+    // Credential metadata (policy B): MANAGE_INFRASTRUCTURE, MANAGE_CREDENTIALS or REVEAL_CREDENTIALS;
+    // the server expiry view (id, name, expiry_date) stays open for the notification center
+    ['get', '/api/v1/infrastructure/credentials', ['ops', 'super'], ['member', 'client']],
+    ['get', '/api/v1/infrastructure/credentials/1', ['ops'], ['member', 'client']],
+    ['get', '/api/v1/infrastructure/servers', ['ops', 'super'], ['member', 'client']],
+    ['get', '/api/v1/infrastructure/servers/1', ['ops'], ['member', 'client']],
+    ['get', '/api/v1/infrastructure/servers?fields=expiry', ['member', 'client', 'ops'], []],
     ['post', '/api/v1/infrastructure/credentials', ['ops'], ['member']],
     ['put', '/api/v1/infrastructure/credentials/1', ['ops'], ['member']],
     ['delete', '/api/v1/infrastructure/credentials/1', ['ops'], ['member', 'client']],

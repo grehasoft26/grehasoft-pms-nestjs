@@ -2,6 +2,8 @@ import { Test } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
 import { InfrastructureService } from './infrastructure.service';
 import { PrismaService } from '../../core/prisma.service';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { CredentialAuditService } from '../credential-audit/credential-audit.service';
 import { DOMAIN_PROVIDERS, parseDomainProvider, parseDomainStatus } from './domain-options';
 
 /**
@@ -57,6 +59,8 @@ describe('Domain status and provider', () => {
       providers: [
         InfrastructureService,
         { provide: PrismaService, useValue: fake.prisma },
+        { provide: CredentialCryptoService, useValue: {} },
+        { provide: CredentialAuditService, useValue: {} },
       ],
     }).compile();
     service = moduleRef.get(InfrastructureService);
@@ -212,6 +216,8 @@ describe('Domain status and provider', () => {
         providers: [
           InfrastructureService,
           { provide: PrismaService, useValue: listPrisma },
+          { provide: CredentialCryptoService, useValue: {} },
+          { provide: CredentialAuditService, useValue: {} },
         ],
       }).compile();
       list = moduleRef.get(InfrastructureService);

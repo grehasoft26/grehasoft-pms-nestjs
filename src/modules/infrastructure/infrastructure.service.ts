@@ -1,8 +1,17 @@
-import { Injectable, ForbiddenException, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  ForbiddenException,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  UnprocessableEntityException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../core/prisma.service';
 import { isSuperAdmin } from '../../core/utils/role-access.util';
-import * as crypto from 'crypto';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { canRevealCredentials, credentialCryptoHttpError } from '../../core/utils/credential-access.util';
+import { CredentialAuditContext, CredentialAuditService } from '../credential-audit/credential-audit.service';
 import {
   compactLikePattern,
   expiryFilterWhere,
@@ -24,9 +33,16 @@ const renewalPeriodData = (period: RenewalPeriod | null | undefined) =>
 /** Server columns the form suggestions may show (never username or password). */
 const SERVER_SUMMARY_SELECT = { id: true, name: true, provider: true, owner: true, ip_address: true, server_ip: true } as const;
 
+/** AAD identifiers for servers.password; must match on encrypt and decrypt. */
+const SERVER_PASSWORD_AAD = { table: 'servers', field: 'password' } as const;
+
 @Injectable()
 export class InfrastructureService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly credentialCrypto: CredentialCryptoService,
+    private readonly credentialAudit: CredentialAuditService,
+  ) {}
 
   // -------------------------------------------------------------
   // HELPER: ROLE CHECKS & PROJECT SCOPING
@@ -89,6 +105,7 @@ export class InfrastructureService {
     const expiryOnly = query.fields === 'expiry';
     // fields=summary: the form suggestions; only these columns are read (no username or password)
     const summary: { select?: typeof SERVER_SUMMARY_SELECT } = query.fields === 'summary' ? { select: SERVER_SUMMARY_SELECT } : {};
+    const shape = (s: any) => (query.fields === 'summary' ? s : this.formatServer(s));
 
     if (!this.isAdmin(user)) {
       const projectIds = await this.getAccessibleProjectIds(user);
@@ -140,9 +157,6 @@ export class InfrastructureService {
         orderBy: { expiry_date: 'asc' },
       });
     }
-
-    const isAdm = this.isAdmin(user);
-    const shape = (s: any) => (query.fields === 'summary' ? s : this.formatServer(s, isAdm));
 
     if (query.all === 'true') {
       const servers = await this.prisma.server.findMany({
@@ -209,7 +223,7 @@ export class InfrastructureService {
         : 0;
       if (!linked) throw new NotFoundException('Server not found');
     }
-    return this.formatServer(server, this.isAdmin(user));
+    return this.formatServer(server);
   }
 
   /** Non-admins may only read records of projects they are members of (404 otherwise). */
@@ -219,34 +233,64 @@ export class InfrastructureService {
     if (!projectId || !projectIds.includes(projectId)) throw new NotFoundException(notFoundMessage);
   }
 
-  async createServer(user: any, data: any) {
+  /**
+   * A server belongs to the projects of the domains that use it. Non-super-admins may change or
+   * delete it only when it is linked to their projects and to no project they cannot access
+   * (otherwise 404, like reads), so a server shared with another project stays untouched.
+   * Creating a server is unchanged: it has no project until a domain uses it.
+   */
+  private async assertServerWritable(user: any, id: number) {
+    if (this.isAdmin(user)) return;
+    const projectIds = await this.getAccessibleProjectIds(user);
+    const linked = await this.prisma.domain.findMany({ where: { server_id: id }, select: { project_id: true } });
+    const allAccessible = linked.length > 0 && linked.every((d: any) => d.project_id && projectIds.includes(d.project_id));
+    if (!allAccessible) throw new NotFoundException('Server not found');
+  }
+
+  async createServer(user: any, data: any, context: CredentialAuditContext) {
     const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date') ?? null;
     const expiryDate = this.parseDateOnly(data.expiry_date, 'Expiry date') ?? null;
     this.validateServerDetails(data.phone_number, purchaseDate, expiryDate);
     const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
+    const password = data.password ? String(data.password) : '';
+    if (password) this.withCredentialCrypto(() => this.credentialCrypto.assertReady());
 
-    const server = await this.prisma.server.create({
-      data: {
-        name: data.name,
-        provider: data.provider || '',
-        owner: data.owner || '',
-        server_ip: data.server_ip || '',
-        ip_address: data.ip_address || '',
-        notes: data.notes || '',
-        username: data.username || '',
-        password: data.password ? this.encryptPassword(data.password) : '',
-        phone_number: data.phone_number ? String(data.phone_number).trim() : '',
-        purchase_date: purchaseDate,
-        expiry_date: expiryDate,
-        ...renewalPeriodData(renewalPeriod),
-      },
-    });
-    return this.formatServer(server, this.isAdmin(user));
+    const server = await this.prisma
+      .$transaction(async (tx: any) => {
+        // The record id is part of the AAD, so the row is created without the password first and
+        // the encrypted password added in the same transaction; any failure rolls both back
+        let row = await tx.server.create({
+          data: {
+            name: data.name,
+            provider: data.provider || '',
+            owner: data.owner || '',
+            server_ip: data.server_ip || '',
+            ip_address: data.ip_address || '',
+            notes: data.notes || '',
+            username: data.username || '',
+            password: '',
+            phone_number: data.phone_number ? String(data.phone_number).trim() : '',
+            purchase_date: purchaseDate,
+            expiry_date: expiryDate,
+            ...renewalPeriodData(renewalPeriod),
+          },
+        });
+        if (password) {
+          row = await tx.server.update({ where: { id: row.id }, data: { password: this.encryptServerPassword(password, row.id) } });
+          await this.credentialAudit.record(context, { credentialType: 'server', credentialId: row.id, action: 'CREATE' }, tx);
+        }
+        return row;
+      })
+      .catch((error: unknown) => {
+        throw credentialCryptoHttpError(error);
+      });
+    return this.formatServer(server);
   }
 
-  async updateServer(user: any, id: number, data: any) {
+  async updateServer(user: any, id: number, data: any, context: CredentialAuditContext) {
     const server = await this.prisma.server.findUnique({ where: { id } });
     if (!server) throw new NotFoundException('Server not found');
+    await this.assertServerWritable(user, id);
 
     const purchaseDate = this.parseDateOnly(data.purchase_date, 'Purchase date');
     const expiryDate = this.parseDateOnly(data.expiry_date, 'Expiry date');
@@ -258,11 +302,15 @@ export class InfrastructureService {
     const renewalPeriod = parseRenewalPeriod(data.renewal_period_value, data.renewal_period_unit);
     const expiry = this.expiryWrite(expiryDate, data.expected_expiry_date, server.expiry_date);
 
-    // The masked placeholder sent back by non-admins must not overwrite the stored password
+    // The masked placeholder sent back by edit forms must not overwrite the stored password;
+    // '' clears it, any other value replaces it
     const password =
       data.password === undefined || data.password === InfrastructureService.PASSWORD_MASK
         ? undefined
-        : data.password ? this.encryptPassword(data.password) : '';
+        : data.password
+          ? (this.withCredentialCrypto(() => this.credentialCrypto.assertReady()), this.encryptServerPassword(String(data.password), id))
+          : '';
+    const secretChanged = password !== undefined;
 
     const update = (client: any) => client.server.update({
       where: { id },
@@ -281,15 +329,76 @@ export class InfrastructureService {
         ...renewalPeriodData(renewalPeriod),
       },
     });
-    const updated = expiry.locked
-      ? await this.prisma.$transaction(async (tx: any) => {
-          const previous = await this.lockUnchangedExpiry(tx, 'server', id, expiry.baseline);
-          const row = await update(tx);
-          await recordManualExpiryChange(tx, { type: 'server', id, name: row.name ?? server.name, previous, next: expiry.value!, user });
-          return row;
-        })
-      : await update(this.prisma);
-    return this.formatServer(updated, this.isAdmin(user));
+    // A password change is audited in the same transaction as the write
+    const updated =
+      expiry.locked || secretChanged
+        ? await this.prisma.$transaction(async (tx: any) => {
+            const previous = expiry.locked ? await this.lockUnchangedExpiry(tx, 'server', id, expiry.baseline) : undefined;
+            const row = await update(tx);
+            if (expiry.locked) {
+              await recordManualExpiryChange(tx, { type: 'server', id, name: row.name ?? server.name, previous: previous!, next: expiry.value!, user });
+            }
+            if (secretChanged) {
+              await this.credentialAudit.record(context, { credentialType: 'server', credentialId: id, action: 'UPDATE_SECRET' }, tx);
+            }
+            return row;
+          })
+        : await update(this.prisma);
+    return this.formatServer(updated);
+  }
+
+  /**
+   * One decrypted server password. Same scope as reads; refusals (permission or scope) are audited
+   * as REVEAL_DENIED and the password is returned only after the REVEAL row is written.
+   */
+  async revealServerPassword(user: any, id: number, context: CredentialAuditContext) {
+    const deny = () =>
+      this.credentialAudit
+        .record(context, { credentialType: 'server', credentialId: id, action: 'REVEAL_DENIED' })
+        .catch(() => undefined); // the request is refused either way
+    if (!canRevealCredentials(user)) {
+      await deny();
+      throw new ForbiddenException('You do not have permission to reveal credentials.');
+    }
+    const server = await this.prisma.server.findUnique({ where: { id }, select: { id: true, password: true } });
+    if (!server) throw new NotFoundException('Server not found');
+    if (!this.isAdmin(user)) {
+      const projectIds = await this.getAccessibleProjectIds(user);
+      const linked = projectIds.length
+        ? await this.prisma.domain.count({ where: { server_id: id, project_id: { in: projectIds } } })
+        : 0;
+      if (!linked) {
+        await deny();
+        throw new NotFoundException('Server not found');
+      }
+    }
+    const password = server.password ? this.readServerPassword(server.password, id) : '';
+    await this.credentialAudit.record(context, { credentialType: 'server', credentialId: id, action: 'REVEAL' });
+    return { password };
+  }
+
+  private encryptServerPassword(plaintext: string, id: number): string {
+    return this.withCredentialCrypto(() => this.credentialCrypto.encrypt(plaintext, { ...SERVER_PASSWORD_AAD, recordId: id }));
+  }
+
+  /** gcm1, plus the static-key hex servers were written with before (the column is Node-only, no Django values). */
+  private readServerPassword(stored: string, id: number): string {
+    return this.withCredentialCrypto(() => {
+      const format = this.credentialCrypto.classify(stored);
+      if (format === 'gcm1') return this.credentialCrypto.decrypt(stored, { ...SERVER_PASSWORD_AAD, recordId: id });
+      if (format === 'legacy-cbc-static') return this.credentialCrypto.decryptLegacy(stored).plaintext;
+      throw new UnprocessableEntityException(
+        'The stored password is not in a recognised encrypted format and needs manual review. Replace it to continue.',
+      );
+    });
+  }
+
+  private withCredentialCrypto<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (error) {
+      throw credentialCryptoHttpError(error);
+    }
   }
 
   /**
@@ -321,12 +430,9 @@ export class InfrastructureService {
 
   private static readonly PASSWORD_MASK = '••••••••';
 
-  private formatServer(server: any, isAdm: boolean) {
-    if (!server.password) return server;
-    return {
-      ...server,
-      password: isAdm ? this.decryptPassword(server.password) : InfrastructureService.PASSWORD_MASK,
-    };
+  /** Responses never carry the password, for any user: the mask when one is stored, else ''. */
+  private formatServer(server: any) {
+    return { ...server, password: server.password ? InfrastructureService.PASSWORD_MASK : '' };
   }
 
   /** Date-only parsing shared by servers and domains (see core/utils/date-only.util). */
@@ -347,10 +453,18 @@ export class InfrastructureService {
     }
   }
 
-  async deleteServer(user: any, id: number) {
+  async deleteServer(user: any, id: number, context: CredentialAuditContext) {
     const server = await this.prisma.server.findUnique({ where: { id } });
     if (!server) throw new NotFoundException('Server not found');
-    return this.prisma.server.delete({ where: { id } });
+    await this.assertServerWritable(user, id);
+    // Deleting a server that holds a password is a credential deletion (audited atomically)
+    return this.prisma.$transaction(async (tx: any) => {
+      const deleted = await tx.server.delete({ where: { id } });
+      if (server.password) {
+        await this.credentialAudit.record(context, { credentialType: 'server', credentialId: id, action: 'DELETE' }, tx);
+      }
+      return deleted;
+    });
   }
 
   // -------------------------------------------------------------
@@ -681,249 +795,5 @@ export class InfrastructureService {
     return this.prisma.domain.delete({ where: { id } });
   }
 
-  // -------------------------------------------------------------
-  // 3. WEBSITE CREDENTIALS
-  private formatCredential(c: any, isAdm: boolean) {
-    const res: any = {
-      ...c,
-      project: c.project_id,
-      domain: c.domain_id,
-      project_name: c.project?.name || null,
-      domain_name: c.domain?.domain_name || null,
-    };
-
-    if (!isAdm) {
-      if (res.admin_password) res.admin_password = '••••••••';
-      if (res.cpanel_password) res.cpanel_password = '••••••••';
-      if (res.ftp_password) res.ftp_password = '••••••••';
-      if (res.client_email_password) res.client_email_password = '••••••••';
-      if (res.business_email_password) res.business_email_password = '••••••••';
-    } else {
-      if (res.admin_password) res.admin_password = this.decryptPassword(res.admin_password);
-      if (res.cpanel_password) res.cpanel_password = this.decryptPassword(res.cpanel_password);
-      if (res.ftp_password) res.ftp_password = this.decryptPassword(res.ftp_password);
-      if (res.client_email_password) res.client_email_password = this.decryptPassword(res.client_email_password);
-      if (res.business_email_password) res.business_email_password = this.decryptPassword(res.business_email_password);
-    }
-
-    return res;
-  }
-
-  // -------------------------------------------------------------
-  // 3. WEBSITE CREDENTIALS
-  // -------------------------------------------------------------
-  async getCredentials(user: any, query: { page?: string; limit?: string; search?: string; all?: string } = {}) {
-    const where: any = {};
-
-    if (!this.isAdmin(user)) {
-      const projectIds = await this.getAccessibleProjectIds(user);
-      if (projectIds.length === 0) {
-        return query.all === 'true' ? [] : { count: 0, next: null, previous: null, results: [] };
-      }
-      where.project_id = { in: projectIds };
-    }
-
-    if (query.search) {
-      where.OR = [
-        { url: { contains: query.search, mode: 'insensitive' } },
-        { username: { contains: query.search, mode: 'insensitive' } },
-        { project: { name: { contains: query.search, mode: 'insensitive' } } },
-      ];
-    }
-
-    const isAdm = this.isAdmin(user);
-
-    if (query.all === 'true') {
-      const credentials = await this.prisma.websiteCredential.findMany({
-        where,
-        include: {
-          project: { select: { id: true, name: true } },
-          domain: { select: { id: true, domain_name: true } },
-        },
-        orderBy: { created_at: 'desc' },
-      });
-
-      return credentials.map((c) => this.formatCredential(c, isAdm));
-    }
-
-    const pageNum = Math.max(1, Number(query.page) || 1);
-    const limitNum = Math.max(1, Number(query.limit) || 5);
-    const skip = (pageNum - 1) * limitNum;
-
-    const count = await this.prisma.websiteCredential.count({ where });
-
-    const credentials = await this.prisma.websiteCredential.findMany({
-      where,
-      include: {
-        project: { select: { id: true, name: true } },
-        domain: { select: { id: true, domain_name: true } },
-      },
-      orderBy: { id: 'desc' },
-      skip,
-      take: limitNum,
-    });
-
-    const formatted = credentials.map((c) => this.formatCredential(c, isAdm));
-
-    return {
-      count,
-      next: pageNum * limitNum < count ? `/api/infrastructure/credentials?page=${pageNum + 1}` : null,
-      previous: pageNum > 1 ? `/api/infrastructure/credentials?page=${pageNum - 1}` : null,
-      results: formatted,
-    };
-  }
-
-  async getCredentialById(user: any, id: number) {
-    const c = await this.prisma.websiteCredential.findUnique({
-      where: { id },
-      include: {
-        project: { select: { id: true, name: true } },
-        domain: { select: { id: true, domain_name: true } },
-      },
-    });
-    if (!c) throw new NotFoundException('Credential not found');
-    await this.assertProjectReadable(user, c.project_id, 'Credential not found');
-
-    const isAdm = this.isAdmin(user);
-    const res: any = {
-      ...c,
-      project: c.project_id,
-      domain: c.domain_id,
-      project_name: c.project?.name || null,
-      domain_name: c.domain?.domain_name || null,
-    };
-
-    if (!isAdm) {
-      if (res.admin_password) res.admin_password = '••••••••';
-      if (res.cpanel_password) res.cpanel_password = '••••••••';
-      if (res.ftp_password) res.ftp_password = '••••••••';
-      if (res.client_email_password) res.client_email_password = '••••••••';
-      if (res.business_email_password) res.business_email_password = '••••••••';
-    } else {
-      if (res.admin_password) res.admin_password = this.decryptPassword(res.admin_password);
-      if (res.cpanel_password) res.cpanel_password = this.decryptPassword(res.cpanel_password);
-      if (res.ftp_password) res.ftp_password = this.decryptPassword(res.ftp_password);
-      if (res.client_email_password) res.client_email_password = this.decryptPassword(res.client_email_password);
-      if (res.business_email_password) res.business_email_password = this.decryptPassword(res.business_email_password);
-    }
-
-    return res;
-  }
-
-  async createCredential(user: any, data: any) {
-    const cred = await this.prisma.websiteCredential.create({
-      data: {
-        project_id: Number(data.project_id || data.project),
-        domain_id: Number(data.domain_id || data.domain),
-        admin_url: data.admin_url || '',
-        admin_username: data.admin_username || '',
-        admin_password: data.admin_password ? this.encryptPassword(data.admin_password) : '',
-        cpanel_url: data.cpanel_url || '',
-        cpanel_username: data.cpanel_username || '',
-        cpanel_password: data.cpanel_password ? this.encryptPassword(data.cpanel_password) : '',
-        ftp_host: data.ftp_host || '',
-        ftp_username: data.ftp_username || '',
-        ftp_password: data.ftp_password ? this.encryptPassword(data.ftp_password) : '',
-        contact_form_email: data.contact_form_email || '',
-        client_email: data.client_email || '',
-        client_email_password: data.client_email_password ? this.encryptPassword(data.client_email_password) : '',
-        business_email: data.business_email || null,
-        business_email_password: data.business_email_password ? this.encryptPassword(data.business_email_password) : null,
-        business_email_type: data.business_email_type || null,
-        notes: data.notes || '',
-      },
-      include: { project: true, domain: true },
-    });
-
-    return {
-      ...cred,
-      project: cred.project_id,
-      domain: cred.domain_id,
-      project_name: cred.project?.name || null,
-      domain_name: cred.domain?.domain_name || null,
-      admin_password: data.admin_password || '',
-      cpanel_password: data.cpanel_password || '',
-      ftp_password: data.ftp_password || '',
-      client_email_password: data.client_email_password || '',
-      business_email_password: data.business_email_password || '',
-    };
-  }
-
-  async updateCredential(user: any, id: number, data: any) {
-    const existing = await this.prisma.websiteCredential.findUnique({ where: { id } });
-    if (!existing) throw new NotFoundException('Credential not found');
-
-    // The masked placeholder sent back by edit forms must not overwrite the stored password
-    const pw = (value: any, empty: '' | null) =>
-      value === undefined || value === InfrastructureService.PASSWORD_MASK ? undefined : value ? this.encryptPassword(value) : empty;
-
-    const cred = await this.prisma.websiteCredential.update({
-      where: { id },
-      data: {
-        project_id: data.project_id || data.project ? Number(data.project_id || data.project) : undefined,
-        domain_id: data.domain_id || data.domain ? Number(data.domain_id || data.domain) : undefined,
-        admin_url: data.admin_url,
-        admin_username: data.admin_username,
-        admin_password: pw(data.admin_password, ''),
-        cpanel_url: data.cpanel_url,
-        cpanel_username: data.cpanel_username,
-        cpanel_password: pw(data.cpanel_password, ''),
-        ftp_host: data.ftp_host,
-        ftp_username: data.ftp_username,
-        ftp_password: pw(data.ftp_password, ''),
-        contact_form_email: data.contact_form_email,
-        client_email: data.client_email,
-        client_email_password: pw(data.client_email_password, ''),
-        business_email: data.business_email,
-        business_email_password: pw(data.business_email_password, null),
-        business_email_type: data.business_email_type,
-        notes: data.notes,
-      },
-      include: { project: true, domain: true },
-    });
-
-    // Same masking/decryption as reads (previously returned the stored ciphertext)
-    return this.formatCredential(cred, this.isAdmin(user));
-  }
-
-  async deleteCredential(user: any, id: number) {
-    const cred = await this.prisma.websiteCredential.findUnique({ where: { id } });
-    if (!cred) throw new NotFoundException('Credential not found');
-    return this.prisma.websiteCredential.delete({ where: { id } });
-  }
-
-  // -------------------------------------------------------------
-  // ENCRYPTION HELPERS
-  // -------------------------------------------------------------
-  private encryptPassword(text: string): string {
-    if (!text) return '';
-    try {
-      const cipher = crypto.createCipheriv(
-        'aes-256-cbc',
-        Buffer.from('12345678901234567890123456789012'),
-        Buffer.from('1234567890123456'),
-      );
-      let encrypted = cipher.update(text, 'utf8', 'hex');
-      encrypted += cipher.final('hex');
-      return encrypted;
-    } catch {
-      return text;
-    }
-  }
-
-  private decryptPassword(text: string): string {
-    if (!text) return '';
-    try {
-      const decipher = crypto.createDecipheriv(
-        'aes-256-cbc',
-        Buffer.from('12345678901234567890123456789012'),
-        Buffer.from('1234567890123456'),
-      );
-      let decrypted = decipher.update(text, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
-    } catch {
-      return text;
-    }
-  }
+  // Client (website) credentials: WebsiteCredentialsService (website-credentials.service.ts)
 }

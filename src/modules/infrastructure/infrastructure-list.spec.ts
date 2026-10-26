@@ -1,3 +1,5 @@
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { CredentialAuditService } from '../credential-audit/credential-audit.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
 import { InfrastructureService } from './infrastructure.service';
@@ -92,7 +94,13 @@ describe('InfrastructureService list sorting, search and expiry filters', () => 
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
-      providers: [InfrastructureService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        InfrastructureService,
+        { provide: PrismaService, useValue: prisma },
+        // Server passwords are not exercised here
+        { provide: CredentialCryptoService, useValue: {} },
+        { provide: CredentialAuditService, useValue: {} },
+      ],
     }).compile();
     service = module.get(InfrastructureService);
     jest.clearAllMocks();

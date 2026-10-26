@@ -2,6 +2,7 @@ import { ProjectsService } from './projects/projects.service';
 import { LeadsService } from './crm/leads.service';
 import { TaskTypesService } from './tasks/task-types.service';
 import { ClientsService } from './projects/clients.service';
+import { WebsiteCredentialsService } from './infrastructure/website-credentials.service';
 import { InfrastructureService } from './infrastructure/infrastructure.service';
 
 /**
@@ -89,6 +90,34 @@ describe("complete lists for pickers keep the paginated list's access scope", ()
     );
     expect(all.where).toEqual(paged.where);
     expect(full).toHaveLength(8);
+  });
+
+  it('website credentials: project-member scope kept, all records beyond 5, passwords masked', async () => {
+    const rows = Array.from({ length: 8 }, (_, i) => ({
+      id: i + 1,
+      project_id: 3,
+      domain_id: i + 1,
+      admin_password: 'gcm1:secret',
+      project: { name: 'P' },
+      domain: { domain_name: `d${i}.com` },
+    }));
+    const prisma: any = {
+      websiteCredential: model(rows),
+      projectMember: { findMany: jest.fn(async () => [{ project_id: 3 }]) },
+    };
+    const service = new WebsiteCredentialsService(prisma, {} as any, {} as any);
+    const { paged, all, full } = await both(prisma.websiteCredential, (f) =>
+      service.getCredentials(staff, f ? { all: 'true' } : {}),
+    );
+    expect(all.where).toEqual(paged.where);
+    expect(all.where.project_id).toEqual({ in: [3] });
+    expect(full).toHaveLength(8);
+    expect(JSON.stringify(full)).not.toContain('gcm1:secret');
+    // No project membership: nothing at all
+    prisma.projectMember.findMany.mockResolvedValueOnce([]);
+    await expect(
+      service.getCredentials(staff, { all: 'true' }),
+    ).resolves.toEqual([]);
   });
 
   it('domains and servers: project scope kept for staff, every record returned, server passwords masked', async () => {

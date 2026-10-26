@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import { InfrastructureService } from './infrastructure.service';
 import { PrismaService } from '../../core/prisma.service';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { CredentialAuditService } from '../credential-audit/credential-audit.service';
 
 /**
  * Domain names are unique ignoring case and surrounding spaces. The in-memory fake evaluates the
@@ -78,7 +80,13 @@ const MESSAGE = 'Domain already exists.';
 
 const make = async (prisma: any) => {
   const module: TestingModule = await Test.createTestingModule({
-    providers: [InfrastructureService, { provide: PrismaService, useValue: prisma }],
+    providers: [
+        InfrastructureService,
+        { provide: PrismaService, useValue: prisma },
+        // Server passwords are not exercised here
+        { provide: CredentialCryptoService, useValue: {} },
+        { provide: CredentialAuditService, useValue: {} },
+      ],
   }).compile();
   return module.get(InfrastructureService);
 };

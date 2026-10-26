@@ -1,6 +1,14 @@
-import { Injectable, ForbiddenException, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, ForbiddenException, NotFoundException, BadRequestException, UnprocessableEntityException } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
-import * as crypto from 'crypto';
+import { CredentialCryptoService } from '../../core/credential-crypto.service';
+import { canRevealCredentials, credentialCryptoHttpError } from '../../core/utils/credential-access.util';
+import { CredentialAuditContext, CredentialAuditService } from '../credential-audit/credential-audit.service';
+
+/** AAD identifiers; must match on encrypt and decrypt. */
+const SEO_CREDENTIAL_AAD = { table: 'seo_credential', field: 'password' } as const;
+const WORK_LOG_ITEM_AAD = { table: 'seo_daily_work_log_item', field: 'password' } as const;
+/** Placeholder returned for a stored password; sent back unchanged by edit forms it is ignored. */
+const PASSWORD_MASK = '••••••••';
 
 /**
  * `ordering` values of the SEO Tasks list (the page's sort menu); anything else is the default,
@@ -17,9 +25,25 @@ const SEO_TASK_ORDERING: Record<string, any[]> = {
 /** User columns returned with SEO tasks (labels only, no contact or HR details). */
 const SEO_TASK_USER_SELECT = { id: true, name: true, username: true } as const;
 
+/** Relations returned with every daily work log. */
+const DAILY_LOG_INCLUDE = {
+  website: true,
+  executive: true,
+  created_by: true,
+  updated_by: true,
+  approved_by: true,
+  rejected_by: true,
+  items: { include: { activity_type: true } },
+  proof_files: true,
+};
+
 @Injectable()
 export class SeoService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly credentialCrypto: CredentialCryptoService,
+    private readonly credentialAudit: CredentialAuditService,
+  ) {}
 
   // -------------------------------------------------------------
   // HELPER: ROLE CHECKS
@@ -47,7 +71,10 @@ export class SeoService {
     }
   }
 
-  /** Decrypted item passwords are shown only to SEO managers and the log's own executive. */
+  /**
+   * Work-log item passwords may be revealed (with REVEAL_CREDENTIALS) only by SEO managers and the
+   * log's own executive; never by clients or other roles.
+   */
   private canSeeLogPasswords(user: any, log: any): boolean {
     return !!user && (this.isPrivileged(user) || (log?.executive_id !== undefined && log.executive_id === user.id));
   }
@@ -347,9 +374,13 @@ export class SeoService {
   // -------------------------------------------------------------
   // 4. SEO DAILY WORK LOGS
   // -------------------------------------------------------------
+  /**
+   * Item passwords are never returned. Viewers who may reveal them (SEO managers, the log's
+   * executive) see the mask when one is stored; everyone else (clients, other staff) sees '' as before.
+   */
   private formatDailyLog(log: any, viewer?: any) {
     if (!log) return null;
-    const revealPasswords = this.canSeeLogPasswords(viewer, log);
+    const showMask = !this.isClient(viewer ?? {}) && this.canSeeLogPasswords(viewer, log);
     const exec = log.executive;
     const web = log.website;
     const createdBy = log.created_by;
@@ -361,8 +392,7 @@ export class SeoService {
           ...it,
           activity_type: it.activity_type_id || (it.activity_type ? it.activity_type.id : undefined),
           activity_type_name: it.activity_type ? it.activity_type.name : '',
-          password: revealPasswords && it.password ? this.decryptPassword(it.password) : '',
-          decrypted_password: revealPasswords && it.password ? this.decryptPassword(it.password) : '',
+          password: showMask && it.password ? PASSWORD_MASK : '',
         }))
       : [];
 
@@ -487,7 +517,7 @@ export class SeoService {
     return this.formatDailyLog(log, user);
   }
 
-  async createDailyLog(user: any, data: any) {
+  async createDailyLog(user: any, data: any, context: CredentialAuditContext) {
     if (this.isClient(user)) {
       throw new ForbiddenException('Clients do not have permission to modify daily work logs.');
     }
@@ -508,61 +538,77 @@ export class SeoService {
     });
 
     if (existingLog) {
-      return this.addItemsToDailyLog(user, {
-        website: website_id,
-        log_date: data.log_date,
-        items: data.items,
-        remarks: data.remarks,
-        status: data.status,
-      });
+      return this.addItemsToDailyLog(
+        user,
+        {
+          website: website_id,
+          log_date: data.log_date,
+          items: data.items,
+          remarks: data.remarks,
+          status: data.status,
+        },
+        context,
+      );
     }
 
     const itemsData = Array.isArray(data.items) ? data.items : [];
-    let totalCount = 0;
-    const itemsCreate = itemsData.map((item: any) => {
-      const count = Number(item.count || 1);
-      totalCount += count;
-      return {
-        activity_type_id: Number(item.activity_type_id || item.activity_type),
-        count,
-        keyword: item.keyword || null,
-        submission_url: item.submission_url || null,
-        domain_authority: item.domain_authority ? Number(item.domain_authority) : null,
-        spam_score: item.spam_score ? Number(item.spam_score) : null,
-        time_spent_minutes: item.time_spent_minutes ? Number(item.time_spent_minutes) : null,
-        username: item.username || null,
-        password: item.password ? this.encryptPassword(item.password) : null,
-      };
-    });
+    const totalCount = itemsData.reduce((sum: number, item: any) => sum + Number(item.count || 1), 0);
+    this.assertCryptoReadyFor(itemsData);
 
-    const createdLog = await this.prisma.sEODailyWorkLog.create({
-      data: {
-        website_id,
-        log_date,
-        executive_id,
-        created_by_id: user.id,
-        remarks: data.remarks || null,
-        total_count: totalCount,
-        status: data.status || 'draft',
-        seo_task_id: data.seo_task_id || data.seo_task ? Number(data.seo_task_id || data.seo_task) : null,
-        items: { create: itemsCreate },
-      },
-      include: {
-        website: true,
-        executive: true,
-        created_by: true,
-        updated_by: true,
-        approved_by: true,
-        rejected_by: true,
-        items: { include: { activity_type: true } },
-        proof_files: true,
-      },
-    });
+    const createdLog = await this.withCryptoErrors(() =>
+      this.prisma.$transaction(async (tx: any) => {
+        const log = await tx.sEODailyWorkLog.create({
+          data: {
+            website_id,
+            log_date,
+            executive_id,
+            created_by_id: user.id,
+            remarks: data.remarks || null,
+            total_count: totalCount,
+            status: data.status || 'draft',
+            seo_task_id: data.seo_task_id || data.seo_task ? Number(data.seo_task_id || data.seo_task) : null,
+          },
+        });
+        // Items one by one: each item id is part of its password's AAD
+        await this.createLogItems(tx, log.id, itemsData, context);
+        return tx.sEODailyWorkLog.findUnique({ where: { id: log.id }, include: DAILY_LOG_INCLUDE });
+      }),
+    );
 
     return this.formatDailyLog(createdLog, user);
   }
 
-  async addItemsToDailyLog(user: any, data: any) {
+  /**
+   * Creates work-log items without passwords, then stores each password encrypted for its item id
+   * (CredentialCryptoService), auditing CREATE per item password. Runs inside the caller's transaction.
+   */
+  private async createLogItems(tx: any, workLogId: number, itemsData: any[], context: CredentialAuditContext) {
+    for (const item of itemsData) {
+      const created = await tx.sEODailyWorkLogItem.create({
+        data: {
+          work_log_id: workLogId,
+          activity_type_id: Number(item.activity_type_id || item.activity_type),
+          count: Number(item.count || 1),
+          keyword: item.keyword || null,
+          submission_url: item.submission_url || null,
+          domain_authority: item.domain_authority ? Number(item.domain_authority) : null,
+          spam_score: item.spam_score ? Number(item.spam_score) : null,
+          time_spent_minutes: item.time_spent_minutes ? Number(item.time_spent_minutes) : null,
+          username: item.username || null,
+          password: null,
+        },
+      });
+      if (item.password) {
+        await tx.sEODailyWorkLogItem.update({
+          where: { id: created.id },
+          data: { password: this.encryptSecret(String(item.password), { ...WORK_LOG_ITEM_AAD, recordId: created.id }) },
+        });
+        await this.credentialAudit.record(context, { credentialType: 'seo_work_log', credentialId: created.id, action: 'CREATE' }, tx);
+      }
+    }
+  }
+
+  async addItemsToDailyLog(user: any, data: any, context: CredentialAuditContext) {
     if (this.isClient(user)) {
       throw new ForbiddenException('Clients do not have permission to modify daily work logs.');
     }
@@ -570,68 +616,46 @@ export class SeoService {
     const website_id = Number(data.website_id || data.website);
     const log_date = new Date(data.log_date);
     const executive_id = user.id;
-
-    let log = await this.prisma.sEODailyWorkLog.findFirst({
-      where: { executive_id, website_id, log_date },
-    });
-
-    if (!log) {
-      log = await this.prisma.sEODailyWorkLog.create({
-        data: {
-          website_id,
-          log_date,
-          executive_id,
-          created_by_id: user.id,
-          remarks: data.remarks || '',
-          status: data.status || 'submitted',
-          seo_task_id: data.seo_task_id || data.seo_task ? Number(data.seo_task_id || data.seo_task) : null,
-          total_count: 0,
-        },
-      });
-    }
-
     const itemsData = Array.isArray(data.items) ? data.items : [];
-    let addedCount = 0;
+    const addedCount = itemsData.reduce((sum: number, item: any) => sum + Number(item.count || 1), 0);
+    this.assertCryptoReadyFor(itemsData);
 
-    for (const item of itemsData) {
-      const count = Number(item.count || 1);
-      addedCount += count;
-      await this.prisma.sEODailyWorkLogItem.create({
-        data: {
-          work_log_id: log.id,
-          activity_type_id: Number(item.activity_type_id || item.activity_type),
-          count,
-          keyword: item.keyword || null,
-          submission_url: item.submission_url || null,
-          domain_authority: item.domain_authority ? Number(item.domain_authority) : null,
-          spam_score: item.spam_score ? Number(item.spam_score) : null,
-          time_spent_minutes: item.time_spent_minutes ? Number(item.time_spent_minutes) : null,
-          username: item.username || null,
-          password: item.password ? this.encryptPassword(item.password) : null,
-        },
-      });
-    }
+    // One transaction: a failed encryption or audit write leaves no item (and no new log) behind
+    const updatedLog = await this.withCryptoErrors(() =>
+      this.prisma.$transaction(async (tx: any) => {
+        let log = await tx.sEODailyWorkLog.findFirst({
+          where: { executive_id, website_id, log_date },
+        });
 
-    const newTotal = log.total_count + addedCount;
-    const updatedLog = await this.prisma.sEODailyWorkLog.update({
-      where: { id: log.id },
-      data: {
-        total_count: newTotal,
-        remarks: data.remarks !== undefined ? data.remarks : log.remarks,
-        status: data.status !== undefined ? data.status : log.status,
-        updated_by_id: user.id,
-      },
-      include: {
-        website: true,
-        executive: true,
-        created_by: true,
-        updated_by: true,
-        approved_by: true,
-        rejected_by: true,
-        items: { include: { activity_type: true } },
-        proof_files: true,
-      },
-    });
+        if (!log) {
+          log = await tx.sEODailyWorkLog.create({
+            data: {
+              website_id,
+              log_date,
+              executive_id,
+              created_by_id: user.id,
+              remarks: data.remarks || '',
+              status: data.status || 'submitted',
+              seo_task_id: data.seo_task_id || data.seo_task ? Number(data.seo_task_id || data.seo_task) : null,
+              total_count: 0,
+            },
+          });
+        }
+
+        await this.createLogItems(tx, log.id, itemsData, context);
+
+        return tx.sEODailyWorkLog.update({
+          where: { id: log.id },
+          data: {
+            total_count: log.total_count + addedCount,
+            remarks: data.remarks !== undefined ? data.remarks : log.remarks,
+            status: data.status !== undefined ? data.status : log.status,
+            updated_by_id: user.id,
+          },
+          include: DAILY_LOG_INCLUDE,
+        });
+      }),
+    );
 
     return this.formatDailyLog(updatedLog, user);
   }
@@ -682,7 +706,7 @@ export class SeoService {
     return this.formatDailyLog(updatedLog, user);
   }
 
-  async deleteDailyLog(user: any, id: number) {
+  async deleteDailyLog(user: any, id: number, context: CredentialAuditContext) {
     if (this.isClient(user)) {
       throw new ForbiddenException('Clients do not have permission to modify daily work logs.');
     }
@@ -692,7 +716,47 @@ export class SeoService {
     if (!this.isPrivileged(user) && log.executive_id !== user.id) {
       throw new ForbiddenException('You can only delete your own logs.');
     }
-    return this.prisma.sEODailyWorkLog.delete({ where: { id } });
+    // Items cascade with the log; each stored item password is a deleted credential (audited atomically)
+    return this.prisma.$transaction(async (tx: any) => {
+      const withPassword = await tx.sEODailyWorkLogItem.findMany({
+        where: { work_log_id: id, password: { not: null } },
+        select: { id: true, password: true },
+      });
+      const deleted = await tx.sEODailyWorkLog.delete({ where: { id } });
+      for (const item of withPassword.filter((i: any) => i.password)) {
+        await this.credentialAudit.record(context, { credentialType: 'seo_work_log', credentialId: item.id, action: 'DELETE' }, tx);
+      }
+      return deleted;
+    });
+  }
+
+  /**
+   * One decrypted work-log item password. Requires REVEAL_CREDENTIALS (or super admin) and the
+   * existing log scope (SEO managers: any log; executives: their own logs; never clients). A
+   * refused attempt is audited (REVEAL_DENIED) and answered like a missing record; the password is
+   * returned only after the REVEAL row is written.
+   */
+  async revealWorkLogItemPassword(user: any, logId: number, itemId: number, context: CredentialAuditContext) {
+    const deny = () =>
+      this.credentialAudit
+        .record(context, { credentialType: 'seo_work_log', credentialId: itemId, action: 'REVEAL_DENIED' })
+        .catch(() => undefined); // the request is refused either way
+    if (!canRevealCredentials(user)) {
+      await deny();
+      throw new ForbiddenException('You do not have permission to reveal credentials.');
+    }
+    const log = await this.prisma.sEODailyWorkLog.findUnique({ where: { id: logId }, select: { id: true, executive_id: true } });
+    const item = log
+      ? await this.prisma.sEODailyWorkLogItem.findFirst({ where: { id: itemId, work_log_id: logId }, select: { id: true, password: true } })
+      : null;
+    if (!log || !item) throw new NotFoundException('Work log item not found');
+    if (this.isClient(user) || !this.canSeeLogPasswords(user, log)) {
+      await deny();
+      throw new NotFoundException('Work log item not found');
+    }
+    const password = item.password ? this.readSecret(item.password, { ...WORK_LOG_ITEM_AAD, recordId: itemId }) : '';
+    await this.credentialAudit.record(context, { credentialType: 'seo_work_log', credentialId: itemId, action: 'REVEAL' });
+    return { password };
   }
 
   async approveDailyLog(user: any, id: number) {
@@ -1316,13 +1380,17 @@ export class SeoService {
   // -------------------------------------------------------------
   // 9. SEO CREDENTIALS
   // -------------------------------------------------------------
+  /** Passwords are never returned (any viewer): the mask when one is stored, else ''. */
+  private formatCredential(c: any) {
+    return { ...c, password: c.password ? PASSWORD_MASK : '' };
+  }
+
+  /** Metadata only. Scope unchanged: SEO managers and super admins all; executives their assigned websites. */
   async getCredentials(user: any) {
     const where: any = {};
     if (this.isExecutive(user)) {
       where.website = { assigned_executive_id: user.id };
     } else if (!this.isPrivileged(user)) {
-      // Decrypted SEO credentials: managers (all) and executives (assigned websites) only.
-      // Previously clients and every other role received all credentials in plaintext.
       throw new ForbiddenException('You do not have permission to view SEO credentials.');
     }
     const creds = await this.prisma.sEOCredential.findMany({
@@ -1330,87 +1398,162 @@ export class SeoService {
       include: { website: true },
       orderBy: [{ website_id: 'asc' }, { platform: 'asc' }],
     });
-
-    return creds.map((c) => ({
-      ...c,
-      password: this.decryptPassword(c.password),
-    }));
+    return creds.map((c) => this.formatCredential(c));
   }
 
-  async createCredential(user: any, data: any) {
+  async createCredential(user: any, data: any, context: CredentialAuditContext) {
     if (!this.isPrivileged(user)) {
       throw new ForbiddenException('Only SEO Managers and Admins can create credentials.');
     }
-    const cred = await this.prisma.sEOCredential.create({
-      data: {
-        website_id: Number(data.website_id || data.website),
-        platform: data.platform,
-        username: data.username,
-        password: this.encryptPassword(data.password),
-        notes: data.notes || null,
-      },
-      include: { website: true },
-    });
-    return { ...cred, password: data.password };
+    const password = data.password ? String(data.password) : '';
+    if (password) this.withCryptoErrorsSync(() => this.credentialCrypto.assertReady());
+
+    const cred = await this.withCryptoErrors(() =>
+      this.prisma.$transaction(async (tx: any) => {
+        // The record id is part of the AAD: create with '' (the column is NOT NULL), then store the
+        // encrypted password in the same transaction; any failure rolls both back
+        let row = await tx.sEOCredential.create({
+          data: {
+            website_id: Number(data.website_id || data.website),
+            platform: data.platform,
+            username: data.username,
+            password: '',
+            notes: data.notes || null,
+          },
+          include: { website: true },
+        });
+        if (password) {
+          row = await tx.sEOCredential.update({
+            where: { id: row.id },
+            data: { password: this.encryptSecret(password, { ...SEO_CREDENTIAL_AAD, recordId: row.id }) },
+            include: { website: true },
+          });
+        }
+        await this.credentialAudit.record(context, { credentialType: 'seo', credentialId: row.id, action: 'CREATE' }, tx);
+        return row;
+      }),
+    );
+    return this.formatCredential(cred);
   }
 
-  async updateCredential(user: any, id: number, data: any) {
+  /**
+   * Partial update. Password: omitted, null or the mask keeps the stored one; '' clears it (stored
+   * as '', the column is NOT NULL); any other value replaces it.
+   */
+  async updateCredential(user: any, id: number, data: any, context: CredentialAuditContext) {
     if (!this.isPrivileged(user)) {
       throw new ForbiddenException('Only SEO Managers and Admins can update credentials.');
     }
+    const existing = await this.prisma.sEOCredential.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) throw new NotFoundException('SEO credential not found');
+
     const payload: any = {};
     if (data.platform) payload.platform = data.platform;
     if (data.username) payload.username = data.username;
-    if (data.password) payload.password = this.encryptPassword(data.password);
     if (data.notes !== undefined) payload.notes = data.notes;
+    const secretChanged = data.password !== undefined && data.password !== null && data.password !== PASSWORD_MASK;
+    if (secretChanged) {
+      payload.password = data.password
+        ? (this.withCryptoErrorsSync(() => this.credentialCrypto.assertReady()),
+          this.encryptSecret(String(data.password), { ...SEO_CREDENTIAL_AAD, recordId: id }))
+        : '';
+    }
 
-    const cred = await this.prisma.sEOCredential.update({
-      where: { id },
-      data: payload,
-      include: { website: true },
+    const cred = await this.prisma.$transaction(async (tx: any) => {
+      const row = await tx.sEOCredential.update({ where: { id }, data: payload, include: { website: true } });
+      if (secretChanged) {
+        await this.credentialAudit.record(context, { credentialType: 'seo', credentialId: id, action: 'UPDATE_SECRET' }, tx);
+      }
+      return row;
     });
-    return { ...cred, password: data.password || this.decryptPassword(cred.password) };
+    return this.formatCredential(cred);
   }
 
-  async deleteCredential(user: any, id: number) {
+  async deleteCredential(user: any, id: number, context: CredentialAuditContext) {
     if (!this.isPrivileged(user)) {
       throw new ForbiddenException('Only SEO Managers and Admins can delete credentials.');
     }
-    return this.prisma.sEOCredential.delete({ where: { id } });
+    const existing = await this.prisma.sEOCredential.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) throw new NotFoundException('SEO credential not found');
+    return this.prisma.$transaction(async (tx: any) => {
+      const deleted = await tx.sEOCredential.delete({ where: { id } });
+      await this.credentialAudit.record(context, { credentialType: 'seo', credentialId: id, action: 'DELETE' }, tx);
+      return deleted;
+    });
+  }
+
+  /**
+   * One decrypted SEO credential password. Requires REVEAL_CREDENTIALS (or super admin) and the
+   * existing scope (SEO managers and super admins: all; executives: assigned websites). A refused
+   * attempt is audited (REVEAL_DENIED) and answered like a missing record; the password is returned
+   * only after the REVEAL row is written.
+   */
+  async revealCredentialPassword(user: any, id: number, context: CredentialAuditContext) {
+    const deny = () =>
+      this.credentialAudit
+        .record(context, { credentialType: 'seo', credentialId: id, action: 'REVEAL_DENIED' })
+        .catch(() => undefined); // the request is refused either way
+    if (!canRevealCredentials(user)) {
+      await deny();
+      throw new ForbiddenException('You do not have permission to reveal credentials.');
+    }
+    const cred = await this.prisma.sEOCredential.findUnique({
+      where: { id },
+      select: { id: true, password: true, website: { select: { assigned_executive_id: true } } },
+    });
+    if (!cred) throw new NotFoundException('SEO credential not found');
+    const inScope = this.isPrivileged(user) || (this.isExecutive(user) && cred.website?.assigned_executive_id === user.id);
+    if (!inScope) {
+      await deny();
+      throw new NotFoundException('SEO credential not found');
+    }
+    const password = cred.password ? this.readSecret(cred.password, { ...SEO_CREDENTIAL_AAD, recordId: id }) : '';
+    await this.credentialAudit.record(context, { credentialType: 'seo', credentialId: id, action: 'REVEAL' });
+    return { password };
   }
 
   // -------------------------------------------------------------
-  // HELPER: ENCRYPTION / DECRYPTION
+  // HELPER: CREDENTIAL ENCRYPTION (CredentialCryptoService)
   // -------------------------------------------------------------
-  private encryptPassword(text: string): string {
-    if (!text) return '';
-    try {
-      const cipher = crypto.createCipheriv(
-        'aes-256-cbc',
-        Buffer.from('12345678901234567890123456789012'),
-        Buffer.from('1234567890123456'),
+  private encryptSecret(plaintext: string, aad: { table: string; field: string; recordId: number }): string {
+    return this.withCryptoErrorsSync(() => this.credentialCrypto.encrypt(plaintext, aad));
+  }
+
+  /**
+   * gcm1 values, plus the formats these tables held before: static-key hex (Node) and Django
+   * Fernet (needs CREDENTIAL_LEGACY_DJANGO_SECRET_KEY). Anything else is refused for manual review;
+   * the stored value is never returned or rewritten.
+   */
+  private readSecret(stored: string, aad: { table: string; field: string; recordId: number }): string {
+    return this.withCryptoErrorsSync(() => {
+      const format = this.credentialCrypto.classify(stored);
+      if (format === 'gcm1') return this.credentialCrypto.decrypt(stored, aad);
+      if (format === 'legacy-cbc-static' || format === 'legacy-fernet') return this.credentialCrypto.decryptLegacy(stored).plaintext;
+      throw new UnprocessableEntityException(
+        'The stored password is not in a recognised encrypted format and needs manual review. Replace it to continue.',
       );
-      let encrypted = cipher.update(text, 'utf8', 'hex');
-      encrypted += cipher.final('hex');
-      return encrypted;
-    } catch {
-      return text;
+    });
+  }
+
+  /** Fails before any write when new item passwords are sent but encryption is not configured. */
+  private assertCryptoReadyFor(items: any[]) {
+    if (items.some((item: any) => item?.password)) this.withCryptoErrorsSync(() => this.credentialCrypto.assertReady());
+  }
+
+  private withCryptoErrorsSync<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (error) {
+      throw credentialCryptoHttpError(error);
     }
   }
 
-  private decryptPassword(text: string): string {
-    if (!text) return '';
+  private async withCryptoErrors<T>(fn: () => Promise<T>): Promise<T> {
     try {
-      const decipher = crypto.createDecipheriv(
-        'aes-256-cbc',
-        Buffer.from('12345678901234567890123456789012'),
-        Buffer.from('1234567890123456'),
-      );
-      let decrypted = decipher.update(text, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
-    } catch {
-      return text;
+      return await fn();
+    } catch (error) {
+      throw credentialCryptoHttpError(error);
     }
   }
+
 }

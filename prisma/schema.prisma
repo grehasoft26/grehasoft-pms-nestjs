@@ -1654,3 +1654,22 @@ model Expense {
   @@index([payment_account_source])
   @@map("expenses")
 }
+
+// Credential Vault audit trail (append-only; never stores plaintext, ciphertext or keys).
+// No foreign keys: rows survive deletion of the actor or the credential. Retention: 1 year (not yet automated).
+model CredentialAuditLog {
+  id              Int      @id @default(autoincrement())
+  actor_id        Int?
+  actor_username  String   @db.VarChar(150)
+  credential_type String   @db.VarChar(50)
+  credential_id   Int?
+  action          String   @db.VarChar(30)
+  ip_address      String?  @db.VarChar(45)
+  user_agent      String?  @db.VarChar(255)
+  created_at      DateTime @default(now()) @db.DateTime(3)
+
+  @@index([credential_type, credential_id, created_at])
+  @@index([actor_id, created_at])
+  @@index([created_at])
+  @@map("credential_audit_logs")
+}

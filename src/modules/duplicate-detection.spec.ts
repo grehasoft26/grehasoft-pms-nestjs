@@ -240,7 +240,7 @@ describe('Server duplicate warnings and suggestion list', () => {
   });
 
   it('a server with a duplicate name and IP can still be created (warnings never block)', async () => {
-    await expect(service.createServer(admin, { name: 'Prod-Web', ip_address: '203.0.113.10' })).resolves.toMatchObject({ name: 'Prod-Web' });
+    await expect(service.createServer(admin, { name: 'Prod-Web', ip_address: '203.0.113.10' }, {} as any)).resolves.toMatchObject({ name: 'Prod-Web' });
   });
 
   it('fields=summary returns only name, provider, owner and IP columns (no username or password)', async () => {

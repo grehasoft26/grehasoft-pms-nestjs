@@ -14,13 +14,21 @@ import {
   HttpCode,
   HttpStatus,
   Res,
+  Header,
+  ForbiddenException,
 } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import {
+  CREDENTIAL_METADATA_PERMISSIONS,
+  canReadCredentialMetadata,
+} from '../../core/utils/credential-access.util';
 import { InfrastructureService } from './infrastructure.service';
 import { AssetRenewalsService } from './asset-renewals.service';
+import { WebsiteCredentialsService } from './website-credentials.service';
+import { auditContextFrom } from '../credential-audit/credential-audit.service';
 
 /** 201 for a new history entry, 200 when an idempotent retry returns the recorded one. */
 const renewalResponse = (res: Response, result: { replayed: boolean }) => {
@@ -80,8 +88,16 @@ export class ServersController {
     return this.renewals.preview('server', id, query);
   }
 
+  // Server records (username, IPs, hosts) need MANAGE_INFRASTRUCTURE, MANAGE_CREDENTIALS or
+  // REVEAL_CREDENTIALS; fields=expiry (id, name, expiry_date only) stays open to every signed-in
+  // user for the notification center. Both keep the project scope of the service.
   @Get()
   async findAll(@Request() req: any, @Query() query: any) {
+    if (query?.fields !== 'expiry' && !canReadCredentialMetadata(req.user)) {
+      throw new ForbiddenException(
+        'You do not have permission to perform this action.',
+      );
+    }
     return this.infraService.getServers(req.user, query);
   }
 
@@ -94,33 +110,44 @@ export class ServersController {
   }
 
   @Get(':id')
+  @Permissions(...CREDENTIAL_METADATA_PERMISSIONS)
   async findOne(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
     return this.infraService.getServerById(req.user, id);
+  }
+
+  // Responses never contain the server password. No @Permissions on purpose: REVEAL_CREDENTIALS
+  // is checked in the service so that refused attempts are audited too
+  @Post(':id/reveal')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  async reveal(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
+    return this.infraService.revealServerPassword(req.user, id, auditContextFrom(req));
   }
 
   @Post()
   @Permissions('MANAGE_INFRASTRUCTURE')
   async create(@Request() req: any, @Body() body: any) {
-    return this.infraService.createServer(req.user, body);
+    return this.infraService.createServer(req.user, body, auditContextFrom(req));
   }
 
   @Put(':id')
   @Permissions('MANAGE_INFRASTRUCTURE')
   async updatePut(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.infraService.updateServer(req.user, id, body);
+    return this.infraService.updateServer(req.user, id, body, auditContextFrom(req));
   }
 
   @Patch(':id')
   @Permissions('MANAGE_INFRASTRUCTURE')
   async updatePatch(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.infraService.updateServer(req.user, id, body);
+    return this.infraService.updateServer(req.user, id, body, auditContextFrom(req));
   }
 
   @Delete(':id')
   @Permissions('MANAGE_INFRASTRUCTURE')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
-    await this.infraService.deleteServer(req.user, id);
+    await this.infraService.deleteServer(req.user, id, auditContextFrom(req));
   }
 }
 
@@ -206,44 +233,60 @@ export class DomainsController {
 
 // -------------------------------------------------------------
 // 3. CREDENTIALS CONTROLLER (/api/v1/infrastructure/credentials/)
+// Client (website) credentials, also shown per domain. Responses never contain passwords;
+// POST /:id/reveal returns one field (REVEAL_CREDENTIALS, checked and audited in the service).
 // -------------------------------------------------------------
 @Controller('api/v1/infrastructure/credentials')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 export class CredentialsController {
-  constructor(private readonly infraService: InfrastructureService) {}
+  constructor(private readonly websiteCredentials: WebsiteCredentialsService) {}
 
+  // Metadata (usernames, admin/cPanel URLs, FTP hosts, emails; never passwords) needs one of
+  // MANAGE_INFRASTRUCTURE, MANAGE_CREDENTIALS, REVEAL_CREDENTIALS, then the project scope applies
   @Get()
+  @Permissions(...CREDENTIAL_METADATA_PERMISSIONS)
   async findAll(@Request() req: any, @Query() query: any) {
-    return this.infraService.getCredentials(req.user, query);
+    return this.websiteCredentials.getCredentials(req.user, query);
   }
 
   @Get(':id')
+  @Permissions(...CREDENTIAL_METADATA_PERMISSIONS)
   async findOne(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
-    return this.infraService.getCredentialById(req.user, id);
+    return this.websiteCredentials.getCredentialById(req.user, id);
+  }
+
+  // No @Permissions on purpose: REVEAL_CREDENTIALS is checked in the service so that refused
+  // attempts are audited too (the guard would reject them before anything is recorded)
+  @Post(':id/reveal')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  async reveal(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body('field') field: unknown) {
+    return this.websiteCredentials.revealPassword(req.user, id, field, auditContextFrom(req));
   }
 
   @Post()
   @Permissions('MANAGE_INFRASTRUCTURE')
   async create(@Request() req: any, @Body() body: any) {
-    return this.infraService.createCredential(req.user, body);
+    return this.websiteCredentials.createCredential(req.user, body, auditContextFrom(req));
   }
 
   @Put(':id')
   @Permissions('MANAGE_INFRASTRUCTURE')
   async updatePut(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.infraService.updateCredential(req.user, id, body);
+    return this.websiteCredentials.updateCredential(req.user, id, body, auditContextFrom(req));
   }
 
   @Patch(':id')
   @Permissions('MANAGE_INFRASTRUCTURE')
   async updatePatch(@Request() req: any, @Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.infraService.updateCredential(req.user, id, body);
+    return this.websiteCredentials.updateCredential(req.user, id, body, auditContextFrom(req));
   }
 
   @Delete(':id')
   @Permissions('MANAGE_INFRASTRUCTURE')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
-    await this.infraService.deleteCredential(req.user, id);
+    await this.websiteCredentials.deleteCredential(req.user, id, auditContextFrom(req));
   }
 }

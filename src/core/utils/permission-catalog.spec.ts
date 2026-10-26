@@ -100,6 +100,11 @@ describe('permission catalog consistency', () => {
     }
   });
 
+  it('defines the credential permissions in the Credentials category', () => {
+    const credentials = PERMISSION_DEFINITIONS.filter((p) => p.category === 'Credentials').map((p) => p.id);
+    expect(credentials).toEqual(['MANAGE_CREDENTIALS', 'REVEAL_CREDENTIALS', 'VIEW_CREDENTIAL_AUDIT']);
+  });
+
   it('isBuiltInRoleName is case-insensitive and rejects custom names', () => {
     expect(isBuiltInRoleName('admin')).toBe(true);
     expect(isBuiltInRoleName(' Project_Manager ')).toBe(true);

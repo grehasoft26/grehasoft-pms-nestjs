@@ -3,7 +3,7 @@ import { PrismaService } from '../../core/prisma.service';
 import { PasswordUtil } from '../../core/utils/password.util';
 import { formatUserResponse } from './user.serializer';
 import { getActiveRolePermissions, getEffectiveAccess, isSuperAdmin } from '../../core/utils/role-access.util';
-import { isPrivilegedRoleName } from '../../core/utils/permission-catalog';
+import { credentialPermissionsIn, isPrivilegedRoleName } from '../../core/utils/permission-catalog';
 
 @Injectable()
 export class UsersService {
@@ -411,12 +411,20 @@ export class UsersService {
    * - Others may not assign privileged roles (SUPER_ADMIN, ADMIN).
    * - Others may only assign a role whose permissions they all hold themselves
    *   (prevents escalation via roles a super admin granted extra permissions).
+   * - Others may not assign a role that grants credential permissions.
    */
   private assertCanAssignRole(reqUser: any, reqIsSuper: boolean, role: { name: string; permissions?: unknown } | null) {
     if (!role || reqIsSuper) return;
 
     if (isPrivilegedRoleName(role.name)) {
       throw new ForbiddenException({ role: `Only Super Admins can assign the ${role.name} role.` });
+    }
+
+    const credential = credentialPermissionsIn(role.permissions);
+    if (credential.length > 0) {
+      throw new ForbiddenException({
+        role: `Only Super Admins can assign the ${role.name} role because it grants credential permissions: ${credential.join(', ')}.`,
+      });
     }
 
     const notHeld = this.permissionsNotHeld(reqUser, role);
@@ -448,6 +456,9 @@ export class UsersService {
     if (reqIsSuper) return null;
     if (isSuperAdmin(target)) return 'a Super Admin account';
     if (isPrivilegedRoleName(target.role?.name)) return `an account that has the ${target.role.name} role`;
+    // Re-roling, deactivating, deleting or taking over such an account would revoke or transfer credential access
+    const credential = credentialPermissionsIn(target.role?.permissions);
+    if (credential.length > 0) return `an account whose role grants credential permissions (${credential.join(', ')})`;
     const notHeld = this.permissionsNotHeld(reqUser, target.role);
     if (notHeld.length > 0) {
       return `an account whose role grants permissions you do not have (${notHeld.join(', ')})`;
