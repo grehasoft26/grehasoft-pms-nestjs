@@ -19,6 +19,7 @@ import { MilestonesController } from '../../modules/projects/milestones.controll
 import { TaskFilesController } from '../../modules/tasks/task-files.controller';
 import { TaskReviewsController } from '../../modules/tasks/task-reviews.controller';
 import { InfrastructureSummaryController } from '../../modules/infrastructure/infrastructure.controller';
+import { RemindersController, DashboardSummaryController } from '../../modules/reminders/reminders.controller';
 
 /**
  * Phase 2.2: route-level authorization matrix. Real controllers and the real PermissionsGuard;
@@ -41,6 +42,9 @@ const USERS: Record<string, any> = {
   billing: { id: 7, is_superuser: false, role: role('BILLING_VIEWER', ['VIEW_INVOICES']) },
   finance: { id: 8, is_superuser: false, role: role('FINANCE', ['VIEW_FINANCIAL_REPORTS']) },
   leadsViewer: { id: 9, is_superuser: false, role: role('LEADS_VIEWER', ['VIEW_LEADS']) },
+  // Mirrors seeded SEO_EXECUTIVE (VIEW_REMINDERS only) and SEO_MANAGER (both)
+  remindersViewer: { id: 11, is_superuser: false, role: role('REMINDERS_VIEWER', ['VIEW_REMINDERS']) },
+  remindersManager: { id: 12, is_superuser: false, role: role('REMINDERS_MANAGER', ['MANAGE_REMINDERS']) },
   // A role literally named CLIENT is only trusted while active
   deletedClient: { id: 10, is_superuser: false, client_id: 1, role: { ...role('CLIENT', ['VIEW_DASHBOARD']), deleted_at: new Date('2026-09-01') } },
 };
@@ -140,6 +144,15 @@ const CASES: Record<string, Case[]> = {
     ['post', '/api/v1/infrastructure/credentials', ['ops'], ['member']],
     ['put', '/api/v1/infrastructure/credentials/1', ['ops'], ['member']],
     ['delete', '/api/v1/infrastructure/credentials/1', ['ops'], ['member', 'client']],
+    // Renewals and renewal history: MANAGE_INFRASTRUCTURE (history includes costs and payments)
+    ['post', '/api/v1/infrastructure/domains/1/renew', ['ops', 'super'], ['member', 'admin', 'client', 'remindersManager']],
+    ['post', '/api/v1/infrastructure/domains/1/renewal-failed', ['ops', 'super'], ['member', 'admin', 'client']],
+    ['get', '/api/v1/infrastructure/domains/1/renewals', ['ops', 'super'], ['member', 'admin', 'client']],
+    ['post', '/api/v1/infrastructure/servers/1/renew', ['ops', 'super'], ['member', 'admin', 'client', 'remindersManager']],
+    ['post', '/api/v1/infrastructure/servers/1/renewal-failed', ['ops', 'super'], ['member', 'admin', 'client']],
+    ['get', '/api/v1/infrastructure/servers/1/renewals', ['ops', 'super'], ['member', 'admin', 'client']],
+    ['get', '/api/v1/infrastructure/domains/1/renewal-preview', ['ops', 'super'], ['member', 'admin', 'client']],
+    ['get', '/api/v1/infrastructure/servers/1/renewal-preview?period_value=1&period_unit=month', ['ops', 'super'], ['member', 'admin', 'client']],
   ],
   'invoices and payments require invoice permissions': [
     ['get', '/api/v1/invoices', ['admin', 'billing', 'leadsViewer', 'client'], ['member', 'finance']],
@@ -162,9 +175,24 @@ const CASES: Record<string, Case[]> = {
     ['get', '/api/v1/invoice-payments/1/secure-link', ['admin'], ['member', 'client', 'billing']],
     ['get', '/api/v1/invoice-payments/1/receipt', [], ['member', 'client']],
   ],
+  // Reminders are personal (scoped to the caller in the service); every route needs
+  // VIEW_REMINDERS or MANAGE_REMINDERS, like the Reminders page and menu
+  'reminders require VIEW_REMINDERS or MANAGE_REMINDERS': [
+    ['get', '/api/v1/reminders', ['remindersViewer', 'remindersManager', 'super'], ['member', 'admin', 'client', 'ops']],
+    ['get', '/api/v1/reminders/1', ['remindersViewer', 'remindersManager'], ['member', 'client']],
+    ['post', '/api/v1/reminders', ['remindersViewer', 'remindersManager', 'super'], ['member', 'admin', 'client']],
+    ['put', '/api/v1/reminders/1', ['remindersViewer', 'remindersManager'], ['member', 'client']],
+    ['patch', '/api/v1/reminders/1', ['remindersViewer', 'remindersManager'], ['member', 'client']],
+    ['delete', '/api/v1/reminders/1', ['remindersViewer', 'remindersManager'], ['member', 'client']],
+    ['post', '/api/v1/reminders/test-email', ['remindersViewer', 'remindersManager'], ['member', 'client']],
+    ['get', '/api/v1/dashboard-summary', ['remindersViewer', 'remindersManager', 'super'], ['member', 'admin', 'client']],
+  ],
   'tracking administration requires MANAGE_SETTINGS': [
     ['get', '/api/v1/tracking/employee-status', ['settings', 'super'], ['member', 'admin', 'client']],
-    ['get', '/api/v1/tracking/employee-status/3', ['settings'], ['member']],
+    // Own status (desktop tracker productive_time) is open; other users' status needs MANAGE_SETTINGS
+    ['get', '/api/v1/tracking/employee-status/3', ['member', 'settings', 'super'], ['admin', 'client', 'billing', 'deletedClient']],
+    ['get', '/api/v1/tracking/employee-status/2', ['admin', 'settings', 'super'], ['member', 'client']],
+    ['get', '/api/v1/tracking/employee-status/6', ['settings'], ['member', 'admin']],
     ['post', '/api/v1/tracking/toggle-tracking/3', ['settings'], ['member', 'admin']],
     ['get', '/api/v1/tracking/reports/daily', ['settings'], ['member']],
     ['get', '/api/v1/tracking/reports/weekly', ['settings'], ['member']],
@@ -197,6 +225,7 @@ describe('RBAC route matrix (HTTP, Phase 2.2)', () => {
         ServersController, DomainsController, CredentialsController, InvoicesController, InvoicePaymentsController,
         TrackingController, TrackingProfilesController, ReportsController, FinancialReportsController, SeoReportsController,
         ClientPortalController, MilestonesController, TaskFilesController, TaskReviewsController, InfrastructureSummaryController,
+        RemindersController, DashboardSummaryController,
       ],
     })
       .useMocker(() => autoMock())
@@ -236,6 +265,11 @@ describe('RBAC route matrix (HTTP, Phase 2.2)', () => {
 
   it('rejects unauthenticated requests', async () => {
     const res = await request(app.getHttpServer()).get('/api/v1/invoices');
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects unauthenticated employee-status requests', async () => {
+    const res = await request(app.getHttpServer()).get('/api/v1/tracking/employee-status/3');
     expect(res.status).toBe(401);
   });
 });
