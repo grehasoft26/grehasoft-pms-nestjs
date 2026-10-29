@@ -2,6 +2,51 @@ import { Injectable, NotFoundException, BadRequestException, ForbiddenException 
 import { PrismaService } from '../../core/prisma.service';
 import { formatUserResponse } from '../users/user.serializer';
 
+/** Longest lead-level "Last Notes" accepted (TEXT column; well under its 64 KB limit in utf8mb4). */
+export const LEAD_NOTES_MAX_LENGTH = 10000;
+const COMPANY_EMAIL_MAX_LENGTH = 150;
+const COMPANY_PHONE_MAX_LENGTH = 20;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Digits with an optional leading +, spaces, dashes, dots and parentheses; 7-15 digits (E.164 allows 15)
+const PHONE_PATTERN = /^\+?[0-9\s\-().]+$/;
+
+const invalidField = (field: string, message: string) => new BadRequestException({ [field]: [message] });
+
+/**
+ * An optional text field from the request body: trimmed, blank -> null. undefined means the field
+ * was not sent (PATCH leaves the stored value unchanged).
+ */
+const optionalText = (body: any, field: string, label: string, maxLength: number): string | null | undefined => {
+  const raw = body?.[field];
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (typeof raw !== 'string') throw invalidField(field, `${label} must be text.`);
+  const value = raw.trim();
+  if (!value) return null;
+  if (value.length > maxLength) throw invalidField(field, `${label} must be at most ${maxLength} characters.`);
+  return value;
+};
+
+const companyEmailFrom = (body: any): string | null | undefined => {
+  const value = optionalText(body, 'company_email', 'Company email', COMPANY_EMAIL_MAX_LENGTH);
+  if (value && !EMAIL_PATTERN.test(value)) throw invalidField('company_email', 'Enter a valid company email address.');
+  return value;
+};
+
+const companyPhoneFrom = (body: any): string | null | undefined => {
+  const value = optionalText(body, 'company_phone', 'Company phone', COMPANY_PHONE_MAX_LENGTH);
+  if (value) {
+    const digits = value.replace(/\D/g, '').length;
+    if (!PHONE_PATTERN.test(value) || digits < 7 || digits > 15) {
+      throw invalidField('company_phone', 'Enter a valid company phone number.');
+    }
+  }
+  return value;
+};
+
+const leadNotesFrom = (body: any): string | null | undefined =>
+  optionalText(body, 'notes', 'Last notes', LEAD_NOTES_MAX_LENGTH);
+
 @Injectable()
 export class LeadsService {
   constructor(private readonly prisma: PrismaService) {}
@@ -24,10 +69,13 @@ export class LeadsService {
       contacted_person: l.contacted_person || null,
       reference_person: l.reference_person || null,
       company_name: l.company_name || null,
+      company_email: l.company_email || null,
+      company_phone: l.company_phone || null,
       service_required: Array.isArray(l.service_required) ? l.service_required : [],
       client_requirements: l.client_requirements || null,
       details_given: l.details_given || null,
       competitor_websites: l.competitor_websites || null,
+      notes: l.notes || null,
       documents_given: Array.isArray(l.documents_given) ? l.documents_given : [],
       login_credentials: Array.isArray(l.login_credentials) ? l.login_credentials : [],
       followups: (l.followups || []).map((f: any) => ({
@@ -163,6 +211,10 @@ export class LeadsService {
     }
 
     const companyName = (body.company_name || body.name || 'Unnamed Lead').trim();
+    // Validated before anything is written
+    const companyEmail = companyEmailFrom(body) ?? null;
+    const companyPhone = companyPhoneFrom(body) ?? null;
+    const notes = leadNotesFrom(body) ?? null;
 
     const lead = await this.prisma.lead.create({
       data: {
@@ -177,10 +229,13 @@ export class LeadsService {
         contacted_person: body.contacted_person || null,
         reference_person: body.reference_person || null,
         company_name: companyName,
+        company_email: companyEmail,
+        company_phone: companyPhone,
         service_required: Array.isArray(body.service_required) ? body.service_required : [],
         client_requirements: body.client_requirements || null,
         details_given: body.details_given || null,
         competitor_websites: body.competitor_websites || null,
+        notes,
         documents_given: Array.isArray(body.documents_given) ? body.documents_given : [],
         login_credentials: Array.isArray(body.login_credentials) ? body.login_credentials : [],
       },
@@ -205,6 +260,11 @@ export class LeadsService {
 
     await this.findOne(id, user);
 
+    // Validated before anything is written; fields that are not sent keep their stored values
+    const companyEmail = companyEmailFrom(body);
+    const companyPhone = companyPhoneFrom(body);
+    const notes = leadNotesFrom(body);
+
     const data: any = {};
     if (body.name !== undefined) data.name = body.name;
     if (body.email !== undefined) data.email = body.email;
@@ -217,6 +277,9 @@ export class LeadsService {
     if (body.contacted_person !== undefined) data.contacted_person = body.contacted_person;
     if (body.reference_person !== undefined) data.reference_person = body.reference_person;
     if (body.company_name !== undefined) data.company_name = body.company_name;
+    if (companyEmail !== undefined) data.company_email = companyEmail;
+    if (companyPhone !== undefined) data.company_phone = companyPhone;
+    if (notes !== undefined) data.notes = notes;
     if (body.service_required !== undefined) {
       data.service_required = Array.isArray(body.service_required) ? body.service_required : [];
     }
@@ -280,19 +343,26 @@ export class LeadsService {
       throw new BadRequestException({ error: 'Lead already converted' });
     }
 
+    // The contact person's email/phone first; the company's own as fallbacks when blank
+    const email = (lead.email || '').trim() || (lead.company_email || '').trim();
+    const phone = (lead.phone || '').trim() || (lead.company_phone || '').trim();
+
     let client = lead.client;
     if (!client) {
-      // Find active client or create
-      client = await this.prisma.client.findFirst({
-        where: { email: lead.email, deleted_at: null },
-      });
+      // Find active client or create. Only a real email is matched: an empty one would link the
+      // lead to any unrelated client stored without an email.
+      client = email
+        ? await this.prisma.client.findFirst({
+            where: { email, deleted_at: null },
+          })
+        : null;
 
       if (!client) {
         client = await this.prisma.client.create({
           data: {
             name: lead.name || 'Converted Lead',
-            email: lead.email || `client_${Date.now()}@example.com`,
-            phone: lead.phone || '',
+            email: email || `client_${Date.now()}@example.com`,
+            phone,
             company_name: lead.company_name || lead.name || 'Converted Company',
             address: body.client_address || '',
             status: 'active',

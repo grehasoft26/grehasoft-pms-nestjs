@@ -530,10 +530,15 @@ model Lead {
   contacted_person     String?    @db.VarChar(150)
   reference_person     String?    @db.VarChar(150)
   company_name         String?    @db.VarChar(200)
+  // The company's own contact details, separate from the contact person's email/phone
+  company_email        String?    @db.VarChar(150)
+  company_phone        String?    @db.VarChar(20)
   service_required     Json
   client_requirements  String?    @db.Text
   details_given        String?    @db.Text
   competitor_websites  String?    @db.Text
+  // "Last Notes" on the lead itself; follow-up notes stay in lead_followups
+  notes                String?    @db.Text
   documents_given      Json
   login_credentials    Json
   created_at           DateTime   @default(now()) @db.DateTime(3)
