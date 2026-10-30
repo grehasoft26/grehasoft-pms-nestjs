@@ -14,6 +14,13 @@ import {
   validatePaymentAmount,
 } from './invoice-status';
 
+/**
+ * Validity of the invoice secure links shared via WhatsApp (GET /invoices/:id/secure-link): exactly
+ * 30 days. Receipt and offer-letter links keep their own 48-hour expiry. The expiry is signed into
+ * each token, so links issued earlier keep the expiry they were issued with.
+ */
+export const INVOICE_SECURE_LINK_TTL_SECONDS = 30 * 24 * 60 * 60;
+
 export class InvoiceSigning {
   static generateToken(invoiceId: number, secret: string, expiresInSeconds: number = 172800): string {
     const expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds;
@@ -635,11 +642,13 @@ export class InvoicesService {
     if (req?.user) await this.findOne(id, req.user);
 
     const secret = this.getSigningSecret();
-    const token = InvoiceSigning.generateToken(id, secret, 172800);
+    const token = InvoiceSigning.generateToken(id, secret, INVOICE_SECURE_LINK_TTL_SECONDS);
     const baseUrl = this.getBaseUrl(req);
     const securePdfLink = `${baseUrl}/api/v1/invoices/public/${encodeURIComponent(token)}/download/`;
+    // The expiry signed into the token ("<id>.<expiresAt>.<hmac>"), not a separately computed value
+    const expiresAt = Number(token.split('.')[1]);
 
-    return { secure_pdf_link: securePdfLink };
+    return { secure_pdf_link: securePdfLink, expires_at: new Date(expiresAt * 1000).toISOString() };
   }
 
   getInvoicePdfFilename(invoice: any): string {
