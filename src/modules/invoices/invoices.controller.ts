@@ -30,8 +30,9 @@ export class InvoicesController {
 
   @Get('analytics')
   @Permissions(...INVOICE_READ_PERMISSIONS)
-  async getAnalytics(@CurrentUser() user: any) {
-    return this.invoicesService.getAnalytics(user);
+  async getAnalytics(@CurrentUser() user: any, @Query() query: any) {
+    // Optional ?month=YYYY-MM: summary of invoices issued in that month (all invoices when omitted)
+    return this.invoicesService.getAnalytics(user, query);
   }
 
   @Public()

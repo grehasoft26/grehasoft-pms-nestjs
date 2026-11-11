@@ -88,6 +88,71 @@ export function dateOnlyKey(value: Date | string | null | undefined): string | n
   return match ? match[1] : null;
 }
 
+/**
+ * Financial year label of a date, "YYYY-YY" (April 1 to March 31): 2027-04-01 .. 2028-03-31 is "2027-28".
+ * The date is the calendar date in the business time zone (Asia/Kolkata), so the label is the same whatever
+ * time zone the server runs in (00:00-05:29 IST on 1 April is already the new financial year, while UTC still says
+ * 31 March).
+ */
+export function fiscalYearLabel(reference: Date = new Date()): string {
+  const [year, month] = businessDateKey(reference).split('-').map(Number);
+  const startYear = month >= 4 ? year : year - 1;
+  return `${startYear}-${String(startYear + 1).slice(-2)}`;
+}
+
+/** Invoice number prefix of a date's financial year: "GSI/2027-28" (numbers are "<prefix>/001", "<prefix>/002", ...). */
+export function invoiceNumberPrefix(reference: Date = new Date()): string {
+  return `GSI/${fiscalYearLabel(reference)}`;
+}
+
+/**
+ * A date-only value for an invoice or payment date column (`@db.Date`, stored as UTC midnight).
+ * An explicit value is used as given; when it is missing, the default is TODAY IN THE BUSINESS TIME ZONE
+ * (Asia/Kolkata), never the server's UTC date: between 00:00 and 05:29 IST the UTC date is still yesterday,
+ * which would put a new invoice into the previous day (and, on the 1st, the previous month).
+ */
+export function dateOnlyOrToday(value: unknown, now: Date = new Date()): Date {
+  if (value !== undefined && value !== null && value !== '') return new Date(value as any);
+  return new Date(`${businessDateKey(now)}T00:00:00.000Z`);
+}
+
+/** Calendar month of an invoice list / summary filter, from "YYYY-MM". */
+export interface InvoiceMonthRange {
+  /** "YYYY-MM" */
+  month: string;
+  /** First day of the month, as stored in a date column (UTC midnight). Inclusive. */
+  from: Date;
+  /** First day of the NEXT month (UTC midnight). Exclusive: filter with `issue_date >= from AND issue_date < to`. */
+  to: Date;
+  /** "YYYY-MM-DD" of the first and the last day of the month (for display and the API `period`). */
+  from_date: string;
+  to_date: string;
+}
+
+/**
+ * Strictly parses a month filter: exactly "YYYY-MM" with a real calendar month (01-12). Returns null for anything else
+ * ("2026-13", "2026-1", "2026-11-01", " 2026-11", "11-2026", years outside 2000-2100). The range is made of date-only
+ * values, so no time zone is involved when filtering a date column.
+ */
+export function parseInvoiceMonth(value: unknown): InvoiceMonthRange | null {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(value);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (year < 2000 || year > 2100) return null;
+  const from = new Date(Date.UTC(year, month - 1, 1));
+  const to = new Date(Date.UTC(year, month, 1)); // December rolls over to January of the next year
+  const lastDay = new Date(to.getTime() - 24 * 60 * 60 * 1000);
+  return {
+    month: value,
+    from,
+    to,
+    from_date: from.toISOString().slice(0, 10),
+    to_date: lastDay.toISOString().slice(0, 10),
+  };
+}
+
 const resolveToday = (today?: Date | string): string =>
   typeof today === 'string' ? (dateOnlyKey(today) ?? businessDateKey()) : businessDateKey(today ?? new Date());
 

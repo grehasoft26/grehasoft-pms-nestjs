@@ -4,7 +4,7 @@ import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
-import { computeInvoiceFinancials, roundMoney, toPaise, validatePaymentAmount } from './invoice-status';
+import { computeInvoiceFinancials, dateOnlyOrToday, roundMoney, toPaise, validatePaymentAmount } from './invoice-status';
 
 export class ReceiptSigning {
   static generateToken(paymentId: number, secret: string, expiresInSeconds: number = 172800): string {
@@ -417,7 +417,8 @@ export class InvoicePaymentsService {
         data: {
           invoice_id: invoiceId,
           amount: roundMoney(body.amount),
-          payment_date: new Date(body.payment_date || new Date()),
+          // No payment date: today in Asia/Kolkata (not the server's UTC date)
+          payment_date: dateOnlyOrToday(body.payment_date),
           payment_mode: body.payment_mode || 'cash',
           notes: body.notes || '',
         },

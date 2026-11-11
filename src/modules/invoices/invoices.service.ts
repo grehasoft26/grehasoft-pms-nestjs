@@ -6,10 +6,15 @@ import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
 import {
   INITIAL_PAYMENT_NOTE,
+  InvoiceMonthRange,
   aggregateInvoiceFinancials,
+  businessDateKey,
   computeInvoiceFinancials,
+  dateOnlyOrToday,
   findInitialPaymentId,
+  invoiceNumberPrefix,
   matchesInvoiceStatusFilter,
+  parseInvoiceMonth,
   toPaise,
   validatePaymentAmount,
 } from './invoice-status';
@@ -20,6 +25,15 @@ import {
  * each token, so links issued earlier keep the expiry they were issued with.
  */
 export const INVOICE_SECURE_LINK_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * The issue-date period of an invoice list page or summary: one calendar month, or all invoices. The list (with ?month)
+ * and the analytics return the same object for the same request, so they can be checked against each other.
+ */
+export const invoicePeriod = (range: InvoiceMonthRange | null) =>
+  range
+    ? { type: 'month' as const, month: range.month, from: range.from_date, to: range.to_date }
+    : { type: 'all' as const, month: null, from: null, to: null };
 
 export class InvoiceSigning {
   static generateToken(invoiceId: number, secret: string, expiresInSeconds: number = 172800): string {
@@ -80,44 +94,12 @@ export class InvoicesService {
   ) {}
 
   generateNextInvoiceNumber(): string {
-    const today = new Date();
-    const year = today.getFullYear();
-    const month = today.getMonth() + 1; // 1-12
-
-    let startYear: number;
-    let endYear: number;
-
-    if (month >= 4) {
-      startYear = year;
-      endYear = year + 1;
-    } else {
-      startYear = year - 1;
-      endYear = year;
-    }
-
-    const fiscalYear = `${startYear}-${String(endYear).slice(-2)}`;
-    const prefix = `GSI/${fiscalYear}`;
-    return `${prefix}/001`;
+    // Financial year (April-March) of today in Asia/Kolkata, whatever the server's time zone
+    return `${invoiceNumberPrefix()}/001`;
   }
 
   async getNextInvoiceNumber(): Promise<string> {
-    const today = new Date();
-    const year = today.getFullYear();
-    const month = today.getMonth() + 1;
-
-    let startYear: number;
-    let endYear: number;
-
-    if (month >= 4) {
-      startYear = year;
-      endYear = year + 1;
-    } else {
-      startYear = year - 1;
-      endYear = year;
-    }
-
-    const fiscalYear = `${startYear}-${String(endYear).slice(-2)}`;
-    const prefix = `GSI/${fiscalYear}`;
+    const prefix = invoiceNumberPrefix();
 
     const lastInvoice = await this.prisma.invoice.findFirst({
       where: {
@@ -218,9 +200,25 @@ export class InvoicesService {
     };
   }
 
-  async findAll(user: any, query: { search?: string; client?: string; status?: string; all?: string; page?: string; limit?: string }) {
+  /**
+   * The optional `month=YYYY-MM` filter (issue date within that calendar month). Empty or missing = no month filter.
+   * Anything else that is not exactly YYYY-MM with a real month is a 400.
+   */
+  private resolveMonthFilter(month: unknown): InvoiceMonthRange | null {
+    if (month === undefined || month === null || month === '') return null;
+    const range = parseInvoiceMonth(month);
+    if (!range) {
+      throw new BadRequestException({ month: ['Month must be a real calendar month in YYYY-MM format, for example 2026-11.'] });
+    }
+    return range;
+  }
+
+  async findAll(user: any, query: { search?: string; client?: string; status?: string; all?: string; page?: string; limit?: string; month?: string }) {
     const roleName = user.role?.name;
     const where: any = {};
+    // Validated for every call; applied to the paginated list only. `all=true` callers (expense form picker, etc.) keep
+    // receiving the complete list exactly as before.
+    const monthRange = this.resolveMonthFilter(query.month);
 
     if (query.search) {
       const searchStr = query.search.trim();
@@ -269,6 +267,9 @@ export class InvoicesService {
     const page = Math.max(1, parseInt(query.page as string, 10) || 1);
     const limit = Math.max(1, parseInt(query.limit as string, 10) || 10);
 
+    // Issue date inside the month: [first day, first day of the next month), a date-only column (no time zone involved)
+    if (monthRange) where.issue_date = { gte: monthRange.from, lt: monthRange.to };
+
     const invoices = await this.prisma.invoice.findMany({
       where,
       include: {
@@ -293,6 +294,9 @@ export class InvoicesService {
       next: page * limit < totalCount ? `/api/v1/invoices?page=${page + 1}` : null,
       previous: page > 1 ? `/api/v1/invoices?page=${page - 1}` : null,
       results: paginated,
+      // Only with ?month: the period actually applied (same object as the analytics response), so a client can verify
+      // that the rows belong to the month it asked for. Without ?month the response is exactly as before.
+      ...(monthRange ? { period: invoicePeriod(monthRange) } : {}),
     };
   }
 
@@ -358,7 +362,8 @@ export class InvoicesService {
       const paymentError = validatePaymentAmount(rawInitialPayment, toPaise(total));
       if (paymentError) throw new BadRequestException(paymentError);
     }
-    const issueDateObj = new Date(body.issue_date || new Date());
+    // Missing issue date: today in Asia/Kolkata (not the server's UTC date)
+    const issueDateObj = dateOnlyOrToday(body.issue_date);
     const paymentDateObj = body.payment_date ? new Date(body.payment_date) : issueDateObj;
     const paymentMode = body.payment_mode || 'cash';
 
@@ -441,7 +446,8 @@ export class InvoicesService {
     }
     const paymentMode = body.payment_mode || body.new_payment_mode || 'cash';
     const paymentDateStr = body.payment_date || body.new_payment_date;
-    const paymentDateObj = paymentDateStr ? new Date(paymentDateStr) : (body.issue_date ? new Date(body.issue_date) : new Date());
+    // No payment date: the invoice's issue date when one is sent, otherwise today in Asia/Kolkata
+    const paymentDateObj = paymentDateStr ? new Date(paymentDateStr) : dateOnlyOrToday(body.issue_date);
 
     // Only update advance if explicitly provided and no new_payment_amount is being processed
     if (body.advance !== undefined && newPaymentAmount === 0 && body.new_payment_amount === undefined) {
@@ -554,26 +560,54 @@ export class InvoicesService {
     return null;
   }
 
-  async getAnalytics(user: any) {
-    const invoices = await this.findAll(user, { all: 'true' });
-    const list = Array.isArray(invoices) ? invoices : invoices.results;
+  /**
+   * Invoice summary cards. `month=YYYY-MM` limits them to invoices ISSUED in that month; without it they cover all
+   * invoices (as before).
+   *
+   * For a month:
+   * - total_invoices: invoices issued in the month;
+   * - total_revenue: sum of their totals (GST included);
+   * - total_paid: paid to date on those invoices (advance + every payment, whenever it was received);
+   * - total_balance: their outstanding balances (overdue and not yet due).
+   * Overpayments are counted in total_paid and reported separately (total_overpaid), never as a negative balance.
+   *
+   * A lightweight query: only the invoice amounts and payment amounts (no client, items or other columns), and the
+   * same per-invoice rules as the invoice list (computeInvoiceFinancials), so the cards equal the sum of the list rows.
+   */
+  async getAnalytics(user: any, query: { month?: string } = {}) {
+    const monthRange = this.resolveMonthFilter(query?.month);
+    const period = invoicePeriod(monthRange);
+
+    const where: any = {};
+    if (user.role?.name === 'CLIENT') {
+      const client = await this.prisma.client.findFirst({ where: { portal_users: { some: { id: user.id } } } });
+      // A client account without a client record has no invoices (same as the list)
+      where.client_id = client ? client.id : -1;
+    }
+    if (monthRange) where.issue_date = { gte: monthRange.from, lt: monthRange.to };
+
+    const invoices = await this.prisma.invoice.findMany({
+      where,
+      select: { id: true, total: true, advance: true, due_date: true, payments: { select: { amount: true } } },
+    });
 
     // Exact paise-based totals from the same per-invoice figures shown in the table
     const totals = aggregateInvoiceFinancials(
-      list.map((inv) =>
-        computeInvoiceFinancials({ total: inv.total, payments: [{ amount: inv.total_paid }], due_date: inv.due_date }),
+      invoices.map((inv) =>
+        computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments, due_date: inv.due_date }),
       ),
     );
 
     return {
       total_invoices: totals.invoice_count,
       total_revenue: totals.total_billed,
-      // Cash received, including any overpayment (reported separately below)
+      // Paid to date, including any overpayment (reported separately below)
       total_paid: totals.total_paid,
       total_balance: totals.total_balance,
       total_overpaid: totals.total_overpaid,
       overdue_count: totals.overdue_count,
       overdue_balance: totals.overdue_balance,
+      period,
     };
   }
 
@@ -756,7 +790,7 @@ export class InvoicesService {
 
     const previewInvoiceData = {
       invoice_number: body.invoice_number || body.invoiceNumber || 'PREVIEW',
-      issue_date: body.issue_date || body.issueDate || new Date().toISOString().split('T')[0],
+      issue_date: body.issue_date || body.issueDate || businessDateKey(),
       due_date: dueDateStr,
       status: advance >= total && total > 0 ? 'paid' : advance > 0 ? 'partial' : 'unpaid',
       subtotal,
@@ -779,7 +813,7 @@ export class InvoicesService {
       items: formattedItems,
       payments: advance > 0 ? [{
         amount: advance,
-        payment_date: body.issue_date || new Date().toISOString().split('T')[0],
+        payment_date: body.issue_date || businessDateKey(),
         payment_mode: 'advance',
         notes: 'Amount Received',
       }] : [],
