@@ -323,10 +323,15 @@ describe('TrackingService.getEmployeeStatus: On Break', () => {
     const s: any = await service.getEmployeeStatus(1);
     expect(s.status).toBe('On Break');
     expect(s.break_started_at).toBe(minutesAgo(10).toISOString());
-    expect(s.total_tracked_time).toBe('00:40:00'); // 1800 + 600 s of heartbeat time; break time is not counted
+    // 1800 s active (heartbeat counter) + 0 s idle: idle comes from idle_start/idle_end events (none here), not from the
+    // session's 600 s idle counter; break time is not counted either
+    expect(s.total_tracked_time).toBe('00:30:00');
+    expect(s.idle_time).toBe('00:00:00');
+    expect(s.idle_basis).toBe('threshold_events');
     const args = prisma.trackingActivityLog.findMany.mock.calls[0][0];
     expect(args.where.activity_type).toEqual({ in: ['break_start', 'break_end'] });
-    expect(prisma.trackingActivityLog.findMany).toHaveBeenCalledTimes(1);
+    // One query for open breaks (all users) + one for the employee's events of today (shared with the History Timeline)
+    expect(prisma.trackingActivityLog.findMany).toHaveBeenCalledTimes(2);
   });
 
   it('after the break ended the employee is Stopped (no session open), not On Break', async () => {

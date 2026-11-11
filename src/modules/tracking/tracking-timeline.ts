@@ -95,7 +95,34 @@ export const isValidTimeZone = (tz: unknown): tz is string => {
 
 export const defaultTimeZone = (): string => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
-const addDays = (date: string, days: number): string => {
+/**
+ * The reporting time zone for tracking days (Live Tracking "today" and the History Timeline default). Fixed on purpose:
+ * the Node.js server's own zone (often UTC in production) must never decide where an employee's day starts.
+ */
+export const REPORTING_TIME_ZONE = 'Asia/Kolkata';
+
+/** Today's date (YYYY-MM-DD) in the reporting time zone, and the UTC instant at which it starts. */
+export const reportingToday = (now: Date = new Date()): { date: string; start: Date } => {
+  const date = zonedParts(now, REPORTING_TIME_ZONE).date;
+  return { date, start: zonedDayStart(date, REPORTING_TIME_ZONE) };
+};
+
+/** True when two instants fall on the same calendar day in the reporting time zone. */
+export const sameReportingDay = (a: number, b: number): boolean =>
+  zonedParts(new Date(a), REPORTING_TIME_ZONE).date === zonedParts(new Date(b), REPORTING_TIME_ZONE).date;
+
+/** The reporting-time-zone calendar date (YYYY-MM-DD) of an instant. */
+export const reportingDateOf = (instant: Date | string | number): string => zonedParts(new Date(instant), REPORTING_TIME_ZONE).date;
+
+/** Weekday (0 = Sunday) and month (0 = January) of a YYYY-MM-DD calendar date, without any time zone involved. */
+export const calendarDateParts = (date: string): { weekday: number; month: number; day: number; year: number } => {
+  const [y, m, d] = date.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return { weekday: dt.getUTCDay(), month: dt.getUTCMonth(), day: dt.getUTCDate(), year: dt.getUTCFullYear() };
+};
+
+/** Calendar arithmetic on YYYY-MM-DD strings (time-zone independent). */
+export const addDays = (date: string, days: number): string => {
   const [y, m, d] = date.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d + days));
   return dt.toISOString().slice(0, 10);
@@ -120,6 +147,7 @@ const parsePositiveInt = (value: unknown): number | null => {
 /**
  * Validates GET /tracking/reports/timeline query parameters. `user_id` is required; the period is `date`
  * (one day) or `from`..`to` (inclusive, at most TIMELINE_MAX_RANGE_DAYS days), defaulting to today in `tz`.
+ * `tz` defaults to REPORTING_TIME_ZONE.
  */
 export const parseTimelineQuery = (raw: any, now: Date = new Date()): TimelineQueryResult => {
   const q = raw && typeof raw === 'object' ? raw : {};
@@ -129,7 +157,8 @@ export const parseTimelineQuery = (raw: any, now: Date = new Date()): TimelineQu
   if (userId === null) return fail('user_id is required');
   if (!Number.isSafeInteger(userId)) return fail('user_id must be a positive integer');
 
-  const tz = q.tz === undefined || q.tz === '' ? defaultTimeZone() : q.tz;
+  // No tz given: the reporting zone (never the server's local zone, which decides nothing about an employee's day)
+  const tz = q.tz === undefined || q.tz === '' ? REPORTING_TIME_ZONE : q.tz;
   if (!isValidTimeZone(tz)) return fail('tz must be an IANA time zone such as Asia/Kolkata');
 
   let from: string;

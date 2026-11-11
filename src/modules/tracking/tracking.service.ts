@@ -17,11 +17,31 @@ import {
   OpenBreak,
   TIMELINE_MAX_EVENTS,
   TIMELINE_MAX_SESSIONS,
+  REPORTING_TIME_ZONE,
+  addDays,
   buildTrackingTimeline,
+  calendarDateParts,
+  isCalendarDate,
   parseTimelineQuery,
+  reportingDateOf,
+  reportingToday,
   resolveOpenBreaks,
+  sameReportingDay,
+  zonedParts,
   zonedRange,
 } from './tracking-timeline';
+import {
+  IDLE_DERIVED_ROW_KEYS,
+  IDLE_UNAVAILABLE_LABEL,
+  NullableTotal,
+  exportValue,
+  idleBasesOf,
+  CSV_UTF8_BOM,
+  readIdleEffectiveDate,
+  reportIdleBasis,
+  rowIdleBasis,
+  sumNullable,
+} from './tracking-report-idle';
 
 /**
  * device_id of web-portal (browser) sessions: the portal heartbeat sends no device_id, so it falls back to
@@ -45,6 +65,58 @@ const toMs = (value: Date | string | null | undefined): number | null => {
   const ms = new Date(value).getTime();
   return Number.isFinite(ms) ? ms : null;
 };
+
+/**
+ * How one desktop heartbeat tick (normal heartbeat or offline batch entry) is counted in the session's
+ * productive_seconds / idle_seconds. Threshold-based: the tick is idle only when the tracker reports is_idle
+ * (no keyboard/mouse input for its idle threshold, 5 minutes by default), otherwise it is active time.
+ *
+ * Before this rule a tick counted as idle whenever it had no input in its own ~10 s, which made a few seconds of
+ * reading or thinking "idle" and disagreed with the event-based idle of the History Timeline. Every tracker version
+ * (with or without event support) sends the same threshold-based is_idle flag, so the rule applies to all of them.
+ * Each tick's duration lands in exactly one bucket, so nothing is counted twice.
+ */
+export const heartbeatTickSeconds = (isIdle: boolean, durationSeconds: number): { activeSeconds: number; idleSeconds: number } => {
+  const seconds = Math.max(0, Number(durationSeconds) || 0);
+  return isIdle ? { activeSeconds: 0, idleSeconds: seconds } : { activeSeconds: seconds, idleSeconds: 0 };
+};
+
+/**
+ * What Live Tracking's idle_time is based on:
+ * - 'threshold_events': idle_start/idle_end periods for today (reporting time zone), computed by the same
+ *   buildTrackingTimeline as the History Timeline (identical definition and rounding);
+ * - 'heartbeat_counters': fallback when tracking events cannot be read; the sum of today's work_session.idle_seconds,
+ *   which for sessions that started before the threshold rule may still contain old no-input-tick seconds.
+ */
+export type LiveIdleBasis = 'threshold_events' | 'heartbeat_counters';
+
+export type LiveIdleResult = { seconds: number; basis: LiveIdleBasis; ongoing: boolean; incompleteIntervals: number };
+
+/** Timeline rows of one employee, capped exactly like the single-employee History Timeline query. */
+export type TimelineRowsForUser = { sessionRows: any[]; events: any[]; truncated: boolean };
+
+/**
+ * A business reporting date parameter as YYYY-MM-DD in the reporting time zone. A calendar date is taken as is; any
+ * other parseable value (e.g. an ISO timestamp) is converted to its Asia/Kolkata date; empty = null.
+ */
+const reportDateParam = (value: unknown, name: string): string | null => {
+  if (value === undefined || value === null || value === '') return null;
+  const s = String(value).trim();
+  if (isCalendarDate(s)) return s;
+  const parsed = new Date(s);
+  if (!Number.isNaN(parsed.getTime())) return reportingDateOf(parsed);
+  throw new BadRequestException(`${name} must be a date in YYYY-MM-DD format`);
+};
+
+/** PDF cell marker for an unavailable (mixed-day) value; the legend under the table spells out IDLE_UNAVAILABLE_LABEL */
+const PDF_UNAVAILABLE_MARK = 'Unavailable †';
+
+/** Export columns (daily/employee rows, weekly trend, monthly ranking) whose value depends on idle time */
+const IDLE_DERIVED_EXPORT_KEYS = new Set<string>([...IDLE_DERIVED_ROW_KEYS, 'Idle Hours', 'Total Tracked', 'tracked_hours']);
+
+const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DAY_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 type Interval = { start: number; end: number };
 
@@ -668,9 +740,10 @@ export class TrackingService {
 
       if (!recentDup) {
         const category = this.classifyAppActivity(appName || '', windowTitle);
-        const isProductiveTick = (!isIdle) && (mouseMoves > 0 || keyPresses > 0 || clicks > 0);
-        const tickProductiveSeconds = isProductiveTick ? durationSeconds : 0;
-        const tickIdleSeconds = isProductiveTick ? 0 : durationSeconds;
+        // Threshold-based (see heartbeatTickSeconds): a tick without input but with is_idle=false is active time
+        const tick = heartbeatTickSeconds(isIdle, durationSeconds);
+        const tickProductiveSeconds = tick.activeSeconds;
+        const tickIdleSeconds = tick.idleSeconds;
 
         const updatedMouse = activeSession.mouse_moves + mouseMoves;
         const updatedKeys = activeSession.key_presses + keyPresses;
@@ -846,7 +919,8 @@ export class TrackingService {
     };
     const loginMs = (s: any) => toMs(s.login_time) ?? Number.POSITIVE_INFINITY;
     const endMs = (s: any) => (s.is_active_session ? Number.POSITIVE_INFINITY : toMs(s.logout_time) ?? toMs(s.last_ping) ?? loginMs(s));
-    const sameDay = (a: number, b: number) => new Date(a).toDateString() === new Date(b).toDateString();
+    // "Same day" in the reporting time zone, never the server's local zone
+    const sameDay = sameReportingDay;
 
     const sessionFor = async (ts: Date): Promise<Touched> => {
       const t = ts.getTime();
@@ -916,9 +990,10 @@ export class TrackingService {
       lastSessionId = targetSession.id;
 
       const category = this.classifyAppActivity(act.app_name, act.window_title);
-      const isProductiveTick = (!act.is_idle) && (act.mouse_moves > 0 || act.key_presses > 0 || act.clicks > 0);
-      const tickProd = isProductiveTick ? act.duration_seconds : 0;
-      const tickIdle = isProductiveTick ? 0 : act.duration_seconds;
+      // Same threshold-based rule as a live heartbeat (see heartbeatTickSeconds)
+      const tick = heartbeatTickSeconds(act.is_idle, act.duration_seconds);
+      const tickProd = tick.activeSeconds;
+      const tickIdle = tick.idleSeconds;
 
       entry.mouse += act.mouse_moves;
       entry.keys += act.key_presses;
@@ -1192,11 +1267,14 @@ export class TrackingService {
     });
 
     const now = new Date();
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    // "Today" is the calendar day in the reporting time zone (Asia/Kolkata), not the server's local day
+    const today = reportingToday(now);
+    const todayStart = today.start;
 
     const results = [];
     const openBreaks = await this.loadOpenBreaks(users.map((u) => u.id), now);
+    // Today's threshold idle for every employee: two queries in total (not two per employee)
+    const liveIdleByUser = await this.loadLiveIdleBatch(users.map((u) => u.id), today, now);
 
     for (const u of users) {
       // Today's sessions plus any still-open older session, on every device (desktop and browser)
@@ -1249,18 +1327,25 @@ export class TrackingService {
       }
 
       let dailyProductiveSeconds = 0;
-      let dailyIdleSeconds = 0;
+      let counterIdleSeconds = 0;
       let dailyMouseMoves = 0;
       let dailyKeyPresses = 0;
       let dailyClicks = 0;
 
       for (const s of todaySessions) {
         dailyProductiveSeconds += s.productive_seconds || 0;
-        dailyIdleSeconds += s.idle_seconds || 0;
+        counterIdleSeconds += s.idle_seconds || 0;
         dailyMouseMoves += s.mouse_moves || 0;
         dailyKeyPresses += s.key_presses || 0;
         dailyClicks += s.clicks || 0;
       }
+
+      // Idle time: the History Timeline's threshold-based idle for today (never the per-tick counters, which for
+      // sessions that began before the threshold rule still hold old no-input-tick seconds); counters only as a
+      // labelled fallback when events cannot be read
+      const liveIdle: LiveIdleResult =
+        liveIdleByUser.get(u.id) ?? { seconds: counterIdleSeconds, basis: 'heartbeat_counters', ongoing: false, incompleteIntervals: 0 };
+      const dailyIdleSeconds = liveIdle.seconds;
 
       if (isLive && activeSession) {
         loginTime = activeSession.login_time.toISOString();
@@ -1325,7 +1410,19 @@ export class TrackingService {
         key_presses: dailyKeyPresses,
         clicks: dailyClicks,
         productive_seconds: sessionProductiveSec,
+        /** Raw heartbeat counter of the displayed session (may include old no-input-tick seconds); see idle_basis */
         idle_seconds: sessionIdleSec,
+        /** Today's idle seconds behind idle_time (the History Timeline's idle_seconds for the same employee and day) */
+        idle_seconds_today: dailyIdleSeconds,
+        /** 'threshold_events' (same calculation as the History Timeline) or 'heartbeat_counters' (fallback) */
+        idle_basis: liveIdle.basis,
+        /** An idle period is open right now (counted up to now) */
+        idle_ongoing: liveIdle.ongoing,
+        /** Idle periods today whose end is unknown (not counted, as in the History Timeline) */
+        idle_incomplete_count: liveIdle.incompleteIntervals,
+        /** The reporting day this summary covers */
+        report_date: today.date,
+        report_time_zone: REPORTING_TIME_ZONE,
       };
 
       if (targetUserId && activeSession) {
@@ -1354,7 +1451,8 @@ export class TrackingService {
         for (const act of dayActivities) {
           const actMs = toMs(act.timestamp);
           if (actMs === null) continue;
-          const actHour = new Date(actMs).getHours();
+          // Hour of day in the reporting time zone (the chart covers today's reporting day)
+          const actHour = Number(zonedParts(new Date(actMs), REPORTING_TIME_ZONE).time.slice(0, 2));
           const category = this.classifyAppActivity(act.app_name, act.window_title || '');
           const durationMins = Math.max(0, Number(act.duration_seconds) || 0) / 60.0;
 
@@ -1405,10 +1503,27 @@ export class TrackingService {
     if (!employee) throw new NotFoundException('Employee not found');
 
     const { start, end } = zonedRange(query.from, query.to, query.tz);
+    const { sessionRows, events, truncated } = await this.loadTimelineRows(query.userId, start, end);
+
+    return buildTrackingTimeline({
+      sessions: sessionRows as any,
+      events: events as any,
+      query,
+      now,
+      employee,
+      truncated,
+    });
+  }
+
+  /**
+   * The rows behind a timeline (History Timeline and Live Tracking's idle time): desktop sessions overlapping
+   * [start, end) and their events, plus unattached events and nearby break events. Two bounded queries.
+   */
+  private async loadTimelineRows(userId: number, start: Date, end: Date) {
     // Overlapping the range: started before its end, and ended (or last heard from, when not closed) after its start
     const sessions = await this.prisma.workSession.findMany({
       where: {
-        user_id: query.userId,
+        user_id: userId,
         device_id: { not: BROWSER_DEVICE_ID },
         login_time: { lt: end },
         OR: [
@@ -1427,7 +1542,7 @@ export class TrackingService {
 
     const eventsFound = await this.prisma.trackingActivityLog.findMany({
       where: {
-        user_id: query.userId,
+        user_id: userId,
         activity_type: { in: [...CLIENT_EVENT_TYPES] as any },
         OR: [
           ...(sessionIds.length ? [{ session_id: { in: sessionIds } }] : []),
@@ -1444,14 +1559,201 @@ export class TrackingService {
     });
     if (eventsFound.length > TIMELINE_MAX_EVENTS) truncated = true;
 
-    return buildTrackingTimeline({
-      sessions: sessionRows as any,
-      events: eventsFound.slice(0, TIMELINE_MAX_EVENTS) as any,
-      query,
-      now,
-      employee,
-      truncated,
+    return { sessionRows, events: eventsFound.slice(0, TIMELINE_MAX_EVENTS), truncated };
+  }
+
+  /**
+   * The same rows as loadTimelineRows, for many employees at once: one session query and one event query in total
+   * (user_id IN ...), grouped by employee in memory. Each employee gets exactly what the single-employee query returns:
+   * the same filters, the same order, and the 500-session / 5,000-event caps (with `truncated`) applied per employee.
+   * If a combined result reaches its safety limit, the affected step is redone per employee so no cap can be applied
+   * across employees.
+   */
+  private async loadTimelineRowsForUsers(userIds: number[], start: Date, end: Date): Promise<Map<number, TimelineRowsForUser>> {
+    const out = new Map<number, TimelineRowsForUser>();
+    const ids = Array.from(new Set(userIds));
+    if (ids.length === 0) return out;
+
+    const sessionLimit = (TIMELINE_MAX_SESSIONS + 1) * ids.length;
+    const sessions = await this.prisma.workSession.findMany({
+      where: {
+        user_id: { in: ids },
+        device_id: { not: BROWSER_DEVICE_ID },
+        login_time: { lt: end },
+        OR: [
+          { logout_time: { gte: start } },
+          { logout_time: null, last_ping: { gte: start } },
+          { logout_time: null, is_active_session: true },
+        ],
+      },
+      select: { id: true, user_id: true, device_id: true, login_time: true, logout_time: true, last_ping: true, is_active_session: true, tracked_seconds: true },
+      orderBy: [{ login_time: 'asc' }, { id: 'asc' }],
+      take: sessionLimit,
     });
+    if (sessions.length >= sessionLimit) {
+      // Cannot tell which employee hit the cap: fall back to the exact single-employee queries
+      for (const id of ids) out.set(id, await this.loadTimelineRows(id, start, end));
+      return out;
+    }
+
+    const sessionsByUser = new Map<number, any[]>(ids.map((id) => [id, []]));
+    for (const s of sessions) sessionsByUser.get(s.user_id)?.push(s);
+    const sessionIdsByUser = new Map<number, Set<number>>();
+    const truncatedByUser = new Map<number, boolean>();
+    for (const id of ids) {
+      const list = sessionsByUser.get(id) ?? [];
+      truncatedByUser.set(id, list.length > TIMELINE_MAX_SESSIONS);
+      const capped = list.slice(0, TIMELINE_MAX_SESSIONS);
+      sessionsByUser.set(id, capped);
+      sessionIdsByUser.set(id, new Set(capped.map((s) => s.id)));
+    }
+    const allSessionIds = Array.from(sessionIdsByUser.values()).flatMap((set) => Array.from(set));
+
+    const breakFrom = new Date(start.getTime() - BREAK_STALE_MS);
+    const eventLimit = (TIMELINE_MAX_EVENTS + 1) * ids.length;
+    const eventsFound = await this.prisma.trackingActivityLog.findMany({
+      where: {
+        user_id: { in: ids },
+        activity_type: { in: [...CLIENT_EVENT_TYPES] as any },
+        OR: [
+          ...(allSessionIds.length ? [{ session_id: { in: allSessionIds } }] : []),
+          { session_id: null, occurred_at: { gte: start, lt: end } },
+          { activity_type: { in: ['break_start', 'break_end'] as any }, occurred_at: { gte: breakFrom, lt: end } },
+        ],
+      },
+      select: { id: true, user_id: true, session_id: true, activity_type: true, occurred_at: true, source: true, reason: true, device_id: true, ended_at: true },
+      orderBy: [{ occurred_at: 'asc' }, { id: 'asc' }],
+      take: eventLimit,
+    });
+    if (eventsFound.length >= eventLimit) {
+      for (const id of ids) out.set(id, await this.loadTimelineRows(id, start, end));
+      return out;
+    }
+
+    // Per employee, the single-employee query's conditions: its own sessions' events (never another employee's
+    // session), its unattached events in the range, and its break events in the break look-back window
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+    const breakFromMs = breakFrom.getTime();
+    const eventsByUser = new Map<number, any[]>(ids.map((id) => [id, []]));
+    for (const e of eventsFound) {
+      const own = sessionIdsByUser.get(e.user_id);
+      if (!own) continue;
+      const t = new Date(e.occurred_at).getTime();
+      const keep =
+        (e.session_id !== null && own.has(e.session_id))
+        || (e.session_id === null && t >= startMs && t < endMs)
+        || ((e.activity_type === 'break_start' || e.activity_type === 'break_end') && t >= breakFromMs && t < endMs);
+      if (keep) eventsByUser.get(e.user_id)!.push(e);
+    }
+
+    for (const id of ids) {
+      const list = eventsByUser.get(id) ?? [];
+      out.set(id, {
+        sessionRows: sessionsByUser.get(id) ?? [],
+        events: list.slice(0, TIMELINE_MAX_EVENTS),
+        truncated: (truncatedByUser.get(id) ?? false) || list.length > TIMELINE_MAX_EVENTS,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Threshold idle per desktop session for a report day (P1-c, threshold days): idle_start/idle_end periods from
+   * buildTrackingTimeline, per session, for sessions overlapping the day and the next one (a report attributes a whole
+   * session to its login day, so a session that runs past midnight keeps its later idle too). Two queries in total.
+   *
+   * Per employee: `available: false` when the employee's events were truncated (the idle total would be incomplete) or
+   * the timeline could not be built; returns null when the events could not be read at all (idle then unavailable).
+   */
+  private async loadThresholdSessionIdle(
+    userIds: number[],
+    date: string,
+    now: Date,
+  ): Promise<Map<number, { available: boolean; note: string | null; bySession: Map<number, number> }> | null> {
+    const out = new Map<number, { available: boolean; note: string | null; bySession: Map<number, number> }>();
+    if (userIds.length === 0) return out;
+    const nextDay = addDays(date, 1);
+    const { start, end } = zonedRange(date, nextDay, REPORTING_TIME_ZONE);
+    let rowsByUser: Map<number, TimelineRowsForUser>;
+    try {
+      rowsByUser = await this.loadTimelineRowsForUsers(userIds, start, end);
+    } catch (err) {
+      this.logger.warn(`Could not read tracking events for report idle on ${date}: ${(err as Error)?.message ?? err}`);
+      return null;
+    }
+    for (const userId of userIds) {
+      const rows = rowsByUser.get(userId);
+      if (!rows) continue;
+      if (rows.truncated) {
+        out.set(userId, { available: false, note: 'events_truncated', bySession: new Map() });
+        continue;
+      }
+      try {
+        const t = buildTrackingTimeline({
+          sessions: rows.sessionRows as any,
+          events: rows.events as any,
+          query: { userId, from: date, to: nextDay, tz: REPORTING_TIME_ZONE, eventTypes: null, page: 1, limit: TIMELINE_MAX_SESSIONS },
+          now,
+          employee: null,
+          truncated: false,
+        });
+        out.set(userId, { available: true, note: null, bySession: new Map(t.sessions.map((s) => [s.id, s.idle_seconds])) });
+      } catch (err) {
+        this.logger.warn(`Could not calculate report idle (user ${userId}, ${date}): ${(err as Error)?.message ?? err}`);
+        out.set(userId, { available: false, note: 'events_unavailable', bySession: new Map() });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Today's idle time for Live Tracking, for every given employee, in the reporting time zone: exactly the History
+   * Timeline's idle_seconds for the same employee and day (same rows and caps, same buildTrackingTimeline, same `now`).
+   * Closed idle periods count in full, an ongoing one (live session) up to `now`, and an incomplete one (its end unknown)
+   * not at all, as in the History Timeline. Two queries in total, whatever the number of employees.
+   *
+   * An employee missing from the result could not be calculated (the event queries failed, or that employee's
+   * timeline could not be built); the caller then falls back to that employee's heartbeat counters, labelled as such.
+   */
+  private async loadLiveIdleBatch(userIds: number[], today: { date: string; start: Date }, now: Date): Promise<Map<number, LiveIdleResult>> {
+    const out = new Map<number, LiveIdleResult>();
+    if (userIds.length === 0) return out;
+    const end = zonedRange(today.date, today.date, REPORTING_TIME_ZONE).end;
+
+    let rowsByUser: Map<number, TimelineRowsForUser>;
+    try {
+      rowsByUser = await this.loadTimelineRowsForUsers(userIds, today.start, end);
+    } catch (err) {
+      this.logger.warn(`Could not read tracking events for live idle time (${userIds.length} employees): ${(err as Error)?.message ?? err}`);
+      return out;
+    }
+
+    for (const userId of userIds) {
+      const rows = rowsByUser.get(userId);
+      if (!rows) continue;
+      try {
+        const t = buildTrackingTimeline({
+          sessions: rows.sessionRows as any,
+          events: rows.events as any,
+          // One page holding every session, so every idle interval is visible below (the summary never depends on paging)
+          query: { userId, from: today.date, to: today.date, tz: REPORTING_TIME_ZONE, eventTypes: null, page: 1, limit: TIMELINE_MAX_SESSIONS },
+          now,
+          employee: null,
+          truncated: rows.truncated,
+        });
+        const idleIntervals = [...t.sessions.flatMap((s) => s.intervals), ...t.unassigned_intervals].filter((iv) => iv.kind === 'idle');
+        out.set(userId, {
+          seconds: t.summary.idle_seconds,
+          basis: 'threshold_events',
+          ongoing: idleIntervals.some((iv) => iv.status === 'ongoing'),
+          incompleteIntervals: idleIntervals.filter((iv) => iv.status === 'incomplete').length,
+        });
+      } catch (err) {
+        this.logger.warn(`Could not calculate live idle time (user ${userId}): ${(err as Error)?.message ?? err}`);
+      }
+    }
+    return out;
   }
 
   async getUserSessions(user: any, filter?: 'today' | 'active') {
@@ -1509,7 +1811,7 @@ export class TrackingService {
     let coveredUntil: number | null = null;
     for (const iv of sessionIntervals) {
       if (coveredUntil !== null && iv.start > coveredUntil
-        && new Date(coveredUntil).toDateString() === new Date(iv.start).toDateString()) {
+        && sameReportingDay(coveredUntil, iv.start)) {
         const gap = Math.floor((iv.start - coveredUntil) / 1000);
         if (gap >= 60) {
           breaks.push({
@@ -1568,28 +1870,23 @@ export class TrackingService {
   }
 
   async getDailyReport(params: any) {
-    const toLocalDateStr = (d: Date | string) => {
-      const dt = new Date(d);
-      const year = dt.getFullYear();
-      const month = String(dt.getMonth() + 1).padStart(2, '0');
-      const day = String(dt.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    };
+    // Report days are Asia/Kolkata calendar days (REPORTING_TIME_ZONE), never the server's local days
+    const toLocalDateStr = (d: Date | string) => reportingDateOf(d);
 
-    let startDateStr = params?.start_date;
-    let endDateStr = params?.end_date;
+    let startDateStr = reportDateParam(params?.start_date, 'start_date');
+    let endDateStr = reportDateParam(params?.end_date, 'end_date');
 
     if (params?.date && !startDateStr && !endDateStr) {
-      startDateStr = params.date;
-      endDateStr = params.date;
+      startDateStr = reportDateParam(params.date, 'date');
+      endDateStr = startDateStr;
     }
 
-    const todayStr = toLocalDateStr(new Date());
+    const todayStr = reportingToday(new Date()).date;
     if (!startDateStr) startDateStr = todayStr;
     if (!endDateStr) endDateStr = startDateStr;
 
-    const startDate = new Date(startDateStr.includes('T') ? startDateStr : `${startDateStr}T00:00:00`);
-    const endDate = new Date(endDateStr.includes('T') ? endDateStr : `${endDateStr}T23:59:59.999`);
+    // [00:00 IST of the first day, 00:00 IST of the day after the last day)
+    const { start: startDate, end: endExclusive } = zonedRange(startDateStr, endDateStr, REPORTING_TIME_ZONE);
 
     const userWhere: any = {};
     if (params?.department_id) {
@@ -1624,7 +1921,7 @@ export class TrackingService {
     const sessions = await this.prisma.workSession.findMany({
       where: {
         user_id: { in: userIds },
-        login_time: { gte: startDate, lte: endDate },
+        login_time: { gte: startDate, lt: endExclusive },
       },
       orderBy: { login_time: 'asc' },
     });
@@ -1632,7 +1929,7 @@ export class TrackingService {
     const activities = await this.prisma.appActivity.findMany({
       where: {
         user_id: { in: userIds },
-        timestamp: { gte: startDate, lte: endDate },
+        timestamp: { gte: startDate, lt: endExclusive },
       },
       orderBy: { timestamp: 'asc' },
     });
@@ -1648,9 +1945,24 @@ export class TrackingService {
     const reportRows: any[] = [];
     const now = new Date();
 
-    const currDate = new Date(startDate);
-    while (currDate <= endDate) {
-      const dateIso = toLocalDateStr(currDate);
+    // Idle basis per day (P1-c): legacy counters before the threshold-idle effective date, unavailable on that day
+    // (mixed), threshold events after it. Unset effective date = every day legacy (the calculation is unchanged).
+    const effective = readIdleEffectiveDate();
+    if (effective.error) this.logger.error(`${effective.error}; reports use the legacy idle calculation for every day`);
+    // Conservative calculation boundary: 00:00 Asia/Kolkata on the effective date (a date, not the deployment instant)
+    const boundaryMs = effective.date ? zonedRange(effective.date, effective.date, REPORTING_TIME_ZONE).start.getTime() : null;
+
+    // One pass per Asia/Kolkata calendar day of the range (string dates: no server-time-zone arithmetic)
+    for (let dateIso = startDateStr; dateIso <= endDateStr; dateIso = addDays(dateIso, 1)) {
+      const idleBasis = reportIdleBasis(dateIso, effective.date);
+      // Threshold days: per-session event idle of the day's employees (two queries per day, whatever the employee count)
+      const thresholdIdle = idleBasis === 'threshold'
+        ? await this.loadThresholdSessionIdle(
+          users.map((u) => u.id).filter((id) => sessions.some((s) => s.user_id === id && toLocalDateStr(s.login_time) === dateIso)),
+          dateIso,
+          now,
+        )
+        : null;
 
       for (const u of users) {
         const daySessions = sessions.filter((s) => s.user_id === u.id && toLocalDateStr(s.login_time) === dateIso);
@@ -1702,17 +2014,41 @@ export class TrackingService {
         const offlineBreakSec = breakAnalysis.breaksList.filter((b) => b.type === 'offline').reduce((acc, b) => acc + b.duration, 0);
         const idleBreakSec = breakAnalysis.breaksList.filter((b) => b.type === 'idle').reduce((acc, b) => acc + b.duration, 0);
 
-        const reconciledIdleSec = idleSec;
+        // Idle of this employee and day by basis. null = unavailable (never zero): the mixed day, or a threshold day
+        // whose events could not be read completely
+        // A legacy day with a desktop session that started before the effective-date boundary and ran past it (or is
+        // still open) is mixed too: that session's counters may hold seconds of both rules
+        const rowBasis = rowIdleBasis(idleBasis, daySessions.filter((s) => !isBrowserSession(s)), boundaryMs);
+        let reconciledIdleSec: number | null = idleSec;
+        let idleNote: string | null = null;
+        if (rowBasis.basis === 'mixed') {
+          reconciledIdleSec = null;
+          idleNote = rowBasis.spansBoundary ? 'spans_effective_date' : 'mixed_calculation';
+        } else if (idleBasis === 'threshold') {
+          const perUser = thresholdIdle?.get(u.id);
+          if (!perUser || !perUser.available) {
+            reconciledIdleSec = null;
+            idleNote = perUser?.note ?? 'events_unavailable';
+          } else {
+            // Desktop sessions that started on this day (the report attributes a whole session to its login day)
+            reconciledIdleSec = daySessions.filter((s) => !isBrowserSession(s)).reduce((acc, s) => acc + (perUser.bySession.get(s.id) ?? 0), 0);
+          }
+        }
+        // productiveSec is the stored counter capped at the session's elapsed time, on every basis (the loop above)
+        const idleAvailable = reconciledIdleSec !== null;
         const reconciledBreakSec = offlineBreakSec + idleBreakSec;
 
         const spannedDuration = Math.max(0, Math.floor((new Date(lastActive).getTime() - new Date(firstLogin).getTime()) / 1000));
-        const desktopWorkSec = productiveSec + reconciledIdleSec;
-        const totalEngagementSec = desktopWorkSec + portalActiveSec;
+        // Everything derived from idle is unavailable with it (never computed from a zero idle)
+        const desktopWorkSec = idleAvailable ? productiveSec + (reconciledIdleSec as number) : null;
+        const totalEngagementSec = desktopWorkSec !== null ? desktopWorkSec + portalActiveSec : null;
 
-        const sumAccounted = productiveSec + reconciledIdleSec + portalActiveSec + reconciledBreakSec;
-        const unaccountedSec = Math.max(0, spannedDuration - sumAccounted);
+        const unaccountedSec = idleAvailable
+          ? Math.max(0, spannedDuration - (productiveSec + (reconciledIdleSec as number) + portalActiveSec + reconciledBreakSec))
+          : null;
 
-        const activityPct = desktopWorkSec > 0 ? Math.min(100.0, (productiveSec / desktopWorkSec) * 100.0) : 0.0;
+        const activityPct = desktopWorkSec === null ? null : desktopWorkSec > 0 ? Math.min(100.0, (productiveSec / desktopWorkSec) * 100.0) : 0.0;
+        const fmtOrNull = (sec: number | null) => (sec === null ? null : formatDurationSec(sec));
 
         const fullName = u.name || u.username;
         const empCode = `GS-26-${String(u.id).padStart(3, '0')}`;
@@ -1728,15 +2064,25 @@ export class TrackingService {
           department: deptName,
           date: dateIso,
           productive_time: formatDurationSec(productiveSec),
-          idle_time: formatDurationSec(reconciledIdleSec),
-          desktop_work_time: formatDurationSec(desktopWorkSec),
+          // null (not "00:00:00") when idle is unavailable; see idle_basis / idle_available
+          idle_time: fmtOrNull(reconciledIdleSec),
+          desktop_work_time: fmtOrNull(desktopWorkSec),
           portal_active_time: formatDurationSec(portalActiveSec),
           break_time: formatDurationSec(reconciledBreakSec),
-          unaccounted_time: formatDurationSec(unaccountedSec),
-          total_engagement_time: formatDurationSec(totalEngagementSec),
+          unaccounted_time: fmtOrNull(unaccountedSec),
+          total_engagement_time: fmtOrNull(totalEngagementSec),
           workday_span: formatDurationSec(spannedDuration),
-          activity_percentage: Number(activityPct.toFixed(2)),
+          activity_percentage: activityPct === null ? null : Number(activityPct.toFixed(2)),
           status,
+          /** 'legacy' (stored counters), 'mixed' (deployment day: idle unavailable) or 'threshold' (idle events) */
+          idle_basis: rowBasis.basis,
+          /** False when idle_time (and the values derived from it) is unavailable; a real zero idle is "00:00:00" */
+          idle_available: idleAvailable,
+          /**
+           * Why idle is unavailable: 'mixed_calculation' (the effective date), 'spans_effective_date' (a session of this
+           * login day ran across the effective-date boundary), 'events_unavailable' or 'events_truncated'; null otherwise
+           */
+          idle_unavailable_reason: idleNote,
 
           user_id: u.id,
           username: u.username,
@@ -1744,7 +2090,7 @@ export class TrackingService {
           email: u.email,
           first_login: firstLogin ? new Date(firstLogin).toISOString() : null,
           last_active: lastActive ? new Date(lastActive).toISOString() : null,
-          total_tracked_time: formatDurationSec(desktopWorkSec),
+          total_tracked_time: fmtOrNull(desktopWorkSec),
           break_count: breakAnalysis.breakCount,
 
           raw_tracked_seconds: desktopWorkSec,
@@ -1758,8 +2104,6 @@ export class TrackingService {
           raw_workday_span: spannedDuration,
         });
       }
-
-      currDate.setDate(currDate.getDate() + 1);
     }
 
     return reportRows;
@@ -1789,11 +2133,12 @@ export class TrackingService {
       };
     }
 
-    const totalTrackedSec = rows.reduce((acc: number, r: any) => acc + (r.raw_tracked_seconds || 0), 0);
-    const totalProductiveSec = rows.reduce((acc: number, r: any) => acc + (r.raw_productive_seconds || 0), 0);
-    const totalIdleSec = rows.reduce((acc: number, r: any) => acc + (r.raw_idle_seconds || 0), 0);
-
-    const avgActivity = totalTrackedSec > 0 ? (totalProductiveSec / totalTrackedSec) * 100.0 : 0.0;
+    // Idle and tracked totals are unavailable (null) when a day's idle is unavailable (mixed day), never summed as zero;
+    // the sum of the available days and the unavailable dates are returned alongside
+    const tracked = sumNullable(rows, 'raw_tracked_seconds');
+    const idle = sumNullable(rows, 'raw_idle_seconds');
+    const activity = this.knownActivity(rows);
+    const avgActivity = activity.percentage;
     const attendanceDays = new Set(rows.map((r: any) => `${r.user_id}_${r.date}`)).size;
 
     const dayProductivity: Record<string, number> = {};
@@ -1805,10 +2150,9 @@ export class TrackingService {
     const dates = Object.keys(dayProductivity);
     if (dates.length > 0) {
       const topDate = dates.reduce((a, b) => (dayProductivity[a] > dayProductivity[b] ? a : b));
-      const dObj = new Date(topDate);
-      const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      mostProductiveDay = `${dayNames[dObj.getDay()]} (${monthNames[dObj.getMonth()]} ${String(dObj.getDate()).padStart(2, '0')})`;
+      // Calendar date label without any server-time-zone conversion
+      const p = calendarDateParts(topDate);
+      mostProductiveDay = `${DAY_LONG[p.weekday]} (${MONTH_SHORT[p.month]} ${String(p.day).padStart(2, '0')})`;
     }
 
     const userIds = Array.from(new Set(rows.map((r: any) => r.user_id)));
@@ -1840,53 +2184,88 @@ export class TrackingService {
       .slice(0, 10);
 
     const dailyProductivityTrend: any[] = [];
-    const dateMap: Record<string, { prod: number; idle: number }> = {};
-    for (const r of rows) {
-      if (!dateMap[r.date]) dateMap[r.date] = { prod: 0, idle: 0 };
-      dateMap[r.date].prod += r.raw_productive_seconds;
-      dateMap[r.date].idle += r.raw_idle_seconds;
-    }
+    const dateMap: Record<string, any[]> = {};
+    for (const r of rows) (dateMap[r.date] ||= []).push(r);
 
     for (const dStr of Object.keys(dateMap).sort()) {
-      const dObj = new Date(dStr);
-      const dayShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dObj.getDay()];
-      const monthShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][dObj.getMonth()];
+      const p = calendarDateParts(dStr);
+      const dayIdle = sumNullable(dateMap[dStr], 'raw_idle_seconds');
       dailyProductivityTrend.push({
-        date: `${dayShort}, ${monthShort} ${String(dObj.getDate()).padStart(2, '0')}`,
-        productive_hours: Number((dateMap[dStr].prod / 3600.0).toFixed(2)),
-        idle_hours: Number((dateMap[dStr].idle / 3600.0).toFixed(2)),
+        date: `${DAY_SHORT[p.weekday]}, ${MONTH_SHORT[p.month]} ${String(p.day).padStart(2, '0')}`,
+        productive_hours: Number((dateMap[dStr].reduce((a, r) => a + r.raw_productive_seconds, 0) / 3600.0).toFixed(2)),
+        // null on a mixed day (unavailable, not zero)
+        idle_hours: dayIdle.total === null ? null : Number((dayIdle.total / 3600.0).toFixed(2)),
+        // 'mixed' when any row of the date is mixed (a legacy date can hold a session spanning the effective date)
+        idle_basis: dateMap[dStr].some((r) => r.idle_basis === 'mixed') ? 'mixed' : dateMap[dStr][0]?.idle_basis ?? 'legacy',
       });
     }
 
-    const userHoursMap: Record<string, number> = {};
-    for (const r of rows) {
-      userHoursMap[r.full_name] = (userHoursMap[r.full_name] || 0) + r.raw_tracked_seconds;
-    }
+    const userRowsMap: Record<string, any[]> = {};
+    for (const r of rows) (userRowsMap[r.full_name] ||= []).push(r);
 
-    const weeklyWorkHours = Object.keys(userHoursMap).map((name) => ({
-      employee: name,
-      hours: Number((userHoursMap[name] / 3600.0).toFixed(2)),
-    }));
+    const weeklyWorkHours = Object.keys(userRowsMap).map((name) => {
+      const t = sumNullable(userRowsMap[name], 'raw_tracked_seconds');
+      return {
+        employee: name,
+        // null when a day of this employee has unavailable (mixed) idle; hours_known_days sums the other days
+        hours: t.total === null ? null : Number((t.total / 3600.0).toFixed(2)),
+        hours_known_days: Number((t.known / 3600.0).toFixed(2)),
+      };
+    });
 
     return {
-      total_weekly_hours: formatDurationSec(totalTrackedSec),
+      total_weekly_hours: tracked.total === null ? null : formatDurationSec(tracked.total),
       average_activity_percentage: Number(Math.min(100.0, avgActivity).toFixed(2)),
       most_productive_day: mostProductiveDay,
-      total_idle_time: formatDurationSec(totalIdleSec),
+      total_idle_time: idle.total === null ? null : formatDurationSec(idle.total),
       attendance_days: attendanceDays,
       app_usage_summary: appUsageSummary,
       daily_productivity_trend: dailyProductivityTrend,
       weekly_work_hours: weeklyWorkHours,
+      ...this.idleAggregateFields(rows, { tracked, idle, activity }, formatDurationSec),
+    };
+  }
+
+  /** Activity % over the report rows whose idle (and so tracked time) is available; unavailable days are excluded. */
+  private knownActivity(rows: any[]): { percentage: number; excludedDates: string[] } {
+    const known = rows.filter((r) => r.raw_tracked_seconds !== null && r.raw_tracked_seconds !== undefined);
+    const trackedSec = known.reduce((a, r) => a + (r.raw_tracked_seconds || 0), 0);
+    const productiveSec = known.reduce((a, r) => a + (r.raw_productive_seconds || 0), 0);
+    const excludedDates = Array.from(new Set(rows.filter((r) => !known.includes(r)).map((r) => String(r.date)))).sort();
+    return { percentage: trackedSec > 0 ? (productiveSec / trackedSec) * 100.0 : 0.0, excludedDates };
+  }
+
+  /**
+   * Fields every aggregated report adds so a mixed (unavailable) day is never hidden: the bases of the included days,
+   * the dates whose idle is unavailable, the sums over the available days, and the configured effective date.
+   */
+  private idleAggregateFields(
+    rows: any[],
+    totals: { tracked: NullableTotal; idle: NullableTotal; activity: { excludedDates: string[] } },
+    fmt: (sec: number) => string,
+  ) {
+    return {
+      /** 'legacy' | 'mixed' | 'threshold' bases of the days in this report */
+      idle_bases: idleBasesOf(rows),
+      /** Dates whose idle time is unavailable (mixed calculation); totals that include them are null */
+      idle_unavailable_dates: Array.from(new Set([...totals.idle.unavailableDates, ...totals.tracked.unavailableDates])).sort(),
+      /** Idle and tracked time of the days whose idle is available */
+      total_idle_time_known_days: fmt(totals.idle.known),
+      total_tracked_time_known_days: fmt(totals.tracked.known),
+      /** Dates left out of the activity percentage (their tracked time is unavailable) */
+      activity_excludes_dates: totals.activity.excludedDates,
+      idle_effective_date: readIdleEffectiveDate().date,
     };
   }
 
   async getMonthlyReport(params: any) {
-    const now = new Date();
-    const year = Number(params?.year || now.getFullYear());
-    const month = Number(params?.month || now.getMonth() + 1);
+    // Default month: the current month in the reporting time zone
+    const [currentYear, currentMonth] = reportingToday(new Date()).date.split('-').map(Number);
+    const year = Number(params?.year || currentYear);
+    const month = Number(params?.month || currentMonth);
 
     const startDateStr = `${year}-${String(month).padStart(2, '0')}-01`;
-    const lastDay = new Date(year, month, 0).getDate();
+    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
     const endDateStr = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
 
     const rows = await this.getDailyReport({ ...params, start_date: startDateStr, end_date: endDateStr });
@@ -1915,66 +2294,60 @@ export class TrackingService {
       };
     }
 
-    const totalTrackedSec = rows.reduce((acc: number, r: any) => acc + (r.raw_tracked_seconds || 0), 0);
+    // Unavailable (mixed-day) idle makes the idle and tracked totals null, never zero
+    const tracked = sumNullable(rows, 'raw_tracked_seconds');
     const totalProductiveSec = rows.reduce((acc: number, r: any) => acc + (r.raw_productive_seconds || 0), 0);
-    const totalIdleSec = rows.reduce((acc: number, r: any) => acc + (r.raw_idle_seconds || 0), 0);
+    const idle = sumNullable(rows, 'raw_idle_seconds');
 
     const uniqueDays = new Set(rows.map((r: any) => r.date)).size;
     const uniqueEmployees = new Set(rows.map((r: any) => r.user_id)).size;
 
-    const empStats: Record<number, any> = {};
-    for (const r of rows) {
-      const uid = r.user_id;
-      if (!empStats[uid]) {
-        empStats[uid] = {
-          user_id: uid,
-          full_name: r.full_name,
-          employee_code: r.employee_code,
-          department: r.department,
-          productive_sec: 0,
-          idle_sec: 0,
-          tracked_sec: 0,
-        };
-      }
-      empStats[uid].productive_sec += r.raw_productive_seconds;
-      empStats[uid].idle_sec += r.raw_idle_seconds;
-      empStats[uid].tracked_sec += r.raw_tracked_seconds;
-    }
+    const empRows: Record<number, any[]> = {};
+    for (const r of rows) (empRows[r.user_id] ||= []).push(r);
 
-    const employeeRanking = Object.values(empStats)
-      .map((stats: any) => {
-        const pct = stats.tracked_sec > 0 ? (stats.productive_sec / stats.tracked_sec) * 100.0 : 0.0;
+    const employeeRanking = Object.values(empRows)
+      .map((list: any[]) => {
+        const first = list[0];
+        const productiveSec = list.reduce((a, r) => a + r.raw_productive_seconds, 0);
+        const empTracked = sumNullable(list, 'raw_tracked_seconds');
+        const empActivity = this.knownActivity(list);
         return {
-          user_id: stats.user_id,
-          full_name: stats.full_name,
-          employee_code: stats.employee_code,
-          department: stats.department,
-          productive_hours: Number((stats.productive_sec / 3600.0).toFixed(2)),
-          tracked_hours: Number((stats.tracked_sec / 3600.0).toFixed(2)),
-          activity_percentage: Number(Math.min(100.0, pct).toFixed(2)),
+          user_id: first.user_id,
+          full_name: first.full_name,
+          employee_code: first.employee_code,
+          department: first.department,
+          productive_hours: Number((productiveSec / 3600.0).toFixed(2)),
+          // null when one of the employee's days has unavailable (mixed) idle; known-days hours alongside
+          tracked_hours: empTracked.total === null ? null : Number((empTracked.total / 3600.0).toFixed(2)),
+          tracked_hours_known_days: Number((empTracked.known / 3600.0).toFixed(2)),
+          // over the employee's days with available idle only
+          activity_percentage: Number(Math.min(100.0, empActivity.percentage).toFixed(2)),
+          activity_excludes_dates: empActivity.excludedDates,
         };
       })
       .sort((a: any, b: any) => b.productive_hours - a.productive_hours);
 
-    const trendsGrouped: Record<string, { date: string; productive_hours: number; idle_hours: number }> = {};
-    for (const r of rows) {
-      if (!trendsGrouped[r.date]) {
-        const dObj = new Date(r.date);
-        const monthShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][dObj.getMonth()];
-        trendsGrouped[r.date] = {
-          date: `${monthShort} ${String(dObj.getDate()).padStart(2, '0')}`,
-          productive_hours: 0,
-          idle_hours: 0,
-        };
-      }
-      trendsGrouped[r.date].productive_hours += Number((r.raw_productive_seconds / 3600.0).toFixed(2));
-      trendsGrouped[r.date].idle_hours += Number((r.raw_idle_seconds / 3600.0).toFixed(2));
-    }
+    const dateRows: Record<string, any[]> = {};
+    for (const r of rows) (dateRows[r.date] ||= []).push(r);
+    const productivityTrends = Object.keys(dateRows).map((d) => {
+      const p = calendarDateParts(d);
+      const list = dateRows[d];
+      return {
+        date: `${MONTH_SHORT[p.month]} ${String(p.day).padStart(2, '0')}`,
+        productive_hours: list.reduce((a, r) => a + Number((r.raw_productive_seconds / 3600.0).toFixed(2)), 0),
+        // null on a mixed day (unavailable, not zero)
+        idle_hours: list.some((r) => r.raw_idle_seconds === null || r.raw_idle_seconds === undefined)
+          ? null
+          : list.reduce((a, r) => a + Number((r.raw_idle_seconds / 3600.0).toFixed(2)), 0),
+        idle_basis: list.some((r) => r.idle_basis === 'mixed') ? 'mixed' : list[0]?.idle_basis ?? 'legacy',
+      };
+    });
 
     return {
-      total_monthly_work_hours: formatDurationSec(totalTrackedSec),
+      total_monthly_work_hours: tracked.total === null ? null : formatDurationSec(tracked.total),
       total_productive_hours: formatDurationSec(totalProductiveSec),
-      total_idle_hours: formatDurationSec(totalIdleSec),
+      total_idle_hours: idle.total === null ? null : formatDurationSec(idle.total),
+      ...this.idleAggregateFields(rows, { tracked, idle, activity: this.knownActivity(rows) }, formatDurationSec),
       attendance_summary: {
         total_sessions: rows.length,
         avg_sessions_per_day: Number((rows.length / Math.max(1, uniqueDays)).toFixed(1)),
@@ -1982,7 +2355,7 @@ export class TrackingService {
         active_employees_count: uniqueEmployees,
       },
       employee_ranking: employeeRanking,
-      productivity_trends: Object.values(trendsGrouped),
+      productivity_trends: productivityTrends,
     };
   }
 
@@ -1996,15 +2369,11 @@ export class TrackingService {
     });
     if (!user) throw new NotFoundException('User not found');
 
-    const todayStr = new Date().toISOString().split('T')[0];
-    const endDateStr = params?.end_date || todayStr;
-    const endDateObj = new Date(endDateStr);
-    endDateObj.setHours(23, 59, 59, 999);
-
-    const startDateObj = params?.start_date ? new Date(params.start_date) : new Date(endDateObj.getTime() - 6 * 86400000);
-    startDateObj.setHours(0, 0, 0, 0);
-
-    const startDateStr = startDateObj.toISOString().split('T')[0];
+    // Asia/Kolkata calendar days: end defaults to today, start to six days before the end (seven days in total)
+    const todayStr = reportingToday(new Date()).date;
+    const endDateStr = reportDateParam(params?.end_date, 'end_date') ?? todayStr;
+    const startDateStr = reportDateParam(params?.start_date, 'start_date') ?? addDays(endDateStr, -6);
+    const { start: startDateObj, end: endExclusive } = zonedRange(startDateStr, endDateStr, REPORTING_TIME_ZONE);
 
     const rows = await this.getDailyReport({ user_id: userId, start_date: startDateStr, end_date: endDateStr });
     const userRows = rows.filter((r: any) => r.user_id === userId);
@@ -2012,7 +2381,7 @@ export class TrackingService {
     const activities = await this.prisma.appActivity.findMany({
       where: {
         user_id: userId,
-        timestamp: { gte: startDateObj, lte: endDateObj },
+        timestamp: { gte: startDateObj, lt: endExclusive },
       },
       orderBy: { timestamp: 'desc' },
     });
@@ -2020,7 +2389,7 @@ export class TrackingService {
     const sessions = await this.prisma.workSession.findMany({
       where: {
         user_id: userId,
-        login_time: { gte: startDateObj, lte: endDateObj },
+        login_time: { gte: startDateObj, lt: endExclusive },
       },
       orderBy: { login_time: 'asc' },
     });
@@ -2079,15 +2448,18 @@ export class TrackingService {
     }));
 
     const totalProd = userRows.reduce((acc: number, r: any) => acc + r.raw_productive_seconds, 0);
-    const totalIdle = userRows.reduce((acc: number, r: any) => acc + r.raw_idle_seconds, 0);
-    const totalTracked = userRows.reduce((acc: number, r: any) => acc + r.raw_tracked_seconds, 0);
+    // Idle-derived totals are null when a day's idle is unavailable (mixed day), never summed as zero
+    const idle = sumNullable(userRows, 'raw_idle_seconds');
+    const tracked = sumNullable(userRows, 'raw_tracked_seconds');
+    const unaccounted = sumNullable(userRows, 'raw_unaccounted_seconds');
+    const engagement = sumNullable(userRows, 'raw_total_engagement_seconds');
     const totalPortal = userRows.reduce((acc: number, r: any) => acc + r.raw_portal_active_seconds, 0);
     const totalBreak = userRows.reduce((acc: number, r: any) => acc + r.raw_break_seconds, 0);
-    const totalUnaccounted = userRows.reduce((acc: number, r: any) => acc + r.raw_unaccounted_seconds, 0);
-    const totalEngagement = userRows.reduce((acc: number, r: any) => acc + r.raw_total_engagement_seconds, 0);
     const totalBreakCount = userRows.reduce((acc: number, r: any) => acc + r.break_count, 0);
 
-    const avgActPct = totalTracked > 0 ? (totalProd / totalTracked) * 100.0 : 0.0;
+    const activity = this.knownActivity(userRows);
+    const avgActPct = activity.percentage;
+    const fmtTotal = (t: NullableTotal) => (t.total === null ? null : formatDurationSec(t.total));
     const fullName = user.name || user.username;
     const empCode = `GS-26-${String(user.id).padStart(3, '0')}`;
 
@@ -2101,17 +2473,19 @@ export class TrackingService {
         department: user.department?.name || 'General',
       },
       totals: {
-        total_tracked_time: formatDurationSec(totalTracked),
+        total_tracked_time: fmtTotal(tracked),
         productive_time: formatDurationSec(totalProd),
-        idle_time: formatDurationSec(totalIdle),
-        desktop_work_time: formatDurationSec(totalTracked),
+        idle_time: fmtTotal(idle),
+        desktop_work_time: fmtTotal(tracked),
         portal_active_time: formatDurationSec(totalPortal),
         break_time: formatDurationSec(totalBreak),
-        unaccounted_time: formatDurationSec(totalUnaccounted),
-        total_engagement_time: formatDurationSec(totalEngagement),
+        unaccounted_time: fmtTotal(unaccounted),
+        total_engagement_time: fmtTotal(engagement),
+        // over the days with available idle (see activity_excludes_dates)
         activity_percentage: Number(Math.min(100.0, avgActPct).toFixed(2)),
         break_count: totalBreakCount,
         total_break_time: formatDurationSec(totalBreak),
+        ...this.idleAggregateFields(userRows, { tracked, idle, activity }, formatDurationSec),
       },
       daily_breakdown: userRows,
       app_usage: formattedApps,
@@ -2124,29 +2498,49 @@ export class TrackingService {
     const reportType = String(query?.type || 'daily').toLowerCase();
 
     let data: any[] = [];
-    let filename = `report_${new Date().toISOString().split('T')[0]}`;
+    // Default dates: today in the reporting time zone (the same day getDailyReport uses when no date is given)
+    const reportToday = reportingToday(new Date());
+    let filename = `report_${reportToday.date}`;
 
     if (reportType === 'daily') {
       data = await this.getDailyReport(query);
-      filename = `daily_report_${query?.start_date || new Date().toISOString().split('T')[0]}`;
+      filename = `daily_report_${query?.start_date || query?.date || reportToday.date}`;
     } else if (reportType === 'weekly') {
       const weekly = await this.getWeeklyReport(query);
       data = (weekly.daily_productivity_trend || []).map((trend: any) => ({
         Date: trend.date,
         'Productive Hours': trend.productive_hours,
         'Idle Hours': trend.idle_hours,
-        'Total Tracked': Number((trend.productive_hours + trend.idle_hours).toFixed(2)),
+        // unavailable (null) on a mixed day, never productive + 0
+        'Total Tracked': trend.idle_hours === null ? null : Number((trend.productive_hours + trend.idle_hours).toFixed(2)),
       }));
       filename = `weekly_report_${query?.start_date || 'week'}`;
     } else if (reportType === 'monthly') {
       const monthly = await this.getMonthlyReport(query);
-      data = monthly.employee_ranking || [];
-      filename = `monthly_ranking_${query?.year || new Date().getFullYear()}_${query?.month || new Date().getMonth() + 1}`;
+      // The export keeps its original columns (the ranking's known-days helper fields are not exported)
+      data = (monthly.employee_ranking || []).map((r: any) => ({
+        user_id: r.user_id,
+        full_name: r.full_name,
+        employee_code: r.employee_code,
+        department: r.department,
+        productive_hours: r.productive_hours,
+        tracked_hours: r.tracked_hours,
+        activity_percentage: r.activity_percentage,
+      }));
+      filename = `monthly_ranking_${query?.year || Number(reportToday.date.slice(0, 4))}_${query?.month || Number(reportToday.date.slice(5, 7))}`;
     } else if (reportType === 'employee') {
       const employee = await this.getEmployeeAnalytics(query);
       data = employee.daily_breakdown || [];
       filename = `employee_report_${employee.employee?.username || 'analytics'}`;
     }
+
+    // An unavailable (mixed-day) idle value or a value derived from it is exported as the explicit label, never as
+    // '-', blank or zero; every other value is exported exactly as the report returns it
+    data = data.map((row: any) => {
+      const out: any = {};
+      for (const [k, v] of Object.entries(row)) out[k] = exportValue(v, IDLE_DERIVED_EXPORT_KEYS.has(k));
+      return out;
+    });
 
     if (exportFormat === 'csv') {
       const headers = [
@@ -2184,7 +2578,9 @@ export class TrackingService {
         'Content-Type': 'text/csv',
         'Content-Disposition': `attachment; filename="${filename}.csv"`,
       });
-      return res.send(csvStr);
+      // UTF-8 byte order mark (EF BB BF): spreadsheet programs then decode names and labels such as
+      // "Mixed calculation – unavailable" as UTF-8 instead of the system code page. Headers, columns and values unchanged.
+      return res.send(CSV_UTF8_BOM + csvStr);
     } else if (exportFormat === 'excel') {
       const ExcelJS = require('exceljs');
       const wb = new ExcelJS.Workbook();
@@ -2297,7 +2693,7 @@ export class TrackingService {
           });
           doc.on('error', (err: any) => reject(err));
 
-          const startDateStr = String(query?.start_date || query?.date || new Date().toISOString().split('T')[0]);
+          const startDateStr = String(query?.start_date || query?.date || reportToday.date);
           const endDateStr = String(query?.end_date || query?.date || startDateStr);
 
           this.generateReportPdf(doc, reportType, startDateStr, endDateStr, data, fonts);
@@ -2320,6 +2716,8 @@ export class TrackingService {
     const marginY = 30;
     const printableWidth = 841.89 - marginX * 2; // 781.89
     const maxY = 595.28 - marginY; // 565.28
+    // Set when a cell holds a mixed-day (unavailable) value: a legend is printed under the table
+    let hasUnavailable = false;
 
     const titleReportName = reportType.charAt(0).toUpperCase() + reportType.slice(1);
     doc.fillColor('#1E293B')
@@ -2448,7 +2846,11 @@ export class TrackingService {
            .stroke('#E2E8F0');
 
         let val = row[col.key];
-        if (val === undefined || val === null || val === '') {
+        if (val === IDLE_UNAVAILABLE_LABEL) {
+          // Narrow cell: short marker; the full "Mixed calculation – unavailable" legend is printed under the table
+          val = PDF_UNAVAILABLE_MARK;
+          hasUnavailable = true;
+        } else if (val === undefined || val === null || val === '') {
           val = '-';
         } else {
           val = String(val);
@@ -2478,6 +2880,16 @@ export class TrackingService {
       }
 
       currentY += rowHeight;
+    }
+
+    if (hasUnavailable) {
+      if (currentY + 30 > maxY) {
+        doc.addPage();
+        currentY = marginY;
+      }
+      doc.fillColor('#475569').font(fontRegular).fontSize(8)
+         .text(`${PDF_UNAVAILABLE_MARK}: ${IDLE_UNAVAILABLE_LABEL}. Idle time on the threshold-idle deployment day cannot be separated from the earlier calculation, so idle time and the values derived from it are not shown for that day.`,
+           marginX, currentY + 8, { width: printableWidth });
     }
   }
 
