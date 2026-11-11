@@ -34,14 +34,24 @@ export class TrackingController {
     return this.trackingService.handleHeartbeat(req.user.id, body);
   }
 
+  // State-transition events from the employee's own desktop tracker (self-service like the heartbeat:
+  // no permission needed, the employee is always the authenticated user). 200 with per-event results.
+  @Post('events')
+  @HttpCode(HttpStatus.OK)
+  async events(@Request() req: any, @Body() body: any) {
+    return this.trackingService.handleTrackingEvents(req.user.id, body);
+  }
+
   @Post('activity-batch-sync')
   async activityBatchSync(@Request() req: any, @Body() body: any) {
     return this.trackingService.handleActivityBatchSync(req.user.id, body);
   }
 
+  // Ends only the session of the calling device (body.device_id; the web portal sends 'default').
+  // Without a device_id nothing is ended — see TrackingService.handleLogout.
   @Post('logout')
-  async logout(@Request() req: any) {
-    return this.trackingService.handleLogout(req.user.id);
+  async logout(@Request() req: any, @Body() body: any) {
+    return this.trackingService.handleLogout(req.user.id, body);
   }
 
   @Get('user-status')
@@ -103,6 +113,14 @@ export class TrackingController {
   @Permissions('MANAGE_SETTINGS')
   async getEmployeeAnalytics(@Query() query: any) {
     return this.trackingService.getEmployeeAnalytics(query);
+  }
+
+  // Historical timeline of one employee (sessions, idle/lock/sleep/offline events and durations).
+  // Same access as the other tracking reports: MANAGE_SETTINGS (or super admin); read-only.
+  @Get('reports/timeline')
+  @Permissions('MANAGE_SETTINGS')
+  async getTrackingTimeline(@Query() query: any) {
+    return this.trackingService.getTrackingTimeline(query);
   }
 
   @Get('reports/export')

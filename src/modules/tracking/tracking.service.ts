@@ -1,11 +1,380 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../../core/prisma.service';
+import {
+  ClientEventType,
+  EVENT_SOURCES,
+  EventRejection,
+  MAX_DEVICE_ID_LENGTH,
+  MAX_EVENTS_PER_BATCH,
+  SERVER_EVENT_ID_PREFIX,
+  validateClientEvent,
+} from './tracking-events';
+import { CLIENT_EVENT_TYPES } from './tracking-events';
+import {
+  BREAK_STALE_MS,
+  OpenBreak,
+  TIMELINE_MAX_EVENTS,
+  TIMELINE_MAX_SESSIONS,
+  buildTrackingTimeline,
+  parseTimelineQuery,
+  resolveOpenBreaks,
+  zonedRange,
+} from './tracking-timeline';
+
+/**
+ * device_id of web-portal (browser) sessions: the portal heartbeat sends no device_id, so it falls back to
+ * this value. Every other device_id is a desktop tracker (the tracker always sends its machine name).
+ */
+export const BROWSER_DEVICE_ID = 'default';
+
+/** A session with no heartbeat for this long is treated as ended. */
+const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
+/** A desktop tracker that has not pinged for this long is shown as Offline. */
+const LIVE_WINDOW_SECONDS = 300;
+/** A desktop tracker that has not pinged for this long (but is still within the live window) is shown as Idle. */
+const STALE_PING_IDLE_SECONDS = 120;
+
+export const isBrowserSession = (session: { device_id?: string | null } | null | undefined): boolean =>
+  (session?.device_id ?? BROWSER_DEVICE_ID) === BROWSER_DEVICE_ID;
+
+/** Milliseconds for a Date/string, or null when it is missing or not a valid date. */
+const toMs = (value: Date | string | null | undefined): number | null => {
+  if (value === null || value === undefined) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+};
+
+type Interval = { start: number; end: number };
+
+/** Sorted, non-overlapping union of the given intervals. */
+const mergeIntervals = (intervals: Interval[]): Interval[] => {
+  const sorted = intervals.filter((i) => i.end > i.start).sort((a, b) => a.start - b.start);
+  const merged: Interval[] = [];
+  for (const iv of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && iv.start <= last.end) last.end = Math.max(last.end, iv.end);
+    else merged.push({ ...iv });
+  }
+  return merged;
+};
+
+/** Total seconds of `intervals` (merged) that are not covered by `cover` (merged). */
+const uncoveredSeconds = (intervals: Interval[], cover: Interval[]): number => {
+  const base = mergeIntervals(intervals);
+  const covering = mergeIntervals(cover);
+  let total = 0;
+  for (const iv of base) {
+    let covered = 0;
+    for (const c of covering) {
+      const overlap = Math.min(iv.end, c.end) - Math.max(iv.start, c.start);
+      if (overlap > 0) covered += overlap;
+    }
+    total += iv.end - iv.start - covered;
+  }
+  return Math.max(0, Math.floor(total / 1000));
+};
+
+/**
+ * Idempotency keys of server-generated events. Deterministic, so a retried heartbeat or a repeated
+ * inference cannot store the same event twice (unique per user + client_event_id).
+ */
+export const serverEventId = {
+  sessionStart: (sessionId: number) => `${SERVER_EVENT_ID_PREFIX}session_start:${sessionId}`,
+  sessionEnd: (sessionId: number) => `${SERVER_EVENT_ID_PREFIX}session_end:${sessionId}`,
+  /** Offline gap that followed `sessionId` (keyed by the session before the gap) */
+  offlineStart: (sessionId: number) => `${SERVER_EVENT_ID_PREFIX}offline_start:${sessionId}`,
+  offlineEnd: (sessionId: number) => `${SERVER_EVENT_ID_PREFIX}offline_end:${sessionId}`,
+  heartbeatIdle: (sessionId: number, type: 'idle_start' | 'idle_end', detectedAt: Date) =>
+    `${SERVER_EVENT_ID_PREFIX}hb:${sessionId}:${type}:${detectedAt.getTime()}`,
+};
+
+type ServerEventInput = {
+  userId: number;
+  sessionId: number | null;
+  deviceId: string;
+  type: ClientEventType;
+  occurredAt: Date;
+  source: typeof EVENT_SOURCES.serverHeartbeat | typeof EVENT_SOURCES.serverInferred;
+  reason: string;
+  clientEventId: string;
+  endedAt?: Date | null;
+  metadata?: Record<string, unknown> | null;
+};
+
+const isUniqueViolation = (err: any) => err?.code === 'P2002';
+
+/** A late offline batch may extend a session (or pull its start back) by at most this much, same local day only. */
+const MAX_LATE_ATTACH_MS = 12 * 3600 * 1000;
+
+export type LiveStatus = {
+  /** 'On Break' / 'Stopped' are only produced when the caller asks for them (see resolveLiveStatus options) */
+  status: 'Active' | 'Idle' | 'Offline' | 'On Break' | 'Stopped';
+  source: 'desktop' | 'portal' | null;
+  session: any | null;
+  /** When the manual break that makes the status 'On Break' started */
+  break_started_at?: Date | null;
+};
+
+export type LiveStatusOptions = {
+  /** The employee's open manual break (see resolveOpenBreaks); makes the status 'On Break' unless work has resumed */
+  openBreak?: OpenBreak | null;
+  /** Report a desktop tracker that was stopped on purpose (latest session closed, none open) as 'Stopped', not 'Offline' */
+  distinguishStopped?: boolean;
+};
 
 @Injectable()
 export class TrackingService {
+  private readonly logger = new Logger(TrackingService.name);
+
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Stores one server-generated tracking event. Never throws: event storage must not break heartbeats,
+   * logout or activity sync (for example on a database the Phase 2 migration has not reached yet).
+   */
+  private async recordServerEvent(e: ServerEventInput): Promise<'created' | 'duplicate' | 'failed'> {
+    const endedAt = e.endedAt ?? null;
+    try {
+      await this.prisma.trackingActivityLog.create({
+        data: {
+          user_id: e.userId,
+          session_id: e.sessionId,
+          activity_type: e.type,
+          occurred_at: e.occurredAt,
+          client_event_id: e.clientEventId,
+          source: e.source,
+          reason: e.reason,
+          device_id: e.deviceId,
+          ended_at: endedAt,
+          duration_seconds: endedAt ? Math.max(0, Math.round((endedAt.getTime() - e.occurredAt.getTime()) / 1000)) : null,
+          metadata: (e.metadata ?? undefined) as any,
+        },
+      });
+      return 'created';
+    } catch (err) {
+      if (isUniqueViolation(err)) return 'duplicate';
+      this.logger.warn(`Could not store tracking event ${e.clientEventId}: ${(err as Error)?.message ?? err}`);
+      return 'failed';
+    }
+  }
+
+  /**
+   * Moves a server-inferred event to a corrected time (used when a late offline batch shows a session
+   * lasted longer, or started earlier, than the server first inferred). Never throws.
+   */
+  private async reviseServerEvent(userId: number, clientEventId: string, occurredAt: Date, revisedBy: string): Promise<void> {
+    try {
+      const existing = await this.prisma.trackingActivityLog.findFirst({
+        where: { user_id: userId, client_event_id: clientEventId, source: EVENT_SOURCES.serverInferred },
+      });
+      if (!existing || new Date(existing.occurred_at).getTime() === occurredAt.getTime()) return;
+      const previous = (existing.metadata && typeof existing.metadata === 'object' ? existing.metadata : {}) as Record<string, unknown>;
+      await this.prisma.trackingActivityLog.update({
+        where: { id: existing.id },
+        data: {
+          occurred_at: occurredAt,
+          metadata: { ...previous, revised_by: revisedBy, originally_inferred_at: new Date(existing.occurred_at).toISOString() } as any,
+        },
+      });
+    } catch (err) {
+      this.logger.warn(`Could not revise tracking event ${clientEventId}: ${(err as Error)?.message ?? err}`);
+    }
+  }
+
+  /**
+   * Heartbeat fallback for trackers that do not send events: records idle_start / idle_end when the
+   * desktop's is_idle flag differs from the session's stored state.
+   *
+   * occurred_at is the DETECTION time (this heartbeat's timestamp), not the moment of the change. The
+   * tracker reports idle only after its inactivity threshold (5 minutes by default), so the employee's
+   * last input was roughly that long before idle_start, and the change itself happened somewhere between
+   * the previous heartbeat and this one. Neither moment is known to the server; metadata says so.
+   */
+  private async recordHeartbeatIdleTransition(
+    userId: number,
+    sessionId: number,
+    deviceId: string,
+    previousIdle: boolean | null,
+    isIdle: boolean,
+    detectedAt: Date,
+    previousHeartbeatAt: Date | null,
+  ): Promise<void> {
+    let type: 'idle_start' | 'idle_end' | null = null;
+    let reason = 'heartbeat_state_change';
+    if (previousIdle === null) {
+      if (isIdle) {
+        type = 'idle_start';
+        reason = 'idle_at_session_start';
+      }
+    } else if (previousIdle !== isIdle) {
+      type = isIdle ? 'idle_start' : 'idle_end';
+    }
+    if (!type) return;
+
+    await this.recordServerEvent({
+      userId,
+      sessionId,
+      deviceId,
+      type,
+      occurredAt: detectedAt,
+      source: EVENT_SOURCES.serverHeartbeat,
+      reason,
+      clientEventId: serverEventId.heartbeatIdle(sessionId, type, detectedAt),
+      metadata: {
+        precision: 'heartbeat',
+        occurred_at_is: 'detection time (heartbeat timestamp), not the exact moment of the change',
+        changed_after: previousHeartbeatAt ? previousHeartbeatAt.toISOString() : null,
+        changed_by: detectedAt.toISOString(),
+        ...(type === 'idle_start'
+          ? { note: 'The tracker reports idle only after its inactivity threshold; the last keyboard/mouse input was earlier and is not known' }
+          : {}),
+      },
+    });
+  }
+
+  // -------------------------------------------------------------
+  // TRACKING EVENTS (POST /tracking/events)
+  // -------------------------------------------------------------
+  /**
+   * Stores a batch of state-transition events from the authenticated employee's desktop tracker.
+   *
+   * - The user is always the authenticated employee (never taken from the body).
+   * - device_id is required and must be a desktop device (not the portal's BROWSER_DEVICE_ID).
+   * - An event may name a session_id only if that session belongs to this employee AND this device;
+   *   otherwise the event is rejected. Without session_id the session covering occurred_at on this
+   *   device is used (or none).
+   * - occurred_at is stored exactly as sent (UTC); the receive time goes to `timestamp`.
+   * - Idempotent: (user, client_event_id) is unique. A repeat is reported as duplicate, never stored twice.
+   * - Partial success: each event gets its own accepted / duplicate / rejected result.
+   */
+  async handleTrackingEvents(userId: number, body: any = {}) {
+    const profile = await this.getOrCreateProfile(userId);
+    if (!profile.is_tracking_enabled) {
+      throw new ForbiddenException('Tracking is disabled for user');
+    }
+
+    const deviceId = typeof body?.device_id === 'string' ? body.device_id.trim() : '';
+    if (!deviceId) throw new BadRequestException('device_id is required');
+    if (deviceId.length > MAX_DEVICE_ID_LENGTH) throw new BadRequestException('device_id is too long');
+    if (deviceId === BROWSER_DEVICE_ID) {
+      throw new BadRequestException('Tracking events are only accepted from a desktop tracker device');
+    }
+    if (!Array.isArray(body?.events)) throw new BadRequestException('events must be an array');
+    if (body.events.length > MAX_EVENTS_PER_BATCH) {
+      throw new BadRequestException(`At most ${MAX_EVENTS_PER_BATCH} events per request`);
+    }
+
+    const now = new Date();
+    type EventResult = {
+      index: number;
+      client_event_id: string | null;
+      status: 'accepted' | 'duplicate' | 'rejected';
+      id?: number;
+      session_id?: number | null;
+      error?: EventRejection;
+      message?: string;
+      conflict?: boolean;
+    };
+    const results: EventResult[] = [];
+    const seenInBatch = new Set<string>();
+    const sessionCache = new Map<number, any>();
+
+    for (let index = 0; index < body.events.length; index++) {
+      const validation = validateClientEvent(body.events[index], deviceId, now.getTime());
+      // (`in` narrows the union without strictNullChecks, which this project does not enable)
+      if ('error' in validation) {
+        results.push({ index, client_event_id: validation.client_event_id, status: 'rejected', error: validation.error, message: validation.message });
+        continue;
+      }
+      const ev = validation.event;
+
+      if (seenInBatch.has(ev.client_event_id)) {
+        results.push({ index, client_event_id: ev.client_event_id, status: 'duplicate', message: 'Repeated in this batch' });
+        continue;
+      }
+      seenInBatch.add(ev.client_event_id);
+
+      // Session ownership: the same answer for "does not exist" and "not yours", so ids cannot be probed
+      let sessionId: number | null = null;
+      if (ev.session_id !== null) {
+        if (!sessionCache.has(ev.session_id)) {
+          sessionCache.set(ev.session_id, await this.prisma.workSession.findFirst({ where: { id: ev.session_id, user_id: userId } }));
+        }
+        const session = sessionCache.get(ev.session_id);
+        if (!session || session.user_id !== userId || session.device_id !== deviceId) {
+          results.push({
+            index, client_event_id: ev.client_event_id, status: 'rejected', error: 'session_not_permitted',
+            message: 'session_id is not a session of this employee on this device',
+          });
+          continue;
+        }
+        sessionId = session.id;
+      } else {
+        const covering = await this.prisma.workSession.findFirst({
+          where: {
+            user_id: userId,
+            device_id: deviceId,
+            login_time: { lte: ev.occurred_at },
+            OR: [{ logout_time: null }, { logout_time: { gte: ev.occurred_at } }],
+          },
+          orderBy: { login_time: 'desc' },
+        });
+        sessionId = covering?.id ?? null;
+      }
+
+      const existing = await this.prisma.trackingActivityLog.findFirst({
+        where: { user_id: userId, client_event_id: ev.client_event_id },
+      });
+      if (existing) {
+        const conflict = existing.activity_type !== ev.type || new Date(existing.occurred_at).getTime() !== ev.occurred_at.getTime();
+        results.push({
+          index, client_event_id: ev.client_event_id, status: 'duplicate', id: existing.id, session_id: existing.session_id,
+          ...(conflict ? { conflict: true, message: 'Already stored with a different type or time; the stored event is kept' } : {}),
+        });
+        continue;
+      }
+
+      try {
+        const created = await this.prisma.trackingActivityLog.create({
+          data: {
+            user_id: userId,
+            session_id: sessionId,
+            activity_type: ev.type,
+            occurred_at: ev.occurred_at,
+            client_event_id: ev.client_event_id,
+            source: EVENT_SOURCES.desktopClient,
+            reason: ev.reason,
+            device_id: deviceId,
+            ended_at: ev.ended_at,
+            duration_seconds: ev.duration_seconds,
+            metadata: (ev.metadata ?? undefined) as any,
+          },
+        });
+        results.push({ index, client_event_id: ev.client_event_id, status: 'accepted', id: created.id, session_id: sessionId });
+      } catch (err) {
+        if (isUniqueViolation(err)) {
+          // Stored concurrently by another request with the same id
+          results.push({ index, client_event_id: ev.client_event_id, status: 'duplicate' });
+        } else {
+          this.logger.warn(`Could not store tracking event ${ev.client_event_id}: ${(err as Error)?.message ?? err}`);
+          results.push({ index, client_event_id: ev.client_event_id, status: 'rejected', error: 'storage_error', message: 'The event could not be stored; retry later' });
+        }
+      }
+    }
+
+    const count = (status: EventResult['status']) => results.filter((r) => r.status === status).length;
+    return {
+      success: true,
+      device_id: deviceId,
+      received: body.events.length,
+      accepted: count('accepted'),
+      duplicates: count('duplicate'),
+      rejected: count('rejected'),
+      results,
+    };
+  }
 
   // -------------------------------------------------------------
   // 1. GET OR CREATE USER TRACKING PROFILE
@@ -113,71 +482,71 @@ export class TrackingService {
       }
     }
 
-    let activeSession: any = null;
-
-    if (deviceId === 'default') {
-      const activeDesktopSession = await this.prisma.workSession.findFirst({
+    // A heartbeat only ever reads, refreshes or closes sessions of its own kind: browser heartbeats touch
+    // browser sessions, desktop heartbeats touch desktop sessions. (Previously a browser heartbeat attached
+    // itself to a live desktop session and refreshed its last_ping, so an open portal tab kept a disconnected
+    // tracker looking connected; and a desktop heartbeat closed the user's browser session.)
+    if (deviceId !== BROWSER_DEVICE_ID) {
+      // One desktop tracker per user at a time: a heartbeat from this machine closes the user's sessions on
+      // other desktop machines. Browser sessions are left alone.
+      const otherDesktopSessions = await this.prisma.workSession.findMany({
         where: {
           user_id: userId,
           is_active_session: true,
-          NOT: { device_id: 'default' },
-        },
-        orderBy: { login_time: 'desc' },
-      });
-
-      if (activeDesktopSession) {
-        const timeSinceDesktopMs = now.getTime() - new Date(activeDesktopSession.last_ping).getTime();
-        if (timeSinceDesktopMs > 5 * 60 * 1000) {
-          await this.prisma.workSession.update({
-            where: { id: activeDesktopSession.id },
-            data: {
-              is_active_session: false,
-              logout_time: activeDesktopSession.last_ping,
-            },
-          });
-        } else {
-          activeSession = activeDesktopSession;
-        }
-      }
-    } else {
-      const otherActiveSessions = await this.prisma.workSession.findMany({
-        where: {
-          user_id: userId,
-          is_active_session: true,
-          NOT: { device_id: deviceId },
+          device_id: { notIn: [deviceId, BROWSER_DEVICE_ID] },
         },
       });
 
-      for (const oldSess of otherActiveSessions) {
+      for (const oldSess of otherDesktopSessions) {
+        if (oldSess.device_id === deviceId || isBrowserSession(oldSess)) continue;
+        const endedAt = oldSess.last_ping || oldSess.login_time || now;
         await this.prisma.workSession.update({
           where: { id: oldSess.id },
           data: {
             is_active_session: false,
-            logout_time: oldSess.last_ping || oldSess.login_time || now,
+            logout_time: endedAt,
           },
+        });
+        await this.recordServerEvent({
+          userId,
+          sessionId: oldSess.id,
+          deviceId: oldSess.device_id,
+          type: 'session_end',
+          occurredAt: new Date(endedAt),
+          source: EVENT_SOURCES.serverInferred,
+          reason: 'superseded_by_other_device',
+          clientEventId: serverEventId.sessionEnd(oldSess.id),
+          metadata: { superseded_by_device_id: deviceId, inferred_from: 'last heartbeat of the replaced device' },
         });
       }
     }
 
-    if (!activeSession) {
-      activeSession = await this.prisma.workSession.findFirst({
-        where: {
-          user_id: userId,
-          device_id: deviceId,
-          is_active_session: true,
-        },
-        orderBy: { login_time: 'desc' },
-      });
-    }
+    // Timeline events are recorded for desktop tracker sessions only; browser sessions have none
+    const isDesktopDevice = deviceId !== BROWSER_DEVICE_ID;
+
+    let activeSession: any = await this.prisma.workSession.findFirst({
+      where: {
+        user_id: userId,
+        device_id: deviceId,
+        is_active_session: true,
+      },
+      orderBy: { login_time: 'desc' },
+    });
+
+    // Desktop idle state before this heartbeat (null = new session, no previous state)
+    let previousDesktopIdle: boolean | null = activeSession ? Boolean(activeSession.is_desktop_idle) : null;
+    let previousDesktopPing: Date | null = activeSession?.last_desktop_ping ? new Date(activeSession.last_desktop_ping) : null;
 
     if (activeSession) {
       const timeSincePingMs = now.getTime() - new Date(activeSession.last_ping).getTime();
-      if (timeSincePingMs > 5 * 60 * 1000) {
+      if (timeSincePingMs > SESSION_TIMEOUT_MS) {
+        const timedOut = activeSession;
+        const lastHeartbeatAt = new Date(timedOut.last_ping);
         await this.prisma.workSession.update({
-          where: { id: activeSession.id },
+          where: { id: timedOut.id },
           data: {
             is_active_session: false,
-            logout_time: activeSession.last_ping,
+            logout_time: timedOut.last_ping,
           },
         });
 
@@ -193,6 +562,41 @@ export class TrackingService {
             machine_fingerprint: machineFingerprint,
           },
         });
+        previousDesktopIdle = null;
+        previousDesktopPing = null;
+
+        if (isDesktopDevice) {
+          // No heartbeat for more than SESSION_TIMEOUT_MS: the tracker was not communicating between its last
+          // heartbeat and this one. Why (stopped, asleep, shut down, no network) is not known to the server.
+          const reconnectedAt = new Date(activeSession.login_time);
+          const gapMetadata = {
+            inferred_from: 'heartbeat gap',
+            last_heartbeat_at: lastHeartbeatAt.toISOString(),
+            next_heartbeat_at: reconnectedAt.toISOString(),
+            note: 'The tracker sent no heartbeat in this period; the cause (stopped, asleep, shut down or no network) is unknown',
+          };
+          await this.recordServerEvent({
+            userId, sessionId: timedOut.id, deviceId, type: 'session_end', occurredAt: lastHeartbeatAt,
+            source: EVENT_SOURCES.serverInferred, reason: 'heartbeat_timeout',
+            clientEventId: serverEventId.sessionEnd(timedOut.id), metadata: gapMetadata,
+          });
+          await this.recordServerEvent({
+            userId, sessionId: timedOut.id, deviceId, type: 'offline_start', occurredAt: lastHeartbeatAt,
+            source: EVENT_SOURCES.serverInferred, reason: 'heartbeat_gap', endedAt: reconnectedAt,
+            clientEventId: serverEventId.offlineStart(timedOut.id), metadata: gapMetadata,
+          });
+          await this.recordServerEvent({
+            userId, sessionId: activeSession.id, deviceId, type: 'offline_end', occurredAt: reconnectedAt,
+            source: EVENT_SOURCES.serverInferred, reason: 'heartbeat_resumed',
+            clientEventId: serverEventId.offlineEnd(timedOut.id), metadata: gapMetadata,
+          });
+          await this.recordServerEvent({
+            userId, sessionId: activeSession.id, deviceId, type: 'session_start', occurredAt: reconnectedAt,
+            source: EVENT_SOURCES.serverInferred, reason: 'first_heartbeat_after_gap',
+            clientEventId: serverEventId.sessionStart(activeSession.id),
+            metadata: { inferred_from: 'first heartbeat of the session; the tracker may have started earlier' },
+          });
+        }
       } else {
         activeSession = await this.prisma.workSession.update({
           where: { id: activeSession.id },
@@ -217,6 +621,14 @@ export class TrackingService {
           machine_fingerprint: machineFingerprint,
         },
       });
+      if (isDesktopDevice) {
+        await this.recordServerEvent({
+          userId, sessionId: activeSession.id, deviceId, type: 'session_start', occurredAt: new Date(activeSession.login_time),
+          source: EVENT_SOURCES.serverInferred, reason: 'first_heartbeat',
+          clientEventId: serverEventId.sessionStart(activeSession.id),
+          metadata: { inferred_from: 'first heartbeat of the session; the tracker may have started earlier' },
+        });
+      }
     }
 
     const appName = body?.app_name || body?.current_app || null;
@@ -238,6 +650,11 @@ export class TrackingService {
           is_desktop_idle: isIdle,
         },
       });
+
+      // Fallback for trackers that do not send events yet (they send events_supported: true once they do)
+      if (isDesktopDevice && body?.events_supported !== true) {
+        await this.recordHeartbeatIdleTransition(userId, activeSession.id, deviceId, previousDesktopIdle, isIdle, eventTime, previousDesktopPing);
+      }
 
       // Application-level deduplication: check if exact identical app activity was recorded in last 3 seconds
       const recentDup = await this.prisma.appActivity.findFirst({
@@ -386,79 +803,103 @@ export class TrackingService {
 
     const firstTs = parsedActivities[0].timestamp;
     const lastTs = parsedActivities[parsedActivities.length - 1].timestamp;
+    const isDesktopDevice = deviceId !== BROWSER_DEVICE_ID;
 
-    const isHistorical = (now.getTime() - lastTs.getTime()) > 5 * 60 * 1000;
-    let targetSession: any = null;
+    // Each activity is filed into the session of this device that covers its own timestamp. A late
+    // offline batch (queued while the network was down) therefore lands in the session that was running
+    // at the time, extending it when the server had already closed it on a heartbeat timeout, instead of
+    // in a separate made-up session (the previous behaviour for batches older than 5 minutes).
+    const dayMs = 24 * 3600 * 1000;
+    const candidates = await this.prisma.workSession.findMany({
+      where: {
+        user_id: userId,
+        device_id: deviceId,
+        OR: [
+          { login_time: { gte: new Date(firstTs.getTime() - dayMs), lte: new Date(lastTs.getTime() + dayMs) } },
+          { is_active_session: true },
+        ],
+      },
+      orderBy: { login_time: 'asc' },
+    });
+    const deviceSessions: any[] = candidates.filter((s: any) => s.user_id === userId && s.device_id === deviceId);
 
-    if (isHistorical) {
-      targetSession = await this.prisma.workSession.findFirst({
-        where: {
-          user_id: userId,
-          device_id: deviceId,
-          login_time: { lte: lastTs },
-          logout_time: { gte: firstTs },
-        },
-        orderBy: { login_time: 'desc' },
-      });
-
-      if (!targetSession) {
-        targetSession = await this.prisma.workSession.create({
-          data: {
-            user_id: userId,
-            login_time: firstTs,
-            last_ping: lastTs,
-            logout_time: lastTs,
-            is_active_session: false,
-            device_id: deviceId,
-            installation_uuid: installationUuid,
-            tracker_id: trackerId,
-            machine_fingerprint: machineFingerprint,
-          },
-        });
+    type Touched = {
+      session: any;
+      created: boolean;
+      extended: boolean;
+      startMoved: boolean;
+      mouse: number;
+      keys: number;
+      clicks: number;
+      prod: number;
+      idle: number;
+      synced: number;
+    };
+    const touched = new Map<number, Touched>();
+    const touch = (session: any, created = false): Touched => {
+      let entry = touched.get(session.id);
+      if (!entry) {
+        entry = { session, created, extended: false, startMoved: false, mouse: 0, keys: 0, clicks: 0, prod: 0, idle: 0, synced: 0 };
+        touched.set(session.id, entry);
       }
-    } else {
-      targetSession = await this.prisma.workSession.findFirst({
-        where: {
-          user_id: userId,
-          device_id: deviceId,
-          is_active_session: true,
-        },
-        orderBy: { login_time: 'desc' },
-      });
+      return entry;
+    };
+    const loginMs = (s: any) => toMs(s.login_time) ?? Number.POSITIVE_INFINITY;
+    const endMs = (s: any) => (s.is_active_session ? Number.POSITIVE_INFINITY : toMs(s.logout_time) ?? toMs(s.last_ping) ?? loginMs(s));
+    const sameDay = (a: number, b: number) => new Date(a).toDateString() === new Date(b).toDateString();
 
-      if (!targetSession) {
-        targetSession = await this.prisma.workSession.create({
-          data: {
-            user_id: userId,
-            login_time: firstTs,
-            last_ping: now,
-            is_active_session: true,
-            device_id: deviceId,
-            installation_uuid: installationUuid,
-            tracker_id: trackerId,
-            machine_fingerprint: machineFingerprint,
-          },
-        });
-      } else {
-        await this.prisma.workSession.update({
-          where: { id: targetSession.id },
-          data: { last_ping: now },
-        });
+    const sessionFor = async (ts: Date): Promise<Touched> => {
+      const t = ts.getTime();
+      const started = deviceSessions.filter((s) => loginMs(s) <= t).sort((a, b) => loginMs(b) - loginMs(a));
+      const covering = started.find((s) => endMs(s) >= t);
+      if (covering) return touch(covering);
+
+      // After a closed session (same day, within MAX_LATE_ATTACH_MS): the tracker was still running offline
+      const prior = started[0];
+      if (prior && t - endMs(prior) <= MAX_LATE_ATTACH_MS && sameDay(endMs(prior), t)) {
+        prior.logout_time = ts;
+        if ((toMs(prior.last_ping) ?? 0) < t) prior.last_ping = ts;
+        const entry = touch(prior);
+        entry.extended = true;
+        return entry;
       }
-    }
+
+      // Before the next session's first heartbeat (same day): the session began while offline
+      const next = deviceSessions.filter((s) => loginMs(s) > t).sort((a, b) => loginMs(a) - loginMs(b))[0];
+      if (next && loginMs(next) - t <= MAX_LATE_ATTACH_MS && sameDay(loginMs(next), t)) {
+        next.login_time = ts;
+        const entry = touch(next);
+        entry.startMoved = true;
+        return entry;
+      }
+
+      // No session of this device near this time: a genuinely separate session
+      const live = now.getTime() - t <= SESSION_TIMEOUT_MS && !deviceSessions.some((s) => s.is_active_session);
+      const created = await this.prisma.workSession.create({
+        data: {
+          user_id: userId,
+          login_time: ts,
+          last_ping: live ? now : ts,
+          logout_time: live ? null : ts,
+          is_active_session: live,
+          device_id: deviceId,
+          installation_uuid: installationUuid,
+          tracker_id: trackerId,
+          machine_fingerprint: machineFingerprint,
+        },
+      });
+      deviceSessions.push(created);
+      return touch(created, true);
+    };
 
     let syncedCount = 0;
     let skippedCount = 0;
-    let totalMouse = 0;
-    let totalKeys = 0;
-    let totalClicks = 0;
-    let totalProdSec = 0;
-    let totalIdleSec = 0;
+    let lastSessionId: number | null = null;
 
     for (const act of parsedActivities) {
       const existing = await this.prisma.appActivity.findFirst({
         where: {
-          session_id: targetSession.id,
+          user_id: userId,
           app_name: act.app_name,
           window_title: act.window_title,
           timestamp: act.timestamp,
@@ -470,23 +911,30 @@ export class TrackingService {
         continue;
       }
 
+      const entry = await sessionFor(act.timestamp);
+      const targetSession = entry.session;
+      lastSessionId = targetSession.id;
+
       const category = this.classifyAppActivity(act.app_name, act.window_title);
       const isProductiveTick = (!act.is_idle) && (act.mouse_moves > 0 || act.key_presses > 0 || act.clicks > 0);
       const tickProd = isProductiveTick ? act.duration_seconds : 0;
       const tickIdle = isProductiveTick ? 0 : act.duration_seconds;
 
-      totalMouse += act.mouse_moves;
-      totalKeys += act.key_presses;
-      totalClicks += act.clicks;
-      totalProdSec += tickProd;
-      totalIdleSec += tickIdle;
+      entry.mouse += act.mouse_moves;
+      entry.keys += act.key_presses;
+      entry.clicks += act.clicks;
+      entry.prod += tickProd;
+      entry.idle += tickIdle;
 
       const lastAct = await this.prisma.appActivity.findFirst({
         where: { session_id: targetSession.id },
         orderBy: { timestamp: 'desc' },
       });
 
-      if (lastAct && lastAct.app_name === act.app_name && lastAct.window_title === act.window_title) {
+      // Merge only forward in time: an activity older than the session's latest row gets its own row
+      // (merging would move that row's end timestamp backwards)
+      const lastActMs = lastAct ? toMs(lastAct.timestamp) ?? 0 : 0;
+      if (lastAct && lastAct.app_name === act.app_name && lastAct.window_title === act.window_title && lastActMs <= act.timestamp.getTime()) {
         await this.prisma.appActivity.update({
           where: { id: lastAct.id },
           data: {
@@ -518,71 +966,208 @@ export class TrackingService {
         });
       }
 
+      entry.synced++;
       syncedCount++;
     }
 
-    const currentSession = await this.prisma.workSession.findUnique({ where: { id: targetSession.id } });
-    if (currentSession && syncedCount > 0) {
-      const newProd = currentSession.productive_seconds + totalProdSec;
-      const newIdle = currentSession.idle_seconds + totalIdleSec;
-      const newTracked = newProd + newIdle;
-      const newPct = newTracked > 0 ? Math.min(100.0, (newProd / newTracked) * 100.0) : 0.0;
+    for (const entry of touched.values()) {
+      const s = entry.session;
+      const current = await this.prisma.workSession.findUnique({ where: { id: s.id } });
+      if (!current) continue;
 
-      await this.prisma.workSession.update({
-        where: { id: targetSession.id },
-        data: {
-          mouse_moves: currentSession.mouse_moves + totalMouse,
-          key_presses: currentSession.key_presses + totalKeys,
-          clicks: currentSession.clicks + totalClicks,
-          productive_seconds: newProd,
-          idle_seconds: newIdle,
-          tracked_seconds: newTracked,
-          activity_percentage: newPct,
-        },
-      });
+      const newProd = current.productive_seconds + entry.prod;
+      const newIdle = current.idle_seconds + entry.idle;
+      const newTracked = newProd + newIdle;
+      const data: any = {
+        mouse_moves: current.mouse_moves + entry.mouse,
+        key_presses: current.key_presses + entry.keys,
+        clicks: current.clicks + entry.clicks,
+        productive_seconds: newProd,
+        idle_seconds: newIdle,
+        tracked_seconds: newTracked,
+        activity_percentage: newTracked > 0 ? Math.min(100.0, (newProd / newTracked) * 100.0) : 0.0,
+      };
+      if (entry.extended) {
+        data.logout_time = s.logout_time;
+        data.last_ping = s.last_ping;
+      }
+      if (entry.startMoved) data.login_time = s.login_time;
+      if (current.is_active_session) data.last_ping = now;
+
+      await this.prisma.workSession.update({ where: { id: s.id }, data });
+
+      if (!isDesktopDevice) continue;
+      // Server-inferred session boundaries move to what the late activity shows
+      if (entry.extended) {
+        await this.reviseServerEvent(userId, serverEventId.sessionEnd(s.id), new Date(s.logout_time), 'late_offline_batch');
+      }
+      if (entry.startMoved) {
+        await this.reviseServerEvent(userId, serverEventId.sessionStart(s.id), new Date(s.login_time), 'late_offline_batch');
+      }
+      if (entry.created) {
+        const metadata = { inferred_from: 'activities synced late from the offline queue' };
+        await this.recordServerEvent({
+          userId, sessionId: s.id, deviceId, type: 'session_start', occurredAt: new Date(s.login_time),
+          source: EVENT_SOURCES.serverInferred, reason: 'late_offline_batch',
+          clientEventId: serverEventId.sessionStart(s.id), metadata,
+        });
+        if (!s.is_active_session) {
+          await this.recordServerEvent({
+            userId, sessionId: s.id, deviceId, type: 'session_end', occurredAt: new Date(s.logout_time),
+            source: EVENT_SOURCES.serverInferred, reason: 'late_offline_batch',
+            clientEventId: serverEventId.sessionEnd(s.id), metadata,
+          });
+        }
+      }
     }
 
     return {
       success: true,
       synced_count: syncedCount,
       skipped_count: skippedCount,
-      session_id: targetSession.id,
+      session_id: lastSessionId,
       message: `Batch sync complete. Synced: ${syncedCount}, Skipped duplicates: ${skippedCount}`,
     };
   }
 
-  async handleLogout(userId: number) {
-    const activeSession = await this.prisma.workSession.findFirst({
+  /**
+   * Ends the caller's session on the calling device only (`device_id` in the body; the portal sends
+   * BROWSER_DEVICE_ID). Previously this ended the user's most recent session on *any* device, so a portal
+   * logout could end the desktop tracker's session and vice versa.
+   *
+   * A request without a device_id is ambiguous — the current desktop tracker and older portal builds both
+   * send an empty body — so it ends nothing rather than risk ending another device's session. Such a
+   * tracker session is still closed by the normal timeout (logout_time = its last heartbeat).
+   */
+  async handleLogout(userId: number, body: any = {}) {
+    const deviceId = typeof body?.device_id === 'string' ? body.device_id.trim() : '';
+
+    if (!deviceId) {
+      return {
+        success: false,
+        message: 'No session ended: device_id is required to identify which session to end',
+        session_id: null,
+        ended_session_ids: [],
+      };
+    }
+
+    const sessions = await this.prisma.workSession.findMany({
       where: {
         user_id: userId,
+        device_id: deviceId,
         is_active_session: true,
       },
       orderBy: { login_time: 'desc' },
     });
+    const deviceSessions = sessions.filter(
+      (s: any) => s.user_id === userId && s.device_id === deviceId && s.is_active_session,
+    );
 
-    if (activeSession) {
-      const now = new Date();
+    if (deviceSessions.length === 0) {
+      return {
+        success: true,
+        message: 'No active session found for this device',
+        session_id: null,
+        ended_session_ids: [],
+      };
+    }
+
+    const now = new Date();
+    for (const session of deviceSessions) {
       await this.prisma.workSession.update({
-        where: { id: activeSession.id },
+        where: { id: session.id },
         data: {
           is_active_session: false,
           logout_time: now,
           last_ping: now,
         },
       });
-
-      return {
-        success: true,
-        message: 'Session ended successfully',
-        session_id: activeSession.id,
-      };
+      if (!isBrowserSession(session)) {
+        await this.recordServerEvent({
+          userId, sessionId: session.id, deviceId, type: 'session_end', occurredAt: now,
+          source: EVENT_SOURCES.serverInferred, reason: 'logout_request',
+          clientEventId: serverEventId.sessionEnd(session.id),
+          metadata: { inferred_from: 'logout request from this device (time = when the server received it)' },
+        });
+      }
     }
 
     return {
       success: true,
-      message: 'No active session found',
-      session_id: null,
+      message: 'Session ended successfully',
+      session_id: deviceSessions[0].id,
+      ended_session_ids: deviceSessions.map((s: any) => s.id),
     };
+  }
+
+  /**
+   * Live status from a user's sessions. Desktop tracker sessions decide Active/Idle/Offline. A browser
+   * (portal) session can only make a user Active when they have no desktop session in `sessions` — the
+   * existing behaviour for portal-only users — so an open portal tab never makes a disconnected desktop
+   * tracker look live.
+   */
+  resolveLiveStatus(sessions: any[], now: Date = new Date(), options: LiveStatusOptions = {}): LiveStatus {
+    const nowMs = now.getTime();
+    const breakStartMs = options.openBreak ? options.openBreak.started_at.getTime() : null;
+    const byLatestLogin = (a: any, b: any) => (toMs(b.login_time) ?? 0) - (toMs(a.login_time) ?? 0);
+    const desktopSessions = sessions.filter((s) => s && !isBrowserSession(s));
+    const activeDesktop = desktopSessions.filter((s) => s.is_active_session).sort(byLatestLogin);
+
+    for (const session of activeDesktop) {
+      const pingMs = toMs(session.last_desktop_ping) ?? toMs(session.last_ping);
+      if (pingMs === null) continue;
+      const seconds = Math.floor((nowMs - pingMs) / 1000);
+      if (seconds <= LIVE_WINDOW_SECONDS) {
+        // A heartbeat from before the break started is not work during the break (the break is what stopped them)
+        if (breakStartMs !== null && pingMs <= breakStartMs) continue;
+        const idle = Boolean(session.is_desktop_idle) || seconds > STALE_PING_IDLE_SECONDS;
+        return { status: idle ? 'Idle' : 'Active', source: 'desktop', session };
+      }
+    }
+
+    // On Break: an open manual break and no work heartbeat since it started. A disconnection alone never gets here.
+    if (options.openBreak) {
+      return { status: 'On Break', source: 'desktop', session: null, break_started_at: options.openBreak.started_at };
+    }
+    if (desktopSessions.length === 0) {
+      const activeBrowser = sessions.filter((s) => s && isBrowserSession(s) && s.is_active_session).sort(byLatestLogin);
+      for (const session of activeBrowser) {
+        const pingMs = toMs(session.last_ping);
+        if (pingMs !== null && Math.floor((nowMs - pingMs) / 1000) <= LIVE_WINDOW_SECONDS) {
+          return { status: 'Active', source: 'portal', session };
+        }
+      }
+    }
+
+    // Stopped on purpose: the newest desktop session was closed (Stop/Logout) and none is open. A session that is
+    // still open but silent is a lost connection: Offline.
+    if (options.distinguishStopped && activeDesktop.length === 0 && desktopSessions.length > 0) {
+      const newest = [...desktopSessions].sort(byLatestLogin)[0];
+      if (!newest.is_active_session) return { status: 'Stopped', source: 'desktop', session: null };
+    }
+
+    return { status: 'Offline', source: null, session: null };
+  }
+
+  /** Open manual breaks of these users (one bounded query). Never throws: a database without break support just has none. */
+  private async loadOpenBreaks(userIds: number[], now: Date): Promise<Map<number, OpenBreak>> {
+    if (userIds.length === 0) return new Map();
+    try {
+      const rows = await this.prisma.trackingActivityLog.findMany({
+        where: {
+          user_id: { in: userIds },
+          activity_type: { in: ['break_start', 'break_end'] as any },
+          occurred_at: { gte: new Date(now.getTime() - BREAK_STALE_MS - 3600 * 1000) },
+        },
+        select: { user_id: true, activity_type: true, occurred_at: true },
+        orderBy: { occurred_at: 'asc' },
+        take: 5000,
+      });
+      return resolveOpenBreaks(rows as any, now);
+    } catch (err) {
+      this.logger.warn(`Could not read break events: ${(err as Error)?.message ?? err}`);
+      return new Map();
+    }
   }
 
   // -------------------------------------------------------------
@@ -611,12 +1196,30 @@ export class TrackingService {
     todayStart.setHours(0, 0, 0, 0);
 
     const results = [];
+    const openBreaks = await this.loadOpenBreaks(users.map((u) => u.id), now);
 
     for (const u of users) {
-      let activeSession = await this.prisma.workSession.findFirst({
-        where: { user_id: u.id, is_active_session: true },
-        orderBy: { login_time: 'desc' },
+      // Today's sessions plus any still-open older session, on every device (desktop and browser)
+      const todaySessions = await this.prisma.workSession.findMany({
+        where: {
+          user_id: u.id,
+          OR: [
+            { login_time: { gte: todayStart } },
+            { is_active_session: true },
+          ],
+        },
       });
+
+      const openBreak = openBreaks.get(u.id) ?? null;
+      const live = this.resolveLiveStatus(todaySessions, now, { openBreak, distinguishStopped: true });
+      const status = live.status;
+      const isLive = live.session !== null;
+
+      // The session shown for this user: the live one, else the newest open desktop session, else any open one
+      const byLatestLogin = (a: any, b: any) => (toMs(b.login_time) ?? 0) - (toMs(a.login_time) ?? 0);
+      const openSessions = todaySessions.filter((s: any) => s.is_active_session).sort(byLatestLogin);
+      const activeSession: any =
+        live.session ?? openSessions.find((s: any) => !isBrowserSession(s)) ?? openSessions[0] ?? null;
 
       let displaySession = activeSession;
       if (!displaySession) {
@@ -631,31 +1234,6 @@ export class TrackingService {
         orderBy: { login_time: 'asc' },
       });
 
-      let status = 'Offline';
-      let isLive = false;
-
-      if (activeSession && activeSession.is_active_session) {
-        if (activeSession.last_desktop_ping) {
-          const secondsDesktop = Math.floor((now.getTime() - new Date(activeSession.last_desktop_ping).getTime()) / 1000);
-          if (secondsDesktop <= 300) {
-            isLive = true;
-            if (activeSession.is_desktop_idle || secondsDesktop > 120) {
-              status = 'Idle';
-            } else {
-              status = 'Active';
-            }
-          }
-        }
-
-        if (!isLive && activeSession.last_ping) {
-          const secondsPing = Math.floor((now.getTime() - new Date(activeSession.last_ping).getTime()) / 1000);
-          if (secondsPing <= 300) {
-            isLive = true;
-            status = 'Active';
-          }
-        }
-      }
-
       let loginTime: string | null = null;
       let lastPing: string | null = null;
       let currentApp: string | null = null;
@@ -669,16 +1247,6 @@ export class TrackingService {
         sessionProductiveSec = displaySession.productive_seconds || 0;
         sessionIdleSec = displaySession.idle_seconds || 0;
       }
-
-      const todaySessions = await this.prisma.workSession.findMany({
-        where: {
-          user_id: u.id,
-          OR: [
-            { login_time: { gte: todayStart } },
-            { is_active_session: true },
-          ],
-        },
-      });
 
       let dailyProductiveSeconds = 0;
       let dailyIdleSeconds = 0;
@@ -730,6 +1298,11 @@ export class TrackingService {
         is_tracking_enabled: u.tracking_profile?.is_tracking_enabled ?? true,
         screenshots_enabled: u.tracking_profile?.screenshots_enabled ?? true,
         status,
+        // What the live status is based on: the desktop tracker, the web portal (users with no desktop
+        // session today), or nothing (Offline)
+        status_source: live.source,
+        /** Set while status is 'On Break': when the manual break started (UTC ISO) */
+        break_started_at: live.break_started_at ? live.break_started_at.toISOString() : null,
         login_time: loginTime,
         first_login_time: firstSession ? firstSession.login_time.toISOString() : null,
         last_ping: lastPing,
@@ -764,10 +1337,14 @@ export class TrackingService {
 
         item.app_activities = appActs;
 
-        const hourlyTimeline = [];
+        // Minutes per hour spent in apps classified as productive / non-productive (classifyAppActivity).
+        // This is an app classification, not keyboard/mouse inactivity: time without input inside a
+        // productive app still counts as productive_apps. (These series were previously named
+        // `productive` / `idle`, which presented non-productive apps as employee inactivity.)
+        const hourlyTimeline: { hour: string; productive_apps: number; non_productive_apps: number }[] = [];
         for (let h = 0; h < 24; h++) {
           const hourLabel = `${h % 12 === 0 ? 12 : h % 12}:00 ${h < 12 ? 'AM' : 'PM'}`;
-          hourlyTimeline.push({ hour: hourLabel, productive: 0.0, idle: 0.0 });
+          hourlyTimeline.push({ hour: hourLabel, productive_apps: 0.0, non_productive_apps: 0.0 });
         }
 
         const dayActivities = await this.prisma.appActivity.findMany({
@@ -775,20 +1352,22 @@ export class TrackingService {
         });
 
         for (const act of dayActivities) {
-          const actHour = new Date(act.timestamp).getHours();
+          const actMs = toMs(act.timestamp);
+          if (actMs === null) continue;
+          const actHour = new Date(actMs).getHours();
           const category = this.classifyAppActivity(act.app_name, act.window_title || '');
-          const durationMins = (act.duration_seconds || 0) / 60.0;
+          const durationMins = Math.max(0, Number(act.duration_seconds) || 0) / 60.0;
 
           if (category === 'productive') {
-            hourlyTimeline[actHour].productive += durationMins;
+            hourlyTimeline[actHour].productive_apps += durationMins;
           } else {
-            hourlyTimeline[actHour].idle += durationMins;
+            hourlyTimeline[actHour].non_productive_apps += durationMins;
           }
         }
 
         for (const entry of hourlyTimeline) {
-          entry.productive = Number(entry.productive.toFixed(2));
-          entry.idle = Number(entry.idle.toFixed(2));
+          entry.productive_apps = Number(entry.productive_apps.toFixed(2));
+          entry.non_productive_apps = Number(entry.non_productive_apps.toFixed(2));
         }
 
         item.timeline_data = hourlyTimeline;
@@ -803,6 +1382,78 @@ export class TrackingService {
   // -------------------------------------------------------------
   // 4. SESSIONS LISTING
   // -------------------------------------------------------------
+  // -------------------------------------------------------------
+  // HISTORICAL TIMELINE (GET /tracking/reports/timeline, admin)
+  // -------------------------------------------------------------
+  /**
+   * Read-only historical timeline of one employee's desktop tracking for a local date or date range.
+   * Three queries in total (employee, sessions, events), each bounded: desktop sessions overlapping the range
+   * (at most TIMELINE_MAX_SESSIONS) and their events plus unattached events in the range (at most
+   * TIMELINE_MAX_EVENTS). Portal (browser) sessions are not part of the timeline: they record no events.
+   * Nothing is written; duplicates are resolved in the response only (see tracking-timeline.ts).
+   */
+  async getTrackingTimeline(rawQuery: any) {
+    const now = new Date();
+    const parsed = parseTimelineQuery(rawQuery, now);
+    if ('message' in parsed) throw new BadRequestException(parsed.message);
+    const query = parsed.query;
+
+    const employee = await this.prisma.user.findUnique({
+      where: { id: query.userId },
+      select: { id: true, name: true, username: true, email: true, position: true, department: { select: { id: true, name: true } } },
+    });
+    if (!employee) throw new NotFoundException('Employee not found');
+
+    const { start, end } = zonedRange(query.from, query.to, query.tz);
+    // Overlapping the range: started before its end, and ended (or last heard from, when not closed) after its start
+    const sessions = await this.prisma.workSession.findMany({
+      where: {
+        user_id: query.userId,
+        device_id: { not: BROWSER_DEVICE_ID },
+        login_time: { lt: end },
+        OR: [
+          { logout_time: { gte: start } },
+          { logout_time: null, last_ping: { gte: start } },
+          { logout_time: null, is_active_session: true },
+        ],
+      },
+      select: { id: true, device_id: true, login_time: true, logout_time: true, last_ping: true, is_active_session: true, tracked_seconds: true },
+      orderBy: { login_time: 'asc' },
+      take: TIMELINE_MAX_SESSIONS + 1,
+    });
+    let truncated = sessions.length > TIMELINE_MAX_SESSIONS;
+    const sessionRows = sessions.slice(0, TIMELINE_MAX_SESSIONS);
+    const sessionIds = sessionRows.map((s) => s.id);
+
+    const eventsFound = await this.prisma.trackingActivityLog.findMany({
+      where: {
+        user_id: query.userId,
+        activity_type: { in: [...CLIENT_EVENT_TYPES] as any },
+        OR: [
+          ...(sessionIds.length ? [{ session_id: { in: sessionIds } }] : []),
+          { session_id: null, occurred_at: { gte: start, lt: end } },
+          // A manual break starts in the session Stop Tracking closed and ends in a later one, so a break that touches
+          // the range can have its other event in a session outside it (look back up to the abandoned-break limit)
+          { activity_type: { in: ['break_start', 'break_end'] as any }, occurred_at: { gte: new Date(start.getTime() - BREAK_STALE_MS), lt: end } },
+        ],
+      },
+      // No metadata: the timeline needs none of it
+      select: { id: true, session_id: true, activity_type: true, occurred_at: true, source: true, reason: true, device_id: true, ended_at: true },
+      orderBy: [{ occurred_at: 'asc' }, { id: 'asc' }],
+      take: TIMELINE_MAX_EVENTS + 1,
+    });
+    if (eventsFound.length > TIMELINE_MAX_EVENTS) truncated = true;
+
+    return buildTrackingTimeline({
+      sessions: sessionRows as any,
+      events: eventsFound.slice(0, TIMELINE_MAX_EVENTS) as any,
+      query,
+      now,
+      employee,
+      truncated,
+    });
+  }
+
   async getUserSessions(user: any, filter?: 'today' | 'active') {
     const where: any = { user_id: user.id };
 
@@ -823,59 +1474,86 @@ export class TrackingService {
   // -------------------------------------------------------------
   // 5. REPORTS & ANALYTICS
   // -------------------------------------------------------------
+  /**
+   * Gaps in a day's tracking, from the timestamps that actually exist.
+   *
+   * 1. Offline gaps — time between tracking sessions on the same day (session end = logout_time, else
+   *    last_ping). When the user has desktop sessions only those are used: browser sessions run alongside
+   *    them and would hide desktop gaps. Overlapping sessions are merged so overlaps never produce a gap.
+   *
+   * 2. Activity gaps — time inside a session with no recorded desktop activity. tracking_app_activity rows
+   *    are merged: consecutive heartbeats for the same app/window add their duration to one row and
+   *    overwrite `timestamp` with the *latest* heartbeat. So a row's `timestamp` is the END of the period it
+   *    covers (the old code treated it as the start and added the duration, pushing each row's end into the
+   *    future and hiding real gaps). A row's start is only known as `timestamp - duration_seconds`, which is
+   *    exact when its heartbeats were contiguous, so these gaps are flagged `estimated: true`. Rows without
+   *    a valid timestamp are ignored; a row without a valid duration has no known start, so no gap is
+   *    reported before it. Gaps hidden inside a merged row (same app before and after a pause) cannot be
+   *    recovered from existing data and are not reported.
+   *
+   * Neither kind is a confirmed break: the tracker records no idle or break events.
+   */
   detectBreaksAndGaps(sessionsList: any[], activitiesList: any[]) {
     const breaks: any[] = [];
-    const sortedSessions = [...sessionsList].sort((a, b) => new Date(a.login_time).getTime() - new Date(b.login_time).getTime());
+    const sessions = (sessionsList || []).filter(Boolean);
+    const activities = (activitiesList || []).filter(Boolean);
 
-    for (let i = 0; i < sortedSessions.length - 1; i++) {
-      const s1 = sortedSessions[i];
-      const s2 = sortedSessions[i + 1];
-      const d1 = new Date(s1.login_time).toDateString();
-      const d2 = new Date(s2.login_time).toDateString();
+    const desktopSessions = sessions.filter((s) => !isBrowserSession(s));
+    const gapSessions = desktopSessions.length > 0 ? desktopSessions : sessions;
 
-      if (d1 === d2) {
-        const logout = s1.logout_time || s1.last_ping;
-        const login = s2.login_time;
-        if (logout && new Date(login).getTime() > new Date(logout).getTime()) {
-          const gap = Math.floor((new Date(login).getTime() - new Date(logout).getTime()) / 1000);
-          if (gap >= 60) {
-            breaks.push({
-              start: new Date(logout),
-              end: new Date(login),
-              duration: gap,
-              type: 'offline',
-              description: 'Away from keyboard / Offline',
-            });
-          }
+    const sessionIntervals = gapSessions
+      .map((s) => ({ start: toMs(s.login_time), end: toMs(s.logout_time) ?? toMs(s.last_ping) }))
+      .filter((iv): iv is Interval => iv.start !== null && iv.end !== null && iv.end >= iv.start)
+      .sort((a, b) => a.start - b.start);
+
+    let coveredUntil: number | null = null;
+    for (const iv of sessionIntervals) {
+      if (coveredUntil !== null && iv.start > coveredUntil
+        && new Date(coveredUntil).toDateString() === new Date(iv.start).toDateString()) {
+        const gap = Math.floor((iv.start - coveredUntil) / 1000);
+        if (gap >= 60) {
+          breaks.push({
+            start: new Date(coveredUntil),
+            end: new Date(iv.start),
+            duration: gap,
+            type: 'offline',
+            description: 'No tracking session (offline, logged out or tracker stopped)',
+            estimated: false,
+          });
         }
       }
+      coveredUntil = coveredUntil === null ? iv.end : Math.max(coveredUntil, iv.end);
     }
 
-    for (const session of sortedSessions) {
-      const sessionActs = activitiesList
+    for (const session of sessions) {
+      const rows = activities
         .filter((act) => act.session_id === session.id)
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+        .map((act) => {
+          const durationSec = Number(act.duration_seconds);
+          return { end: toMs(act.timestamp), durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null };
+        })
+        .filter((row): row is { end: number; durationSec: number | null } => row.end !== null)
+        .sort((a, b) => a.end - b.end);
 
-      if (sessionActs.length >= 2) {
-        for (let j = 0; j < sessionActs.length - 1; j++) {
-          const act1 = sessionActs[j];
-          const act2 = sessionActs[j + 1];
-          const act1End = new Date(new Date(act1.timestamp).getTime() + (act1.duration_seconds || 10) * 1000);
-          const act2Start = new Date(act2.timestamp);
-
-          if (act2Start.getTime() > act1End.getTime()) {
-            const gap = Math.floor((act2Start.getTime() - act1End.getTime()) / 1000);
+      let prevEnd: number | null = null;
+      for (const row of rows) {
+        if (prevEnd !== null && row.durationSec !== null) {
+          const estimatedStart = row.end - row.durationSec * 1000;
+          if (estimatedStart > prevEnd) {
+            const gap = Math.floor((estimatedStart - prevEnd) / 1000);
             if (gap >= 180) {
               breaks.push({
-                start: act1End,
-                end: act2Start,
+                start: new Date(prevEnd),
+                end: new Date(estimatedStart),
                 duration: gap,
                 type: 'idle',
-                description: 'Idle session',
+                description: 'No desktop activity recorded (gap estimated from merged activity rows)',
+                estimated: true,
               });
             }
           }
         }
+        prevEnd = prevEnd === null ? row.end : Math.max(prevEnd, row.end);
       }
     }
 
@@ -988,14 +1666,23 @@ export class TrackingService {
 
         let productiveSec = 0;
         let idleSec = 0;
-        let portalActiveSec = 0;
+
+        // Portal time = browser-session time not already covered by a desktop session. Browser and desktop
+        // sessions now run side by side (browser heartbeats no longer fold into the desktop session), so
+        // counting both in full would double-count the same minutes in total engagement.
+        const sessionInterval = (s: any): Interval | null => {
+          const start = toMs(s.login_time);
+          const end = toMs(s.logout_time) ?? toMs(s.last_ping) ?? now.getTime();
+          return start !== null && end > start ? { start, end } : null;
+        };
+        const browserIntervals = daySessions.filter((s) => isBrowserSession(s)).map(sessionInterval).filter((iv): iv is Interval => iv !== null);
+        const desktopIntervals = daySessions.filter((s) => !isBrowserSession(s)).map(sessionInterval).filter((iv): iv is Interval => iv !== null);
+        const portalActiveSec = uncoveredSeconds(browserIntervals, desktopIntervals);
 
         for (const s of daySessions) {
           const sEnd = s.logout_time || s.last_ping || now;
           const sElapsed = Math.max(0, Math.floor((new Date(sEnd).getTime() - new Date(s.login_time).getTime()) / 1000));
-          if (s.device_id === 'default') {
-            portalActiveSec += sElapsed;
-          } else {
+          if (!isBrowserSession(s)) {
             let sProd = Math.max(0, s.productive_seconds || 0);
             let sIdle = Math.max(0, s.idle_seconds || 0);
             if (sProd + sIdle > sElapsed) {
@@ -1031,17 +1718,9 @@ export class TrackingService {
         const empCode = `GS-26-${String(u.id).padStart(3, '0')}`;
         const deptName = u.department?.name || 'General';
 
-        const latestSession = daySessions[daySessions.length - 1];
-        let status = 'Offline';
-        if (dateIso === todayStr && latestSession.is_active_session) {
-          const lastPingTime = latestSession.last_desktop_ping || latestSession.last_ping;
-          if (lastPingTime) {
-            const secSincePing = Math.floor((now.getTime() - new Date(lastPingTime).getTime()) / 1000);
-            if (secSincePing <= 300) {
-              status = latestSession.is_desktop_idle || secSincePing > 120 ? 'Idle' : 'Active';
-            }
-          }
-        }
+        // Same rule as the live dashboard: desktop sessions decide; a browser session counts only on
+        // portal-only days, so an open portal tab cannot make a disconnected tracker look live.
+        const status = dateIso === todayStr ? this.resolveLiveStatus(daySessions, now).status : 'Offline';
 
         reportRows.push({
           employee_name: fullName,
@@ -1396,6 +2075,7 @@ export class TrackingService {
       duration: formatDurationSec(b.duration),
       type: b.type,
       description: b.description,
+      estimated: Boolean(b.estimated),
     }));
 
     const totalProd = userRows.reduce((acc: number, r: any) => acc + r.raw_productive_seconds, 0);

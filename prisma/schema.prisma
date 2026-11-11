@@ -205,10 +205,38 @@ enum NotificationType {
   INVOICE_DUE
 }
 
+/// Tracking state-transition events. `active`, `idle` and `offline` are the original values (never
+/// written by the application); the rest are the timeline events added in Phase 2.
 enum TrackingActivityType {
   active
   idle
   offline
+  session_start
+  session_end
+  idle_start
+  idle_end
+  lock
+  unlock
+  sleep
+  resume
+  offline_start
+  offline_end
+  break_start
+  break_end
+}
+
+/// Who produced a tracking event.
+/// - legacy: rows that existed before event storage (none are written by the application)
+/// - desktop_client: sent by the desktop tracker through POST /tracking/events
+/// - server_heartbeat: inferred from an is_idle change between two desktop heartbeats (detection time, not
+///   the exact moment of the change)
+/// - server_inferred: inferred by the server from the session lifecycle (first heartbeat, heartbeat gap,
+///   timeout, logout request, late offline batch)
+enum TrackingEventSource {
+  legacy
+  desktop_client
+  server_heartbeat
+  server_inferred
 }
 
 enum BackupType {
@@ -1298,17 +1326,35 @@ model WorkSession {
 }
 
 model TrackingActivityLog {
-  id            Int                  @id @default(autoincrement())
-  user_id       Int
-  session_id    Int
-  activity_type TrackingActivityType
-  timestamp     DateTime             @default(now()) @db.DateTime(3)
+  id               Int                  @id @default(autoincrement())
+  user_id          Int
+  /// The work session the event belongs to; null when no session of that device covers occurred_at
+  /// (e.g. an offline event that arrived late)
+  session_id       Int?
+  activity_type    TrackingActivityType
+  /// When the server stored the row (receive time)
+  timestamp        DateTime             @default(now()) @db.DateTime(3)
+  /// When the event happened (UTC), as reported by its source; never replaced by the receive time
+  occurred_at      DateTime             @db.DateTime(3)
+  /// Idempotency key from the producer (unique per user); server-generated keys start with "srv:"
+  client_event_id  String?              @db.VarChar(100)
+  source           TrackingEventSource  @default(legacy)
+  reason           String?              @db.VarChar(64)
+  device_id        String?              @db.VarChar(255)
+  /// End of the period this event opens, when its producer knows it
+  ended_at         DateTime?            @db.DateTime(3)
+  duration_seconds Int?
+  metadata         Json?
 
-  user    User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
-  session WorkSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  user    User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  session WorkSession? @relation(fields: [session_id], references: [id], onDelete: Cascade)
 
+  @@unique([user_id, client_event_id])
   @@index([user_id, timestamp])
   @@index([session_id, timestamp])
+  @@index([user_id, occurred_at])
+  @@index([session_id, occurred_at])
+  @@index([user_id, device_id, occurred_at])
   @@map("tracking_activity_log")
 }
 

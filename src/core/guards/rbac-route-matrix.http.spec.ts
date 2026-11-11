@@ -198,10 +198,15 @@ const CASES: Record<string, Case[]> = {
     ['get', '/api/v1/tracking/reports/weekly', ['settings'], ['member']],
     ['get', '/api/v1/tracking/reports/monthly', ['settings'], ['member']],
     ['get', '/api/v1/tracking/reports/employee-analytics', ['settings'], ['member']],
+    // Historical timeline: another employee's history is admin-only, also when the caller asks for their own id
+    ['get', '/api/v1/tracking/reports/timeline?user_id=3&date=2026-11-07', ['settings', 'super'], ['member', 'admin', 'client', 'billing', 'deletedClient']],
+    ['get', '/api/v1/tracking/reports/timeline?user_id=2&date=2026-11-07', ['settings'], ['member', 'admin']],
     ['get', '/api/v1/tracking/profiles', ['settings'], ['member', 'admin']],
     ['get', '/api/v1/tracking/profiles/1', ['settings'], ['member']],
     // Self-service tracking used by every signed-in employee stays open
     ['post', '/api/v1/tracking/heartbeat', ['member', 'admin'], []],
+    ['post', '/api/v1/tracking/events', ['member', 'admin', 'settings'], []],
+    ['post', '/api/v1/tracking/logout', ['member', 'admin'], []],
     ['get', '/api/v1/tracking/user-status', ['member'], []],
   ],
 };
