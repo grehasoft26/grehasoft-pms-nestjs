@@ -34,6 +34,9 @@ export const BREAK_STALE_MS = 12 * 60 * 60 * 1000;
 
 export type IntervalKind = 'idle' | 'locked' | 'sleep' | 'offline' | 'break';
 
+/** Periods subtracted from session time for Active Time (with completed manual breaks). Offline is deliberately absent. */
+export const ACTIVE_EXCLUDED_KINDS: readonly IntervalKind[] = ['idle', 'locked', 'sleep'];
+
 const INTERVAL_TYPES: Record<IntervalKind, { open: ClientEventType; close: ClientEventType }> = {
   idle: { open: 'idle_start', close: 'idle_end' },
   locked: { open: 'lock', close: 'unlock' },
@@ -614,7 +617,6 @@ export const buildTrackingTimeline = ({ sessions, events, query, now, employee, 
   const spans = sessionViews.map(spanOf).filter((x): x is Interval => x !== null).map((iv) => clip(iv, rangeIv)).filter((x): x is Interval => x !== null);
   const totals = secondsByKind();
   const breakIntervals = completedBreaks();
-  const nonActive = [...kinds.flatMap((k) => knownIntervals(k)), ...breakIntervals];
   const inRange = (iv: TimelineInterval) => {
     const s = iv.start ? new Date(iv.start).getTime() : null;
     const e = iv.end ? new Date(iv.end).getTime() : null;
@@ -629,7 +631,52 @@ export const buildTrackingTimeline = ({ sessions, events, query, now, employee, 
     return sp ? clip(sp, rangeIv) !== null : v.startMs >= rangeIv.start && v.startMs < rangeIv.end;
   });
   const anyIncompleteSession = sessionsInRange.some((v) => v.status === 'incomplete');
-  const activeReliable = incompleteCount === 0 && !anyIncompleteSession && !truncated;
+
+  // ---- Active Time (the single definition shared by History, Live Tracking and the desktop tracker's Today's Work)
+  // Session time (spans above: ended = start..end, ongoing = start..now, incomplete = start..last heartbeat) minus the
+  // merged idle, locked and sleep periods and completed manual breaks. Offline periods are NOT subtracted: while the
+  // tracker runs offline it keeps measuring, and its queued idle/lock/sleep events still mark inactivity once synced;
+  // time without a running tracker session is outside every span anyway. Unfinished periods are closed conservatively
+  // (never adding activity beyond a known boundary) and make the result an estimate.
+  const unclippedSpanBySession = new Map<number, Interval>();
+  for (const v of sessionViews) {
+    const sp = spanOf(v);
+    if (sp) unclippedSpanBySession.set(v.row.id, sp);
+  }
+  const mergedUnclippedSpans = mergeIntervals(Array.from(unclippedSpanBySession.values()));
+  const spanFor = (t: number, sid: number | null): Interval | null =>
+    (sid !== null ? unclippedSpanBySession.get(sid) : undefined) ?? mergedUnclippedSpans.find((iv) => t >= iv.start && t <= iv.end) ?? null;
+  const inactiveIntervals: Interval[] = intervals
+    .filter((iv) => ACTIVE_EXCLUDED_KINDS.includes(iv.kind))
+    .map((iv): Interval | null => {
+      const s = iv.start ? new Date(iv.start).getTime() : null;
+      const e = iv.end ? new Date(iv.end).getTime() : null;
+      if (s !== null && e !== null) return { start: s, end: e };
+      if (iv.status === 'ongoing' && s !== null) return { start: s, end: nowMs };
+      if (s !== null) {
+        // End unknown: inactive until its session's last known boundary (never counted as activity)
+        const sp = spanFor(s, iv.session_id);
+        return sp && sp.end > s ? { start: s, end: sp.end } : null;
+      }
+      if (e !== null) {
+        // Start unknown: inactive since the previous recorded event of its session, else since the session started
+        const sid = iv.session_id ?? null;
+        let prev: number | null = null;
+        for (const k of kept) {
+          if ((k.row.session_id ?? null) === sid && k.t < e && k.row.id !== iv.end_event_id && (prev === null || k.t > prev)) prev = k.t;
+        }
+        const sp = spanFor(e, sid);
+        const start = Math.max(sp ? sp.start : Number.NEGATIVE_INFINITY, prev ?? Number.NEGATIVE_INFINITY);
+        return Number.isFinite(start) && start < e ? { start, end: e } : null;
+      }
+      return null;
+    })
+    .filter((x): x is Interval => x !== null)
+    .map((iv) => clip(iv, rangeIv))
+    .filter((x): x is Interval => x !== null);
+  const incompleteInactive = intervals.filter((iv) => ACTIVE_EXCLUDED_KINDS.includes(iv.kind) && iv.status === 'incomplete' && inRange(iv)).length;
+  const activeEstimated = truncated || anyIncompleteSession || incompleteInactive > 0;
+  const activeSeconds = subtractSeconds(spans, [...inactiveIntervals, ...breakIntervals]);
 
   const clipTo = (iv: TimelineInterval) => (iv.start && iv.end ? clip({ start: new Date(iv.start).getTime(), end: new Date(iv.end).getTime() }, rangeIv) : null);
   const summary = {
@@ -647,9 +694,15 @@ export const buildTrackingTimeline = ({ sessions, events, query, now, employee, 
     incomplete_break_count: incompleteBreaks,
     /** A break is open right now (shown as "ongoing"; its time is not part of break_seconds yet) */
     break_ongoing: ongoingBreak,
-    /** Session time not covered by idle, locked, sleep or offline periods; null when an interval or session end is unknown */
-    active_seconds: activeReliable ? subtractSeconds(spans, nonActive) : null,
-    active_reliable: activeReliable,
+    /**
+     * Active Time: session time not covered by idle, locked or sleep periods or completed manual breaks (offline time while
+     * the tracker ran counts by its own events). Always a number; see active_estimated.
+     */
+    active_seconds: activeSeconds,
+    /** True when an end or start was unknown (closed conservatively at the last known boundary) or the data was truncated */
+    active_estimated: activeEstimated,
+    /** Kept for older clients: the opposite of active_estimated */
+    active_reliable: !activeEstimated,
     incomplete_interval_count: incompleteCount,
     includes_ongoing: sessionsInRange.some((v) => v.status === 'ongoing') || intervals.some((iv) => iv.kind !== 'break' && iv.status === 'ongoing' && inRange(iv)),
     /** tracked_seconds uses the last heartbeat as the end of sessions whose end was never recorded */

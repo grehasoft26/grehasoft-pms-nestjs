@@ -204,8 +204,9 @@ describe('tracking timeline — building', () => {
     expect(s.duration_seconds).toBe(407); // 11:43:35.966 -> 11:50:22.989
     expect(s).toMatchObject({ idle_seconds: 11, locked_seconds: 20, offline_seconds: 58, status: 'ended', heartbeat_tracked_seconds: 420 });
     expect(t.summary).toMatchObject({ session_count: 1, tracked_seconds: 407, idle_seconds: 11, locked_seconds: 20, offline_seconds: 58 });
-    // Not derivable here: the server's offline_end before the session has no known start (see next test)
-    expect(t.summary.active_seconds).toBeNull();
+    // Active Time: 407.023 s of session minus lock (20.122 s) and idle (11.387 s); the offline period is NOT subtracted (the
+    // tracker kept running), and the server's unmatched offline_end before the session does not make the value an estimate
+    expect(t.summary).toMatchObject({ active_seconds: 375, active_estimated: false, active_reliable: true });
   });
 
   it('marks an unmatched closing event and an unclosed opening of an ended session as incomplete (no duration)', () => {
@@ -215,8 +216,8 @@ describe('tracking timeline — building', () => {
     const unmatched = t.sessions[0].intervals.find((iv) => iv.kind === 'offline' && iv.start === null)!;
     expect(unmatched).toMatchObject({ status: 'incomplete', duration_seconds: null, end: '2026-11-07T11:43:35.991Z' });
     expect(t.summary.incomplete_interval_count).toBe(1);
-    expect(t.summary.active_seconds).toBeNull();
-    expect(t.summary.active_reliable).toBe(false);
+    // An unfinished OFFLINE period does not affect Active Time (offline is not subtracted), so this is not an estimate
+    expect(t.summary).toMatchObject({ active_seconds: 375, active_estimated: false });
 
     nextId = 1;
     const s = session(50, '2026-11-07T04:00:00Z', { logout_time: u('2026-11-07T05:00:00Z'), last_ping: u('2026-11-07T05:00:00Z') });
@@ -224,6 +225,8 @@ describe('tracking timeline — building', () => {
     const lock = t2.sessions[0].events.find((e) => e.type === 'lock')!;
     expect(lock).toMatchObject({ duration_seconds: null, elapsed_seconds: null, interval_status: 'incomplete' });
     expect(t2.summary.locked_seconds).toBe(0);
+    // Active Time closes the unfinished lock conservatively at the session's end (05:00): 30 min active, estimated
+    expect(t2.summary).toMatchObject({ active_seconds: 1800, active_estimated: true, active_reliable: false });
   });
 
   it('never pairs an idle opened in one session with an idle_end of a later session', () => {
@@ -248,7 +251,8 @@ describe('tracking timeline — building', () => {
     const stale = session(80, '2026-11-07T08:00:00Z', { is_active_session: true, last_ping: u('2026-11-07T09:00:00Z') });
     const t = build([stale], [], {}, u('2026-11-07T12:00:00Z'));
     expect(t.sessions[0]).toMatchObject({ status: 'incomplete', duration_seconds: null, has_events: false, start: { source: 'session_record' } });
-    expect(t.summary).toMatchObject({ tracked_seconds: 3600, includes_estimates: true, active_seconds: null });
+    // Never beyond the last heartbeat; a number (not "Not available") flagged as an estimate
+    expect(t.summary).toMatchObject({ tracked_seconds: 3600, includes_estimates: true, active_seconds: 3600, active_estimated: true });
   });
 
   it('splits periods at local midnight and shows each day only its own part', () => {

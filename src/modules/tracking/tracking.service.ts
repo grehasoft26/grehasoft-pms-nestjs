@@ -90,7 +90,22 @@ export const heartbeatTickSeconds = (isIdle: boolean, durationSeconds: number): 
  */
 export type LiveIdleBasis = 'threshold_events' | 'heartbeat_counters';
 
-export type LiveIdleResult = { seconds: number; basis: LiveIdleBasis; ongoing: boolean; incompleteIntervals: number };
+export type LiveIdleResult = {
+  seconds: number;
+  basis: LiveIdleBasis;
+  ongoing: boolean;
+  incompleteIntervals: number;
+  /** Today's Active Time: the History Timeline's summary.active_seconds for the same employee and day */
+  activeSeconds: number;
+  activeEstimated: boolean;
+};
+
+/**
+ * What Live Tracking's (and the desktop tracker's) Active Time is based on:
+ * - 'timeline': the History Timeline's active_seconds for today (buildTrackingTimeline; the single definition);
+ * - 'heartbeat_counters': fallback when tracking events cannot be read; the sum of today's productive_seconds counters.
+ */
+export type ActiveTimeBasis = 'timeline' | 'heartbeat_counters';
 
 /** Timeline rows of one employee, capped exactly like the single-employee History Timeline query. */
 export type TimelineRowsForUser = { sessionRows: any[]; events: any[]; truncated: boolean };
@@ -1343,9 +1358,15 @@ export class TrackingService {
       // Idle time: the History Timeline's threshold-based idle for today (never the per-tick counters, which for
       // sessions that began before the threshold rule still hold old no-input-tick seconds); counters only as a
       // labelled fallback when events cannot be read
-      const liveIdle: LiveIdleResult =
-        liveIdleByUser.get(u.id) ?? { seconds: counterIdleSeconds, basis: 'heartbeat_counters', ongoing: false, incompleteIntervals: 0 };
+      const fromTimeline = liveIdleByUser.get(u.id);
+      const liveIdle: LiveIdleResult = fromTimeline ?? {
+        seconds: counterIdleSeconds, basis: 'heartbeat_counters', ongoing: false, incompleteIntervals: 0,
+        activeSeconds: dailyProductiveSeconds, activeEstimated: true,
+      };
       const dailyIdleSeconds = liveIdle.seconds;
+      // Active Time: the History Timeline's calculation for the same employee and reporting day (same rows, same `now`)
+      const activeBasis: ActiveTimeBasis = fromTimeline ? 'timeline' : 'heartbeat_counters';
+      const activeSecondsToday = Math.max(0, Math.floor(liveIdle.activeSeconds));
 
       if (isLive && activeSession) {
         loginTime = activeSession.login_time.toISOString();
@@ -1420,6 +1441,16 @@ export class TrackingService {
         idle_ongoing: liveIdle.ongoing,
         /** Idle periods today whose end is unknown (not counted, as in the History Timeline) */
         idle_incomplete_count: liveIdle.incompleteIntervals,
+        /** Today's Active Time in seconds: identical to the History Timeline's summary.active_seconds for this employee and day */
+        active_seconds_today: activeSecondsToday,
+        /** active_seconds_today as HH:MM:SS (Live Tracking "Active Time", desktop tracker "Today's Work") */
+        active_time: formatDurationSec(activeSecondsToday),
+        /** 'timeline' (History Timeline calculation) or 'heartbeat_counters' (labelled fallback when events cannot be read) */
+        active_basis: activeBasis,
+        /** Some start or end was unknown and was closed at the last known boundary, or the fallback was used */
+        active_estimated: liveIdle.activeEstimated,
+        /** The instant these values were calculated (UTC ISO); clients extrapolate from here */
+        as_of: now.toISOString(),
         /** The reporting day this summary covers */
         report_date: today.date,
         report_time_zone: REPORTING_TIME_ZONE,
@@ -1748,6 +1779,8 @@ export class TrackingService {
           basis: 'threshold_events',
           ongoing: idleIntervals.some((iv) => iv.status === 'ongoing'),
           incompleteIntervals: idleIntervals.filter((iv) => iv.status === 'incomplete').length,
+          activeSeconds: t.summary.active_seconds,
+          activeEstimated: t.summary.active_estimated,
         });
       } catch (err) {
         this.logger.warn(`Could not calculate live idle time (user ${userId}): ${(err as Error)?.message ?? err}`);
