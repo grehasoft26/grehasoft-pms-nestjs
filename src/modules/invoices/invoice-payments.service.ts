@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
@@ -423,23 +423,7 @@ export class InvoicePaymentsService {
       const paymentDate = dateOnlyOrToday(body.payment_date);
 
       // The expense is validated by the Expenses module's own rules before either record is written
-      let expenseData: any = null;
-      if (expenseInput) {
-        const invoice = await tx.invoice.findUnique({
-          where: { id: invoiceId },
-          select: { client_id: true, client: { select: { deleted_at: true } } },
-        });
-        const clientId = invoice?.client_id && invoice.client && !invoice.client.deleted_at ? invoice.client_id : null;
-        expenseData = await prepareExpenseData(tx, user, {
-          ...expenseInput,
-          expense_date: expenseInput.expense_date || paymentDate.toISOString().slice(0, 10),
-          // Links come from the invoice on the server, never from the request
-          invoice_id: invoiceId,
-          client_id: clientId ?? undefined,
-          // Recorded as an already-paid expense; status is derived by the Expenses rules
-          amount_paid: expenseInput.amount,
-        });
-      }
+      const expenseData = expenseInput ? await this.paymentExpenseData(tx, user, expenseInput, invoiceId, paymentDate) : null;
 
       const createdPayment = await tx.invoicePayment.create({
         data: {
@@ -452,11 +436,53 @@ export class InvoicePaymentsService {
       });
 
       // Same transaction: if this fails, the payment above is rolled back too
-      const createdExpense = expenseData ? await tx.expense.create({ data: expenseData }) : null;
+      const createdExpense = expenseData
+        ? await this.createLinkedExpense(tx, expenseData, createdPayment.id)
+        : null;
       return { payment: createdPayment, expense: createdExpense };
     });
 
-    const result: any = this.formatPayment(payment);
+    return this.withExpenseSummary(this.formatPayment(payment), expense);
+  }
+
+  /**
+   * The expense's data, validated by the shared Expenses rules (prepareExpenseData). The invoice and client links come
+   * from the invoice on the server, never from the request; the expense is recorded as already paid; the expense date
+   * defaults to the payment date.
+   */
+  private async paymentExpenseData(tx: any, user: any, expenseInput: CreateExpenseDto, invoiceId: number, paymentDate: Date) {
+    const invoice = await tx.invoice.findUnique({
+      where: { id: invoiceId },
+      select: { client_id: true, client: { select: { deleted_at: true } } },
+    });
+    const clientId = invoice?.client_id && invoice.client && !invoice.client.deleted_at ? invoice.client_id : null;
+    return prepareExpenseData(tx, user, {
+      ...expenseInput,
+      expense_date: expenseInput.expense_date || paymentDate.toISOString().slice(0, 10),
+      invoice_id: invoiceId,
+      client_id: clientId ?? undefined,
+      amount_paid: expenseInput.amount,
+    });
+  }
+
+  /**
+   * Creates the expense linked to its payment (expenses.invoice_payment_id, unique). A concurrent request that already
+   * linked an expense to the same payment fails on the unique key and is reported as a conflict, so the caller's
+   * transaction rolls back and nothing is reported as recorded.
+   */
+  private async createLinkedExpense(tx: any, data: any, paymentId: number) {
+    try {
+      return await tx.expense.create({ data: { ...data, invoice_payment_id: paymentId } });
+    } catch (err: any) {
+      if (err?.code === 'P2002') throw new ConflictException(InvoicePaymentsService.EXPENSE_ALREADY_RECORDED);
+      throw err;
+    }
+  }
+
+  static readonly EXPENSE_ALREADY_RECORDED =
+    'An expense has already been recorded for this payment. Open it in Expenses to change it.';
+
+  private withExpenseSummary(result: any, expense: any) {
     if (expense) {
       result.expense = { id: expense.id, title: expense.title, amount: Number(expense.amount), expense_date: expense.expense_date };
     }
@@ -518,6 +544,9 @@ export class InvoicePaymentsService {
       throw new ForbiddenException('Clients do not have permission to modify invoice payments.');
     }
 
+    // Optional "Also record an expense": permission and shape checked before anything is read or written
+    const expenseInput = this.paymentExpenseInput(user, body.expense);
+
     const existing = await this.prisma.invoicePayment.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Invoice payment not found');
 
@@ -527,6 +556,36 @@ export class InvoicePaymentsService {
     if (body.notes !== undefined) data.notes = body.notes;
 
     const amountChanged = body.amount !== undefined && toPaise(body.amount) !== toPaise(existing.amount);
+
+    if (expenseInput) {
+      // Payment update + expense in ONE transaction under the invoice row lock; any failure rolls back both.
+      // No outstanding balance is required: a fully paid invoice's payment can still record an expense.
+      const { payment, expense } = await this.prisma.$transaction(async (tx) => {
+        const financials = await this.lockInvoiceFinancials(tx, existing.invoice_id, id);
+        if (amountChanged) {
+          const paymentError = validatePaymentAmount(body.amount, financials.balance_paise);
+          if (paymentError) throw new BadRequestException(paymentError);
+        } else if (body.amount !== undefined && toPaise(body.amount) <= 0) {
+          throw new BadRequestException('Payment amount must be greater than zero.');
+        }
+
+        // One expense per payment: an existing link (even to a deleted expense) is never duplicated or replaced
+        const linked = await tx.expense.findUnique({ where: { invoice_payment_id: id }, select: { id: true } });
+        if (linked) throw new ConflictException(InvoicePaymentsService.EXPENSE_ALREADY_RECORDED);
+
+        const paymentDate = data.payment_date ?? existing.payment_date;
+        const expenseData = await this.paymentExpenseData(tx, user, expenseInput, existing.invoice_id, paymentDate);
+
+        const updatedPayment = await tx.invoicePayment.update({
+          where: { id },
+          data: amountChanged ? { ...data, amount: roundMoney(body.amount) } : data,
+        });
+        const createdExpense = await this.createLinkedExpense(tx, expenseData, id);
+        return { payment: updatedPayment, expense: createdExpense };
+      });
+      return this.withExpenseSummary(this.formatPayment(payment), expense);
+    }
+
     if (!amountChanged) {
       if (body.amount !== undefined && toPaise(body.amount) <= 0) {
         throw new BadRequestException('Payment amount must be greater than zero.');

@@ -139,6 +139,10 @@ export class InvoicesService {
       payment_mode: p.payment_mode || 'cash',
       notes: p.notes || '',
       created_at: p.created_at ? p.created_at.toISOString() : null,
+      // Only when loaded (invoice details for staff): the expense recorded from this payment, if any
+      ...(p.expense !== undefined
+        ? { linked_expense: p.expense ? { id: p.expense.id, title: p.expense.title, deleted: !!p.expense.deleted_at } : null }
+        : {}),
     }));
 
     // Shared paise-based calculation (see invoice-status.ts)
@@ -309,7 +313,11 @@ export class InvoicesService {
       include: {
         client: true,
         items: true,
-        payments: true,
+        // Staff see which payments already have an expense (one per payment); client portal users never do
+        payments:
+          roleName === 'CLIENT'
+            ? true
+            : { include: { expense: { select: { id: true, title: true, deleted_at: true } } } },
       },
     });
 
