@@ -95,6 +95,11 @@ const buildPrisma = () => {
       // Financial dashboard queries payments by date range; none fall in its months here
       findMany: jest.fn().mockResolvedValue([]),
       findUnique: jest.fn(async ({ where }: any) => allPayments().find((p) => p.id === where.id) ?? null),
+      // Payments Received (all time here): the sum of every payment, like Prisma's aggregate
+      aggregate: jest.fn(async () => {
+        const all = INVOICES.flatMap((i) => i.payments);
+        return { _sum: { amount: all.length ? all.reduce((a: any, p: any) => a.plus(p.amount), D(0)) : null } };
+      }),
     },
     client: { findFirst: jest.fn().mockResolvedValue(CLIENT) },
     project: empty,
@@ -103,7 +108,7 @@ const buildPrisma = () => {
     sEOTask: empty,
     taskFile: empty,
     clientNotification: empty,
-    expense: empty,
+    expense: { ...empty, aggregate: jest.fn().mockResolvedValue({ _sum: { amount_paid: null } }) },
     expenseCategory: empty,
   };
 };
@@ -233,7 +238,9 @@ describe('Invoice financials consistency across modules', () => {
     });
     expect(findKey(dashboard, 'total_outstanding_collections')).toBe(analytics.total_balance);
 
-    // Cards reconcile: cash received - excess + outstanding = billed
+    // All Months: every payment received (by any date) plus the legacy advance of invoice 9 (no initial-payment record),
+    // so the cards still reconcile: cash received - excess + outstanding = billed. (A single month does not, by design:
+    // Payments Received is by payment date, revenue and pending by issue date.)
     expect(analytics.total_paid - analytics.total_overpaid + analytics.total_balance).toBeCloseTo(analytics.total_revenue, 2);
   });
 

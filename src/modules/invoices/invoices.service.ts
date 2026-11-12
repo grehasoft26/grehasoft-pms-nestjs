@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
+import { getActiveRolePermissions, isSuperAdmin } from '../../core/utils/role-access.util';
 import {
   INITIAL_PAYMENT_NOTE,
   InvoiceMonthRange,
@@ -12,6 +13,7 @@ import {
   computeInvoiceFinancials,
   dateOnlyOrToday,
   findInitialPaymentId,
+  fromPaise,
   invoiceNumberPrefix,
   matchesInvoiceStatusFilter,
   parseInvoiceMonth,
@@ -567,23 +569,26 @@ export class InvoicesService {
    * For a month:
    * - total_invoices: invoices issued in the month;
    * - total_revenue: sum of their totals (GST included);
-   * - total_paid: paid to date on those invoices (advance + every payment, whenever it was received);
-   * - total_balance: their outstanding balances (overdue and not yet due).
-   * Overpayments are counted in total_paid and reported separately (total_overpaid), never as a negative balance.
-   *
-   * A lightweight query: only the invoice amounts and payment amounts (no client, items or other columns), and the
-   * same per-invoice rules as the invoice list (computeInvoiceFinancials), so the cards equal the sum of the list rows.
+   * - total_paid ("Payments Received"): money RECEIVED in the month, by payment date, whatever the invoice's issue date
+   *   (see paymentsReceivedPaise; legacy advances count on their invoice's issue date);
+   * - total_balance: outstanding balances of the invoices issued in the month (overdue and not yet due).
+   * Invoices, revenue, balance, overpaid and overdue use the same per-invoice rules as the invoice list
+   * (computeInvoiceFinancials). Because Payments Received is by payment date, revenue − received ≠ pending in general.
    */
   async getAnalytics(user: any, query: { month?: string } = {}) {
     const monthRange = this.resolveMonthFilter(query?.month);
     const period = invoicePeriod(monthRange);
 
-    const where: any = {};
+    // Client-portal users only ever see their own invoices and payments
+    let clientScope: number | null = null;
     if (user.role?.name === 'CLIENT') {
       const client = await this.prisma.client.findFirst({ where: { portal_users: { some: { id: user.id } } } });
       // A client account without a client record has no invoices (same as the list)
-      where.client_id = client ? client.id : -1;
+      clientScope = client ? client.id : -1;
     }
+
+    const where: any = {};
+    if (clientScope !== null) where.client_id = clientScope;
     if (monthRange) where.issue_date = { gte: monthRange.from, lt: monthRange.to };
 
     const invoices = await this.prisma.invoice.findMany({
@@ -591,23 +596,109 @@ export class InvoicesService {
       select: { id: true, total: true, advance: true, due_date: true, payments: { select: { amount: true } } },
     });
 
-    // Exact paise-based totals from the same per-invoice figures shown in the table
+    // Exact paise-based totals from the same per-invoice figures shown in the table (issue-date basis)
     const totals = aggregateInvoiceFinancials(
       invoices.map((inv) =>
         computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments, due_date: inv.due_date }),
       ),
     );
 
+    const receivedPaise = await this.paymentsReceivedPaise(monthRange, clientScope);
+
     return {
       total_invoices: totals.invoice_count,
       total_revenue: totals.total_billed,
-      // Paid to date, including any overpayment (reported separately below)
-      total_paid: totals.total_paid,
+      // Payments Received: by payment date (not the issue-date paid-to-date of the invoices above)
+      total_paid: fromPaise(receivedPaise),
       total_balance: totals.total_balance,
       total_overpaid: totals.total_overpaid,
       overdue_count: totals.overdue_count,
       overdue_balance: totals.overdue_balance,
+      // Company cash flow of the same month (or all time), by the date money moved. Null for users who may not see
+      // company expenses (and always for client-portal users).
+      ...(await this.periodCashFlow(user, monthRange, receivedPaise)),
       period,
+    };
+  }
+
+  /**
+   * Payments received in a month (or all time when `monthRange` is null), in paise, for one client or all clients:
+   * - every InvoicePayment, on its own payment_date (partial and multiple payments each in their own month);
+   * - a legacy Invoice.advance (stored without a date), on its invoice's issue_date (Option B) — except when that
+   *   invoice also has the payment recorded at creation (marked INITIAL_PAYMENT_NOTE), which already represents the
+   *   creation-time receipt; then only that dated payment counts, so nothing is counted twice. Amounts are never
+   *   compared to decide this (current code never writes both; see findInitialPaymentId).
+   * Same date-only month boundaries as the other cards; exact paise arithmetic.
+   */
+  private async paymentsReceivedPaise(monthRange: InvoiceMonthRange | null, clientScope: number | null): Promise<number> {
+    const inMonth = monthRange ? { gte: monthRange.from, lt: monthRange.to } : undefined;
+    const paymentWhere: any = {};
+    if (inMonth) paymentWhere.payment_date = inMonth;
+    if (clientScope !== null) paymentWhere.invoice = { client_id: clientScope };
+
+    const advanceWhere: any = { advance: { gt: 0 } };
+    if (inMonth) advanceWhere.issue_date = inMonth;
+    if (clientScope !== null) advanceWhere.client_id = clientScope;
+
+    const [payments, legacy] = await Promise.all([
+      this.prisma.invoicePayment.aggregate({ where: paymentWhere, _sum: { amount: true } }),
+      this.prisma.invoice.findMany({
+        where: advanceWhere,
+        select: {
+          advance: true,
+          payments: { where: { notes: INITIAL_PAYMENT_NOTE }, select: { id: true, notes: true } },
+        },
+      }),
+    ]);
+
+    let advancePaise = 0;
+    for (const inv of legacy || []) {
+      const advance = toPaise(inv.advance as any);
+      if (advance <= 0) continue;
+      const representedByInitialPayment = (inv.payments || []).some((p: any) => p.notes === INITIAL_PAYMENT_NOTE);
+      if (!representedByInitialPayment) advancePaise += advance;
+    }
+    return toPaise(payments?._sum?.amount as any) + advancePaise;
+  }
+
+  /** Permissions that may see company expenses and profit on the invoice summary (same as viewing expenses / reports). */
+  static readonly CASH_FLOW_PERMISSIONS = ['VIEW_EXPENSES', 'MANAGE_EXPENSES', 'VIEW_FINANCIAL_REPORTS'] as const;
+
+  /**
+   * Cash flow of a month (or all time when `monthRange` is null), using the same date-only month boundaries as the cards:
+   * - period_collections: the company's Payments Received (the same figure as total_paid, see paymentsReceivedPaise);
+   * - period_expenses: Expense.amount_paid by expense_date, excluding deleted and rejected expenses (a pending or partly
+   *   paid expense counts only what was actually paid);
+   * - period_profit = collections − expenses (may be negative).
+   * One extra aggregate query; exact paise arithmetic.
+   */
+  private async periodCashFlow(
+    user: any,
+    monthRange: InvoiceMonthRange | null,
+    receivedPaise: number,
+  ): Promise<{ period_collections: number | null; period_expenses: number | null; period_profit: number | null }> {
+    const allowed =
+      user?.role?.name !== 'CLIENT' &&
+      (isSuperAdmin(user) || getActiveRolePermissions(user).some((p) => (InvoicesService.CASH_FLOW_PERMISSIONS as readonly string[]).includes(p)));
+    if (!allowed) return { period_collections: null, period_expenses: null, period_profit: null };
+
+    const inMonth = monthRange ? { gte: monthRange.from, lt: monthRange.to } : undefined;
+    const expenses = await this.prisma.expense.aggregate({
+      where: {
+        deleted_at: null,
+        approval_status: { not: 'rejected' },
+        ...(inMonth ? { expense_date: inMonth } : {}),
+      },
+      _sum: { amount_paid: true },
+    });
+
+    // Non-client users are never client-scoped, so this is the company's Payments Received
+    const collectionsPaise = receivedPaise;
+    const expensesPaise = toPaise(expenses?._sum?.amount_paid as any);
+    return {
+      period_collections: fromPaise(collectionsPaise),
+      period_expenses: fromPaise(expensesPaise),
+      period_profit: fromPaise(collectionsPaise - expensesPaise),
     };
   }
 

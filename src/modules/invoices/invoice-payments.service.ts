@@ -5,6 +5,9 @@ import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
 import { computeInvoiceFinancials, dateOnlyOrToday, roundMoney, toPaise, validatePaymentAmount } from './invoice-status';
+import { EXPENSE_PAYMENT_METHODS, prepareExpenseData } from '../expenses/expense-record';
+import { CreateExpenseDto } from '../expenses/dto/create-expense.dto';
+import { getActiveRolePermissions, isSuperAdmin } from '../../core/utils/role-access.util';
 
 export class ReceiptSigning {
   static generateToken(paymentId: number, secret: string, expiresInSeconds: number = 172800): string {
@@ -408,24 +411,90 @@ export class InvoicePaymentsService {
     const invoiceId = Number(body.invoice || body.invoice_id);
     if (!Number.isInteger(invoiceId) || invoiceId <= 0) throw new NotFoundException('Invoice not found');
 
-    const payment = await this.prisma.$transaction(async (tx) => {
+    // Optional "Also record an expense": permission and shape checked before anything is written
+    const expenseInput = this.paymentExpenseInput(user, body.expense);
+
+    const { payment, expense } = await this.prisma.$transaction(async (tx) => {
       const financials = await this.lockInvoiceFinancials(tx, invoiceId);
       const paymentError = validatePaymentAmount(body.amount, financials.balance_paise);
       if (paymentError) throw new BadRequestException(paymentError);
 
-      return tx.invoicePayment.create({
+      // No payment date: today in Asia/Kolkata (not the server's UTC date)
+      const paymentDate = dateOnlyOrToday(body.payment_date);
+
+      // The expense is validated by the Expenses module's own rules before either record is written
+      let expenseData: any = null;
+      if (expenseInput) {
+        const invoice = await tx.invoice.findUnique({
+          where: { id: invoiceId },
+          select: { client_id: true, client: { select: { deleted_at: true } } },
+        });
+        const clientId = invoice?.client_id && invoice.client && !invoice.client.deleted_at ? invoice.client_id : null;
+        expenseData = await prepareExpenseData(tx, user, {
+          ...expenseInput,
+          expense_date: expenseInput.expense_date || paymentDate.toISOString().slice(0, 10),
+          // Links come from the invoice on the server, never from the request
+          invoice_id: invoiceId,
+          client_id: clientId ?? undefined,
+          // Recorded as an already-paid expense; status is derived by the Expenses rules
+          amount_paid: expenseInput.amount,
+        });
+      }
+
+      const createdPayment = await tx.invoicePayment.create({
         data: {
           invoice_id: invoiceId,
           amount: roundMoney(body.amount),
-          // No payment date: today in Asia/Kolkata (not the server's UTC date)
-          payment_date: dateOnlyOrToday(body.payment_date),
+          payment_date: paymentDate,
           payment_mode: body.payment_mode || 'cash',
           notes: body.notes || '',
         },
       });
+
+      // Same transaction: if this fails, the payment above is rolled back too
+      const createdExpense = expenseData ? await tx.expense.create({ data: expenseData }) : null;
+      return { payment: createdPayment, expense: createdExpense };
     });
 
-    return this.formatPayment(payment);
+    const result: any = this.formatPayment(payment);
+    if (expense) {
+      result.expense = { id: expense.id, title: expense.title, amount: Number(expense.amount), expense_date: expense.expense_date };
+    }
+    return result;
+  }
+
+  /**
+   * The optional `expense` of a new payment ("Also record an expense"), or null when none was requested. Requires
+   * MANAGE_EXPENSES (the same permission as creating an expense directly), whatever invoice permission the caller has.
+   * Only the expense's own fields are taken from the request; links, amount paid and approval are decided on the server.
+   */
+  private paymentExpenseInput(user: any, raw: any): CreateExpenseDto | null {
+    if (raw === undefined || raw === null || raw === false) return null;
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new BadRequestException('Invalid expense details.');
+    }
+    if (!isSuperAdmin(user) && !getActiveRolePermissions(user).includes('MANAGE_EXPENSES')) {
+      throw new ForbiddenException('You do not have permission to record expenses.');
+    }
+
+    const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+    if (!title) throw new BadRequestException('Expense title is required.');
+
+    const paymentMethod = raw.payment_method;
+    if (!(EXPENSE_PAYMENT_METHODS as readonly string[]).includes(paymentMethod)) {
+      throw new BadRequestException(`Expense payment method must be one of: ${EXPENSE_PAYMENT_METHODS.join(', ')}.`);
+    }
+
+    const optionalText = (v: any) => (typeof v === 'string' ? v : undefined);
+    return {
+      title,
+      category_id: raw.category_id,
+      amount: raw.amount,
+      expense_date: optionalText(raw.expense_date) as any,
+      payment_method: paymentMethod,
+      vendor: optionalText(raw.vendor),
+      notes: optionalText(raw.notes),
+    };
   }
 
   /**

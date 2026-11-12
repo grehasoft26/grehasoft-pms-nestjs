@@ -82,6 +82,7 @@ const matches = (row: Row, where: Row = {}): boolean =>
       if ('in' in cond) return (cond.in as any[]).includes(row[key]);
       if ('gte' in cond && !(value >= valueOf(cond.gte))) return false;
       if ('lt' in cond && !(value < valueOf(cond.lt))) return false;
+      if ('gt' in cond && !(Number(value) > Number(valueOf(cond.gt)))) return false;
       return true;
     }
     return value === valueOf(cond);
@@ -104,7 +105,28 @@ describe('Invoices: month filter, current-month summary, Asia/Kolkata date defau
       findFirst: jest.fn(async () => null),
       findUnique: jest.fn(async ({ where }: Row) => rows.find((r) => r.id === where.id) ?? null),
     },
+    // Payments Received: payments by payment_date (optionally one client's invoices), like Prisma's aggregate
+    invoicePayment: {
+      aggregate: jest.fn(async ({ where = {} }: Row = {}) => {
+        const found = rows
+          .filter((r) => !where.invoice || r.client_id === where.invoice.client_id)
+          .flatMap((r) => r.payments)
+          .filter((p: Row) => matches(p, where.payment_date ? { payment_date: where.payment_date } : {}));
+        return { _sum: { amount: found.length ? found.reduce((a: any, p: Row) => a.plus(p.amount), D(0)) : null } };
+      }),
+    },
+    // Expenses: covered by invoices.cash-flow.spec.ts
+    expense: { aggregate: jest.fn(async () => ({ _sum: { amount_paid: null } })) },
   });
+
+  /** Payments received in [from, to) by payment date (+ legacy advances on issue date), straight from the test data. */
+  const receivedIn = (from: string | null, to: string | null, clientId?: number) => {
+    const inRange = (d: Date) => (!from || d >= day(from)) && (!to || d < day(to));
+    const own = ALL.filter((r) => clientId === undefined || r.client_id === clientId);
+    const payments = own.flatMap((r) => r.payments).filter((p) => inRange(p.payment_date)).reduce((a, p) => a + Number(p.amount) * 100, 0);
+    const advances = own.filter((r) => Number(r.advance) > 0 && inRange(r.issue_date)).reduce((a, r) => a + Number(r.advance) * 100, 0);
+    return Math.round(payments + advances) / 100;
+  };
 
   const compile = async (extraProviders: any[] = []) => {
     prisma = makePrisma();
@@ -247,13 +269,15 @@ describe('Invoices: month filter, current-month summary, Asia/Kolkata date defau
       overpaid: Math.round(rows.reduce((a, r) => a + r.overpaid_amount * 100, 0)) / 100,
     });
 
-    it('November: counts, revenue (GST included), paid to date (any payment date), pending, and the period', async () => {
+    it('November: counts, revenue (GST included), payments RECEIVED in November, pending, and the period', async () => {
       const a: any = await service.getAnalytics(admin, { month: '2026-11' });
-      // revenue 1000 + 2000 + 1500 + 800 + 1200 + 0; paid 1000 + (500 + 500, the second received in December) + 0 + 1000 + (200 advance + 300) + 0
+      // revenue 1000 + 2000 + 1500 + 800 + 1200 + 0 (issue date);
+      // received in November (payment date): 1000 (2 Nov) + 500 (12 Nov) + 1000 (26 Nov) + 300 (30 Nov) + 200 legacy advance
+      // (invoice issued 30 Nov) = 3000; the 500 of NOV-PARTIAL received on 5 Dec is December's
       expect(a).toMatchObject({
         total_invoices: 6,
         total_revenue: 6500,
-        total_paid: 3500,
+        total_paid: 3000,
         total_balance: 3200, // 0 (paid) + 1000 (partial) + 1500 (unpaid) + 0 (overpaid) + 700 (advance + payment) + 0 (zero total)
         total_overpaid: 200,
         overdue_count: 1,
@@ -262,13 +286,26 @@ describe('Invoices: month filter, current-month summary, Asia/Kolkata date defau
       });
     });
 
-    it('equals the sum of the invoice rows the list shows for the same month', async () => {
+    it('invoices, revenue, pending and overpaid equal the list rows (issue date); payments received follow the payment date', async () => {
+      const next: Record<string, string> = { '2026-10': '2026-11-01', '2026-11': '2026-12-01', '2026-12': '2027-01-01', '2027-01': '2027-02-01', '2028-02': '2028-03-01' };
       for (const month of ['2026-10', '2026-11', '2026-12', '2027-01', '2028-02']) {
         const rows = (await service.findAll(admin, { month, limit: '100' }) as any).results;
         const sums = sumRows(rows);
         const a: any = await service.getAnalytics(admin, { month });
-        expect([a.total_invoices, a.total_revenue, a.total_paid, a.total_balance, a.total_overpaid]).toEqual([sums.invoices, sums.revenue, sums.paid, sums.balance, sums.overpaid]);
+        expect([a.total_invoices, a.total_revenue, a.total_balance, a.total_overpaid]).toEqual([sums.invoices, sums.revenue, sums.balance, sums.overpaid]);
+        expect(a.total_paid).toBe(receivedIn(`${month}-01`, next[month]));
       }
+    });
+
+    it('payments received: a payment counts in the month it was received, not the invoice month', async () => {
+      // NOV-PARTIAL (issued 10 Nov): 500 on 12 Nov and 500 on 5 Dec
+      expect((await service.getAnalytics(admin, { month: '2026-11' }) as any).total_paid).toBe(3000);
+      // December: 500 (NOV-PARTIAL) + 5000 (1 Dec)
+      expect((await service.getAnalytics(admin, { month: '2026-12' }) as any).total_paid).toBe(5500);
+      // October: 1000 received on 31 Oct (last day); the 1 Nov invoice's payment (2 Nov) is November's
+      expect((await service.getAnalytics(admin, { month: '2026-10' }) as any).total_paid).toBe(1000);
+      // Months with invoices but no receipts
+      expect((await service.getAnalytics(admin, { month: '2027-01' }) as any).total_paid).toBe(0);
     });
 
     it('partial payment, a payment received in a later month, overpayment and a zero-total invoice, one by one', async () => {
@@ -278,21 +315,24 @@ describe('Invoices: month filter, current-month summary, Asia/Kolkata date defau
         );
         return service.getAnalytics(admin, { month: '2026-11' }) as any;
       };
-      // Partial: 1000 of 2000 paid, of which 500 in December -> still counted as paid to date for November's invoice
-      expect(await only('NOV-PARTIAL')).toMatchObject({ total_invoices: 1, total_revenue: 2000, total_paid: 1000, total_balance: 1000, overdue_count: 0 });
+      // (Issue-date cards per invoice; Payments Received is checked by payment date above.)
+      // Partial: 1000 of 2000 paid (500 of it in December) -> 1000 pending on November's invoice
+      expect(await only('NOV-PARTIAL')).toMatchObject({ total_invoices: 1, total_revenue: 2000, total_balance: 1000, overdue_count: 0 });
       // Overdue: unpaid and past due
-      expect(await only('NOV-OVERDUE')).toMatchObject({ total_revenue: 1500, total_paid: 0, total_balance: 1500, overdue_count: 1, overdue_balance: 1500 });
-      // Overpayment: paid counts the cash, pending is never negative
-      expect(await only('NOV-OVERPAID')).toMatchObject({ total_revenue: 800, total_paid: 1000, total_balance: 0, total_overpaid: 200 });
+      expect(await only('NOV-OVERDUE')).toMatchObject({ total_revenue: 1500, total_balance: 1500, overdue_count: 1, overdue_balance: 1500 });
+      // Overpayment: pending is never negative; the excess is reported as overpaid
+      expect(await only('NOV-OVERPAID')).toMatchObject({ total_revenue: 800, total_balance: 0, total_overpaid: 200 });
       // Zero total: counted, no revenue, nothing pending
-      expect(await only('NOV-ZERO')).toMatchObject({ total_invoices: 1, total_revenue: 0, total_paid: 0, total_balance: 0 });
-      // Legacy advance column + a payment
-      expect(await only('NOV-ADVANCE')).toMatchObject({ total_revenue: 1200, total_paid: 500, total_balance: 700 });
+      expect(await only('NOV-ZERO')).toMatchObject({ total_invoices: 1, total_revenue: 0, total_balance: 0 });
+      // Legacy advance column + a payment: pending still counts both (per-invoice rules unchanged)
+      expect(await only('NOV-ADVANCE')).toMatchObject({ total_revenue: 1200, total_balance: 700 });
     });
 
     it('an empty month is all zeros with its period', async () => {
       expect(await service.getAnalytics(admin, { month: '2026-05' })).toEqual({
         total_invoices: 0, total_revenue: 0, total_paid: 0, total_balance: 0, total_overpaid: 0, overdue_count: 0, overdue_balance: 0,
+        // Cash flow of the month (no payments or expenses here)
+        period_collections: 0, period_expenses: 0, period_profit: 0,
         period: { type: 'month', month: '2026-05', from: '2026-05-01', to: '2026-05-31' },
       });
     });
@@ -303,14 +343,19 @@ describe('Invoices: month filter, current-month summary, Asia/Kolkata date defau
       const sums = sumRows(rows);
       expect([a.total_invoices, a.total_revenue, a.total_paid, a.total_balance, a.total_overpaid]).toEqual([sums.invoices, sums.revenue, sums.paid, sums.balance, sums.overpaid]);
       expect(a.total_invoices).toBe(ALL.length);
-      expect(Object.keys(a).sort()).toEqual(['overdue_balance', 'overdue_count', 'period', 'total_balance', 'total_invoices', 'total_overpaid', 'total_paid', 'total_revenue']);
+      // Every earlier field is kept; the cash-flow fields are added alongside
+      expect(Object.keys(a).sort()).toEqual([
+        'overdue_balance', 'overdue_count', 'period', 'period_collections', 'period_expenses', 'period_profit',
+        'total_balance', 'total_invoices', 'total_overpaid', 'total_paid', 'total_revenue',
+      ]);
       expect(a.period).toEqual({ type: 'all', month: null, from: null, to: null });
       expect((await service.getAnalytics(admin, undefined as any)).period.type).toBe('all');
     });
 
     it('is a lightweight query: amounts and payment amounts only, no client or items; and the month is applied in the database', async () => {
       await service.getAnalytics(admin, { month: '2026-11' });
-      const args = prisma.invoice.findMany.mock.calls.at(-1)![0];
+      // The card query (the other invoice query only reads legacy advances)
+      const args = prisma.invoice.findMany.mock.calls.map((c: any[]) => c[0]).find((a: Row) => a.select?.total)!;
       expect(args.include).toBeUndefined();
       expect(args.select).toEqual({ id: true, total: true, advance: true, due_date: true, payments: { select: { amount: true } } });
       expect(args.where.issue_date).toEqual({ gte: day('2026-11-01'), lt: day('2026-12-01') });
@@ -325,6 +370,14 @@ describe('Invoices: month filter, current-month summary, Asia/Kolkata date defau
       const a: any = await service.getAnalytics({ id: 9, role: { name: 'CLIENT' } }, { month: '2026-11' });
       expect(prisma.invoice.findMany.mock.calls.at(-1)![0].where.client_id).toBe(1);
       expect(a.total_invoices).toBe(4); // Acme's November invoices: 2, 3, 4, 6
+      // Payments Received: only Acme's receipts (1000 + 500 + 300 + 200 advance), not Birch's 1000 on 26 Nov
+      expect(a.total_paid).toBe(2000);
+      expect(a.total_paid).toBe(receivedIn('2026-11-01', '2026-12-01', 1));
+      // Both payment queries are restricted to the client
+      expect(prisma.invoicePayment.aggregate.mock.calls.at(-1)![0].where.invoice).toEqual({ client_id: 1 });
+      expect(prisma.invoice.findMany.mock.calls.every((c: any[]) => c[0].where.client_id === 1)).toBe(true);
+      // No company cash flow for clients
+      expect(a).toMatchObject({ period_collections: null, period_expenses: null, period_profit: null });
     });
   });
 

@@ -53,6 +53,16 @@ const build = async (rows: any[]) => {
         return select ? found.map((r) => Object.fromEntries(Object.keys(select).map((k) => [k, r[k]]))) : found;
       }),
     },
+    // Payments Received: payments by payment_date, like Prisma's aggregate
+    invoicePayment: {
+      aggregate: jest.fn(async ({ where = {} }: any = {}) => {
+        const found = rows.flatMap((r) => r.payments).filter((p: any) =>
+          !where.payment_date || (valueOf(p.payment_date) >= valueOf(where.payment_date.gte) && valueOf(p.payment_date) < valueOf(where.payment_date.lt)));
+        return { _sum: { amount: found.length ? found.reduce((a: any, p: any) => a.plus(p.amount), D(0)) : null } };
+      }),
+    },
+    // Expenses: not part of these card-list agreement checks
+    expense: { aggregate: jest.fn().mockResolvedValue({ _sum: { amount_paid: null } }) },
   };
   const module: TestingModule = await Test.createTestingModule({
     providers: [
@@ -68,6 +78,10 @@ const build = async (rows: any[]) => {
 
 const admin = { id: 1, role: { name: 'SUPER_ADMIN' } };
 const paise = (n: number) => Math.round(n * 100);
+
+/** Payments received in a "YYYY-MM" month (by payment date), from the test data; these datasets have no legacy advances. */
+const receivedPaiseIn = (rows: any[], month: string) =>
+  rows.flatMap((r) => r.payments).filter((p: any) => p.payment_date.toISOString().slice(0, 7) === month).reduce((a: number, p: any) => a + paise(Number(p.amount)), 0);
 
 /** Every row of every page of the month (10 per page, as the dashboard requests). */
 const allPages = async (service: InvoicesService, month: string) => {
@@ -123,7 +137,7 @@ describe('Invoice dashboard: cards and list always describe the same month', () 
   for (const [name, rows] of [['reported data', REPORTED], ['busy data (edges, pages, partial / later / over payments)', BUSY]] as const) {
     describe(name, () => {
       for (const month of MONTHS) {
-        it(`${month}: same period, count = invoices, cards = sums of all list rows, rows inside the month`, async () => {
+        it(`${month}: same period, count = invoices, issue-date cards = sums of all list rows, payments received by date, rows inside the month`, async () => {
           const service = await build(rows as any[]);
           const { first, rows: listRows } = await allPages(service, month);
           const cards: any = await service.getAnalytics(admin, { month });
@@ -133,13 +147,15 @@ describe('Invoice dashboard: cards and list always describe the same month', () 
           expect(first.count).toBe(listRows.length);
           expect(cards.total_invoices).toBe(first.count);
           expect(paise(cards.total_revenue)).toBe(listRows.reduce((a, r) => a + paise(r.total), 0));
-          expect(paise(cards.total_paid)).toBe(listRows.reduce((a, r) => a + paise(r.total_paid), 0));
+          // Payments Received: money received in the month (payment date), not the list rows' paid-to-date
+          expect(paise(cards.total_paid)).toBe(receivedPaiseIn(rows as any[], month));
           expect(paise(cards.total_balance)).toBe(listRows.reduce((a, r) => a + paise(r.balance), 0));
           for (const r of listRows) {
             expect(r.issue_date >= first.period.from && r.issue_date <= first.period.to).toBe(true);
           }
           if (listRows.length === 0) {
-            expect(cards).toMatchObject({ total_invoices: 0, total_revenue: 0, total_paid: 0, total_balance: 0 });
+            // No invoices issued: zero issue-date cards (payments may still have been received for older invoices)
+            expect(cards).toMatchObject({ total_invoices: 0, total_revenue: 0, total_balance: 0 });
           }
         });
       }
@@ -168,5 +184,19 @@ describe('Invoice dashboard: cards and list always describe the same month', () 
     expect(cards.total_invoices).toBe(list.count);
     expect(list.count).toBe(BUSY.length);
     expect(paise(cards.total_revenue)).toBe(list.results.reduce((a: number, r: any) => a + paise(r.total), 0));
+    // All time: every payment received equals the list's paid-to-date total (no legacy advances here)
+    expect(paise(cards.total_paid)).toBe(list.results.reduce((a: number, r: any) => a + paise(r.total_paid), 0));
+  });
+
+  it('busy data: a later-month payment moves Payments Received to the month it was received', async () => {
+    const service = await build(BUSY);
+    // Invoice 3 (issued 1 Oct): 500.25 on 5 Oct and 1000.00 on 3 Nov; invoice 2 (issued 30 Sep) paid on 2 Oct
+    const oct: any = await service.getAnalytics(admin, { month: '2026-10' });
+    const nov: any = await service.getAnalytics(admin, { month: '2026-11' });
+    const sep: any = await service.getAnalytics(admin, { month: '2026-09' });
+    expect(paise(oct.total_paid)).toBe(paise(1000 + 500.25 + 900)); // 2 Oct, 5 Oct, 31 Oct
+    expect(nov.total_paid).toBe(1000); // received 3 Nov for the October invoice
+    expect(sep.total_paid).toBe(0); // the 30 Sep invoice was paid in October
+    expect(sep.total_revenue).toBe(1000); // revenue stays on the issue date
   });
 });
