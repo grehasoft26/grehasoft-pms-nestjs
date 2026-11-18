@@ -126,8 +126,8 @@ export const credentialPermissionsIn = (permissions: unknown): string[] =>
 export const INVOICE_READ_PERMISSIONS = ['MANAGE_INVOICES', 'VIEW_INVOICES', 'VIEW_LEADS'] as const;
 export const INVOICE_WRITE_PERMISSIONS = ['MANAGE_INVOICES'] as const;
 
-/** Invoice templates and their services: read with VIEW_INVOICES or MANAGE_INVOICES; writes need MANAGE_INVOICES. */
-export const INVOICE_TEMPLATE_READ_PERMISSIONS = ['VIEW_INVOICES', 'MANAGE_INVOICES'] as const;
+/** Invoice templates and their services: every read and write needs MANAGE_INVOICES (no read-only alternative). */
+export const INVOICE_TEMPLATE_PERMISSION = 'MANAGE_INVOICES';
 
 export const BUILT_IN_ROLE_NAMES = [
   'SUPER_ADMIN',

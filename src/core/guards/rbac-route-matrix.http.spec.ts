@@ -181,12 +181,12 @@ const CASES: Record<string, Case[]> = {
     ['get', '/api/v1/invoice-payments/1/secure-link', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
     ['post', '/api/v1/invoice-payments/1/send_email', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
   ],
-  // Invoice templates and their services: reads need VIEW_INVOICES or MANAGE_INVOICES; every write MANAGE_INVOICES.
-  // VIEW_LEADS (invoice read-only) and MANAGE_SETTINGS (the old frontend route key) grant nothing here.
-  'invoice templates and services: reads VIEW_INVOICES or MANAGE_INVOICES, writes MANAGE_INVOICES': [
-    ['get', '/api/v1/invoice-templates', ['billing', 'invoiceManager', 'admin', 'super'], ['leadsViewer', 'settings', 'member', 'client', 'finance']],
-    ['get', '/api/v1/invoice-templates/1', ['billing', 'invoiceManager', 'admin'], ['leadsViewer', 'settings', 'member', 'client']],
-    ['get', '/api/v1/invoice-templates/1/services', ['billing', 'invoiceManager', 'admin'], ['leadsViewer', 'settings', 'member', 'client']],
+  // Invoice templates and their services: every route, reads included, needs MANAGE_INVOICES. VIEW_INVOICES
+  // (e.g. ACCOUNTANT) and VIEW_LEADS keep invoice read access only; MANAGE_SETTINGS grants nothing here.
+  'invoice templates and services: every route needs MANAGE_INVOICES': [
+    ['get', '/api/v1/invoice-templates', ['invoiceManager', 'admin', 'super'], ['billing', 'leadsViewer', 'settings', 'member', 'client', 'finance']],
+    ['get', '/api/v1/invoice-templates/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
+    ['get', '/api/v1/invoice-templates/1/services', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
     ['post', '/api/v1/invoice-templates', ['invoiceManager', 'admin', 'super'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
     ['patch', '/api/v1/invoice-templates/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
     ['delete', '/api/v1/invoice-templates/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],

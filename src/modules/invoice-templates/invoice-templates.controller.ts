@@ -14,37 +14,39 @@ import { InvoiceTemplatesService } from './invoice-templates.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
-import { INVOICE_TEMPLATE_READ_PERMISSIONS } from '../../core/utils/permission-catalog';
+import { INVOICE_TEMPLATE_PERMISSION } from '../../core/utils/permission-catalog';
 import { CreateInvoiceTemplateDto } from './dto/create-invoice-template.dto';
 import { UpdateInvoiceTemplateDto } from './dto/update-invoice-template.dto';
 import { CreateInvoiceServiceDto } from './dto/create-invoice-service.dto';
 import { UpdateInvoiceServiceDto } from './dto/update-invoice-service.dto';
 
+// Invoice templates and services: every route (reads included) needs MANAGE_INVOICES; VIEW_INVOICES and
+// VIEW_LEADS give invoice read access only, never template access.
 @Controller('api/v1')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 export class InvoiceTemplatesController {
   constructor(private readonly invoiceTemplatesService: InvoiceTemplatesService) {}
 
   @Get('invoice-templates')
-  @Permissions(...INVOICE_TEMPLATE_READ_PERMISSIONS)
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async findAll(@Query() query: { search?: string; all?: string; activeOnly?: string }) {
     return this.invoiceTemplatesService.findAll(query);
   }
 
   @Get('invoice-templates/:id')
-  @Permissions(...INVOICE_TEMPLATE_READ_PERMISSIONS)
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async findOne(@Param('id', ParseIntPipe) id: number) {
     return this.invoiceTemplatesService.findOne(id);
   }
 
   @Post('invoice-templates')
-  @Permissions('MANAGE_INVOICES')
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async create(@Body() createDto: CreateInvoiceTemplateDto) {
     return this.invoiceTemplatesService.create(createDto);
   }
 
   @Patch('invoice-templates/:id')
-  @Permissions('MANAGE_INVOICES')
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async update(
     @Param('id', ParseIntPipe) id: number,
     @Body() updateDto: UpdateInvoiceTemplateDto,
@@ -53,7 +55,7 @@ export class InvoiceTemplatesController {
   }
 
   @Delete('invoice-templates/:id')
-  @Permissions('MANAGE_INVOICES')
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async remove(@Param('id', ParseIntPipe) id: number) {
     return this.invoiceTemplatesService.remove(id);
   }
@@ -63,7 +65,7 @@ export class InvoiceTemplatesController {
   // ==========================================
 
   @Get('invoice-templates/:templateId/services')
-  @Permissions(...INVOICE_TEMPLATE_READ_PERMISSIONS)
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async findServicesByTemplate(
     @Param('templateId', ParseIntPipe) templateId: number,
     @Query('activeOnly') activeOnly?: string,
@@ -72,7 +74,7 @@ export class InvoiceTemplatesController {
   }
 
   @Post('invoice-templates/:templateId/services')
-  @Permissions('MANAGE_INVOICES')
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async createService(
     @Param('templateId', ParseIntPipe) templateId: number,
     @Body() createDto: CreateInvoiceServiceDto,
@@ -81,7 +83,7 @@ export class InvoiceTemplatesController {
   }
 
   @Patch('invoice-services/:id')
-  @Permissions('MANAGE_INVOICES')
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async updateService(
     @Param('id', ParseIntPipe) id: number,
     @Body() updateDto: UpdateInvoiceServiceDto,
@@ -90,7 +92,7 @@ export class InvoiceTemplatesController {
   }
 
   @Delete('invoice-services/:id')
-  @Permissions('MANAGE_INVOICES')
+  @Permissions(INVOICE_TEMPLATE_PERMISSION)
   async removeService(@Param('id', ParseIntPipe) id: number) {
     return this.invoiceTemplatesService.removeService(id);
   }
