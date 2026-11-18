@@ -1,8 +1,30 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
-import { aggregateInvoiceFinancials, computeInvoiceFinancials, dateOnlyKey, fiscalYearLabel, fromPaise, toPaise } from '../invoices/invoice-status';
-import { LEGACY_ADVANCE_SELECT, countedLegacyAdvancePaise, legacyAdvanceWhere } from '../invoices/legacy-advance';
+import { aggregateInvoiceFinancials, computeInvoiceFinancials, fiscalYearLabel } from '../invoices/invoice-status';
+import {
+  LEGACY_ADVANCE_SELECT,
+  PaiseEntry,
+  bucketKey,
+  currentMonthKey,
+  dateRange,
+  eligibleExpenseWhere,
+  expensePaise,
+  fyRange,
+  groupPaise,
+  legacyAdvanceEntries,
+  legacyAdvanceInvoiceWhere,
+  monthRange,
+  paymentEntries,
+  paymentWhere,
+  rangeBounds,
+  revenueEntries,
+  revenueInvoiceWhere,
+  sumExpenses,
+  sumPaise,
+  toRupees,
+} from './financial-metrics';
+import { countedLegacyAdvancePaise } from '../invoices/legacy-advance';
 
 @Injectable()
 export class FinancialReportsService {
@@ -184,66 +206,89 @@ export class FinancialReportsService {
   // 2. MONTHLY INCOME & EXPENSE STATEMENT
   // -------------------------------------------------------------
   async getIncomeExpenseStatement(query: { start_date?: string; end_date?: string }) {
-    const now = new Date();
-    const startDate = query.start_date
-      ? new Date(`${query.start_date}T00:00:00.000Z`)
-      : new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0));
-    const endDate = query.end_date
-      ? new Date(`${query.end_date}T23:59:59.999Z`)
-      : new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999));
+    // start_date and end_date stay inclusive for API consumers; internally [start, end + 1 day). Missing or invalid
+    // dates fall back to the current month in Asia/Kolkata (previously the server clock; invalid values caused errors).
+    const range =
+      (query.start_date && query.end_date ? dateRange(query.start_date, query.end_date) : null) ??
+      monthRange(currentMonthKey())!;
 
-    const payments = await this.prisma.invoicePayment.findMany({
-      where: { payment_date: { gte: startDate, lte: endDate } },
-      include: { invoice: { include: { client: true } } },
-      orderBy: { payment_date: 'desc' },
-    });
+    // Shared rules (financial-metrics.ts), the same as the Financial Year Summary
+    const [invoices, payments, legacyAdvanceInvoices, expenses] = await Promise.all([
+      this.prisma.invoice.findMany({ where: revenueInvoiceWhere(range), select: { total: true, issue_date: true } }),
+      this.prisma.invoicePayment.findMany({
+        where: paymentWhere(range),
+        include: { invoice: { include: { client: true } } },
+        orderBy: { payment_date: 'desc' },
+      }),
+      this.prisma.invoice.findMany({
+        where: legacyAdvanceInvoiceWhere(range),
+        select: { ...LEGACY_ADVANCE_SELECT, id: true, invoice_number: true, client: { select: { name: true } } },
+      }),
+      this.prisma.expense.findMany({ where: eligibleExpenseWhere(range), include: { category: true }, orderBy: { expense_date: 'desc' } }),
+    ]);
 
-    const collections = payments.map((p) => ({
+    // Itemised collections: every payment row, plus one row per counted legacy advance (dated on the invoice issue date;
+    // never when an initial-payment row already represents it). entry_type tells them apart; the rows sum exactly to
+    // total_collections.
+    const paymentRows = payments.map((p) => ({
       id: p.id,
+      entry_type: 'payment' as const,
       receipt_number: p.receipt_number || `REC-${p.id}`,
       date: p.payment_date.toISOString().split('T')[0],
       client_name: p.invoice?.client?.name || 'Client',
       invoice_number: p.invoice?.invoice_number || 'INV',
-      payment_mode: p.payment_mode,
-      amount: Number(p.amount),
+      payment_mode: p.payment_mode as string,
+      amount: toRupees(paymentEntries([p])[0].paise),
+      _paise: paymentEntries([p])[0].paise,
     }));
+    const advanceRows = (legacyAdvanceInvoices as any[])
+      .map((inv) => ({ inv, paise: countedLegacyAdvancePaise(inv) }))
+      .filter((x) => x.paise > 0)
+      .map(({ inv, paise }) => ({
+        id: inv.id,
+        entry_type: 'legacy_advance' as const,
+        receipt_number: `Advance on ${inv.invoice_number}`,
+        date: (inv.issue_date as Date).toISOString().split('T')[0],
+        client_name: inv.client?.name || 'Client',
+        invoice_number: inv.invoice_number,
+        payment_mode: 'advance',
+        amount: toRupees(paise),
+        _paise: paise,
+      }));
+    const collectionRows = [...paymentRows, ...advanceRows].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    const collectionsPaise = collectionRows.reduce((acc, r) => acc + r._paise, 0);
+    const collections = collectionRows.map(({ _paise, ...row }) => row);
 
-    const totalCollections = collections.reduce((acc, c) => acc + c.amount, 0);
-
-    const expenses = await this.prisma.expense.findMany({
-      where: { deleted_at: null, expense_date: { gte: startDate, lte: endDate } },
-      include: { category: true },
-      orderBy: { expense_date: 'desc' },
+    // Eligible expenses only (not deleted, not rejected); pending is computed, not the stored outstanding_amount
+    const formattedExpenses = expenses.map((e) => {
+      const x = expensePaise(e);
+      return {
+        id: e.id,
+        title: e.title,
+        date: e.expense_date.toISOString().split('T')[0],
+        category_name: e.category?.name || 'Uncategorized',
+        vendor: e.vendor || '',
+        payment_method: e.payment_method,
+        amount: toRupees(x.billed),
+        amount_paid: toRupees(x.paid),
+        // Same field as before, now computed as max(amount − amount_paid, 0)
+        outstanding_amount: toRupees(x.pending),
+      };
     });
-
-    const formattedExpenses = expenses.map((e) => ({
-      id: e.id,
-      title: e.title,
-      date: e.expense_date.toISOString().split('T')[0],
-      category_name: e.category?.name || 'Uncategorized',
-      vendor: e.vendor || '',
-      payment_method: e.payment_method,
-      amount: Number(e.amount),
-      amount_paid: Number(e.amount_paid),
-      outstanding_amount: Number(e.outstanding_amount),
-    }));
-
-    const totalExpensesPaid = formattedExpenses.reduce((acc, e) => acc + e.amount_paid, 0);
-    const totalExpensesBilled = formattedExpenses.reduce((acc, e) => acc + e.amount, 0);
-    const netCashFlow = totalCollections - totalExpensesPaid;
+    const expenseTotals = sumExpenses(expenses);
+    const revenuePaise = sumPaise(revenueEntries(invoices));
 
     return {
-      period: {
-        start_date: startDate.toISOString().split('T')[0],
-        end_date: endDate.toISOString().split('T')[0],
-      },
+      period: rangeBounds(range),
       collections,
       expenses: formattedExpenses,
       summary: {
-        total_collections: Math.round(totalCollections * 100) / 100,
-        total_expenses_billed: Math.round(totalExpensesBilled * 100) / 100,
-        total_expenses_paid: Math.round(totalExpensesPaid * 100) / 100,
-        net_cash_flow: Math.round(netCashFlow * 100) / 100,
+        total_invoice_revenue: toRupees(revenuePaise),
+        total_collections: toRupees(collectionsPaise),
+        total_expenses_billed: toRupees(expenseTotals.billed),
+        total_expenses_paid: toRupees(expenseTotals.paid),
+        total_pending_expenses: toRupees(expenseTotals.pending),
+        net_cash_flow: toRupees(collectionsPaise - expenseTotals.paid),
       },
       disclaimer: 'This is a cash-flow collection & business expense statement. It is not an audited statutory Profit and Loss Statement.',
     };
@@ -452,54 +497,41 @@ export class FinancialReportsService {
     const fyInfo = this.getFinancialYearDates(query.fy);
     const { startDate, endDate, label, startYear } = fyInfo;
 
-    // Date-only FY range: 1 April (included) to the next 1 April (excluded), as stored in @db.Date columns
-    const inFy = { gte: startDate, lt: new Date(Date.UTC(startYear + 1, 3, 1)) };
-
-    // Revenue: invoices.total (GST included, after discount) by issue date. Collections: payments by payment date plus
-    // legacy advances on the issue date (shared rule, same as the Invoices summary). Expenses: amount_paid by expense
-    // date, excluding deleted and rejected expenses (the schema has no expense payment dates).
+    // Shared rules (financial-metrics.ts): date-only FY range [1 Apr, next 1 Apr); revenue by issue date; collections
+    // by payment date plus legacy advances on the issue date; eligible expenses (not deleted, not rejected) by expense date
+    const inFy = fyRange(startYear);
     const [invoices, payments, legacyAdvances, expenses] = await Promise.all([
-      this.prisma.invoice.findMany({ where: { issue_date: inFy }, select: { total: true, issue_date: true } }),
-      this.prisma.invoicePayment.findMany({ where: { payment_date: inFy }, select: { amount: true, payment_date: true } }),
-      this.prisma.invoice.findMany({ where: legacyAdvanceWhere(inFy), select: LEGACY_ADVANCE_SELECT }),
-      this.prisma.expense.findMany({
-        where: { deleted_at: null, approval_status: { not: 'rejected' }, expense_date: inFy },
-        select: { amount: true, amount_paid: true, expense_date: true },
-      }),
+      this.prisma.invoice.findMany({ where: revenueInvoiceWhere(inFy), select: { total: true, issue_date: true } }),
+      this.prisma.invoicePayment.findMany({ where: paymentWhere(inFy), select: { amount: true, payment_date: true } }),
+      this.prisma.invoice.findMany({ where: legacyAdvanceInvoiceWhere(inFy), select: LEGACY_ADVANCE_SELECT }),
+      this.prisma.expense.findMany({ where: eligibleExpenseWhere(inFy), select: { amount: true, amount_paid: true, expense_date: true } }),
     ]);
 
-    // Quarters by calendar month of the date-only value: Q1 Apr-Jun, Q2 Jul-Sep, Q3 Oct-Dec, Q4 Jan-Mar
+    // Quarters: Q1 Apr-Jun, Q2 Jul-Sep, Q3 Oct-Dec, Q4 Jan-Mar (bucketKey 'quarter')
+    const QUARTERS = ['Q1', 'Q2', 'Q3', 'Q4'];
     const QUARTER_NAMES = ['Q1 (Apr-Jun)', 'Q2 (Jul-Sep)', 'Q3 (Oct-Dec)', 'Q4 (Jan-Mar)'];
-    const quarterOf = (date: Date | string): number => {
-      const month = Number((dateOnlyKey(date) || '').slice(5, 7));
-      return month >= 4 ? Math.floor((month - 4) / 3) : 3;
-    };
-    const q = QUARTER_NAMES.map(() => ({ revenue: 0, collections: 0, paid: 0, billed: 0, pending: 0 }));
+    const byQuarter = (entries: PaiseEntry[]) => groupPaise(entries, QUARTERS, (d) => bucketKey(d, 'quarter'));
+    const expenseEntries = (pick: 'paid' | 'billed' | 'pending') =>
+      expenses.map((e) => ({ date: e.expense_date, paise: expensePaise(e)[pick] }));
 
-    for (const inv of invoices) q[quarterOf(inv.issue_date)].revenue += toPaise(inv.total as any);
-    for (const p of payments) q[quarterOf(p.payment_date)].collections += toPaise(p.amount as any);
-    for (const inv of legacyAdvances) q[quarterOf((inv as any).issue_date)].collections += countedLegacyAdvancePaise(inv as any);
-    for (const e of expenses) {
-      const amount = toPaise(e.amount as any);
-      const paid = toPaise(e.amount_paid as any);
-      const bucket = q[quarterOf(e.expense_date)];
-      bucket.paid += paid;
-      bucket.billed += amount;
-      bucket.pending += Math.max(0, amount - paid);
-    }
+    const revenue = byQuarter(revenueEntries(invoices));
+    const collections = byQuarter([...paymentEntries(payments), ...legacyAdvanceEntries(legacyAdvances as any)]);
+    const paid = byQuarter(expenseEntries('paid'));
+    const billed = byQuarter(expenseEntries('billed'));
+    const pending = byQuarter(expenseEntries('pending'));
 
-    const quarterlyData = q.map((b, i) => ({
+    const quarterlyData = QUARTERS.map((k, i) => ({
       quarter: QUARTER_NAMES[i],
-      invoice_revenue: fromPaise(b.revenue),
-      collections: fromPaise(b.collections),
-      expenses_paid: fromPaise(b.paid),
-      net_cash_flow: fromPaise(b.collections - b.paid),
+      invoice_revenue: toRupees(revenue.get(k)!),
+      collections: toRupees(collections.get(k)!),
+      expenses_paid: toRupees(paid.get(k)!),
+      net_cash_flow: toRupees(collections.get(k)! - paid.get(k)!),
     }));
 
     // Annual totals are the sums of the quarterly paise, so they always reconcile exactly
-    const sum = (key: 'revenue' | 'collections' | 'paid' | 'billed' | 'pending') => q.reduce((acc, b) => acc + b[key], 0);
-    const collectionsPaise = sum('collections');
-    const paidPaise = sum('paid');
+    const total = (m: Map<string, number>) => [...m.values()].reduce((a, b) => a + b, 0);
+    const collectionsPaise = total(collections);
+    const paidPaise = total(paid);
 
     return {
       financial_year: label,
@@ -508,13 +540,13 @@ export class FinancialReportsService {
         end_date: endDate.toISOString().split('T')[0],
       },
       summary: {
-        total_invoice_revenue: fromPaise(sum('revenue')),
-        total_collections: fromPaise(collectionsPaise),
+        total_invoice_revenue: toRupees(total(revenue)),
+        total_collections: toRupees(collectionsPaise),
         // Kept for compatibility (no longer a headline card): rejected expenses excluded, like Expenses Paid
-        total_expenses_billed: fromPaise(sum('billed')),
-        total_expenses_paid: fromPaise(paidPaise),
-        total_pending_expenses: fromPaise(sum('pending')),
-        net_cash_flow: fromPaise(collectionsPaise - paidPaise),
+        total_expenses_billed: toRupees(total(billed)),
+        total_expenses_paid: toRupees(paidPaise),
+        total_pending_expenses: toRupees(total(pending)),
+        net_cash_flow: toRupees(collectionsPaise - paidPaise),
       },
       quarterly_breakdown: quarterlyData,
       disclaimer: 'Financial Year Summary uses the Indian Fiscal Calendar (April 1 to March 31). This summary displays cash flow collections and expenses, not an audited P&L statement.',
