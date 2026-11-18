@@ -101,11 +101,6 @@ export const isKnownPermission = (value: string): value is KnownPermission => KN
 export const ROLE_MANAGEMENT_PERMISSION = 'MANAGE_ROLES';
 
 /**
- * Invoice and invoice-payment access (Phase 2.2). Previously these APIs required only login.
- * VIEW_LEADS is included because the frontend Finance > Invoices menu is gated on it, so users
- * who could reach invoices through the UI keep access. Tightening this is a pending decision.
- */
-/**
  * Credential Vault permissions. Only super admins may grant or revoke them: through role
  * create/update (RolesService) and through user role assignment (UsersService).
  */
@@ -121,8 +116,18 @@ export const credentialPermissionsIn = (permissions: unknown): string[] =>
     ? [...new Set(permissions.filter((p): p is string => typeof p === 'string').map((p) => p.toUpperCase()).filter(isCredentialPermission))]
     : [];
 
+/**
+ * Invoice and invoice-payment access.
+ * - Read (list, details, PDF/receipt download, analytics): MANAGE_INVOICES, VIEW_INVOICES or VIEW_LEADS.
+ *   VIEW_LEADS keeps read-only access (decided; previously the Invoices menu was gated on it).
+ * - Write (create, edit, delete, preview, email, payments, secure links): MANAGE_INVOICES only.
+ *   VIEW_LEADS no longer grants any invoice write.
+ */
 export const INVOICE_READ_PERMISSIONS = ['MANAGE_INVOICES', 'VIEW_INVOICES', 'VIEW_LEADS'] as const;
-export const INVOICE_WRITE_PERMISSIONS = ['MANAGE_INVOICES', 'VIEW_LEADS'] as const;
+export const INVOICE_WRITE_PERMISSIONS = ['MANAGE_INVOICES'] as const;
+
+/** Invoice templates and their services: read with VIEW_INVOICES or MANAGE_INVOICES; writes need MANAGE_INVOICES. */
+export const INVOICE_TEMPLATE_READ_PERMISSIONS = ['VIEW_INVOICES', 'MANAGE_INVOICES'] as const;
 
 export const BUILT_IN_ROLE_NAMES = [
   'SUPER_ADMIN',

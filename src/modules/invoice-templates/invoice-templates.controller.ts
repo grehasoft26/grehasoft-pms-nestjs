@@ -14,6 +14,7 @@ import { InvoiceTemplatesService } from './invoice-templates.service';
 import { JwtAuthGuard } from '../../core/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../core/guards/permissions.guard';
 import { Permissions } from '../../core/decorators/permissions.decorator';
+import { INVOICE_TEMPLATE_READ_PERMISSIONS } from '../../core/utils/permission-catalog';
 import { CreateInvoiceTemplateDto } from './dto/create-invoice-template.dto';
 import { UpdateInvoiceTemplateDto } from './dto/update-invoice-template.dto';
 import { CreateInvoiceServiceDto } from './dto/create-invoice-service.dto';
@@ -25,13 +26,13 @@ export class InvoiceTemplatesController {
   constructor(private readonly invoiceTemplatesService: InvoiceTemplatesService) {}
 
   @Get('invoice-templates')
-  @Permissions('VIEW_INVOICES')
+  @Permissions(...INVOICE_TEMPLATE_READ_PERMISSIONS)
   async findAll(@Query() query: { search?: string; all?: string; activeOnly?: string }) {
     return this.invoiceTemplatesService.findAll(query);
   }
 
   @Get('invoice-templates/:id')
-  @Permissions('VIEW_INVOICES')
+  @Permissions(...INVOICE_TEMPLATE_READ_PERMISSIONS)
   async findOne(@Param('id', ParseIntPipe) id: number) {
     return this.invoiceTemplatesService.findOne(id);
   }
@@ -62,7 +63,7 @@ export class InvoiceTemplatesController {
   // ==========================================
 
   @Get('invoice-templates/:templateId/services')
-  @Permissions('VIEW_INVOICES')
+  @Permissions(...INVOICE_TEMPLATE_READ_PERMISSIONS)
   async findServicesByTemplate(
     @Param('templateId', ParseIntPipe) templateId: number,
     @Query('activeOnly') activeOnly?: string,

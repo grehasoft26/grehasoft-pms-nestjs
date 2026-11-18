@@ -10,6 +10,7 @@ import { LeadsController } from '../../modules/crm/leads.controller';
 import { ServersController, DomainsController, CredentialsController } from '../../modules/infrastructure/infrastructure.controller';
 import { InvoicesController } from '../../modules/invoices/invoices.controller';
 import { InvoicePaymentsController } from '../../modules/invoices/invoice-payments.controller';
+import { InvoiceTemplatesController } from '../../modules/invoice-templates/invoice-templates.controller';
 import { TrackingController, TrackingProfilesController } from '../../modules/tracking/tracking.controller';
 import { ReportsController } from '../../modules/reports/reports.controller';
 import { FinancialReportsController } from '../../modules/financial-reports/financial-reports.controller';
@@ -42,6 +43,8 @@ const USERS: Record<string, any> = {
   billing: { id: 7, is_superuser: false, role: role('BILLING_VIEWER', ['VIEW_INVOICES']) },
   finance: { id: 8, is_superuser: false, role: role('FINANCE', ['VIEW_FINANCIAL_REPORTS']) },
   leadsViewer: { id: 9, is_superuser: false, role: role('LEADS_VIEWER', ['VIEW_LEADS']) },
+  // MANAGE_INVOICES alone (no VIEW_INVOICES): every invoice/template write, and template reads
+  invoiceManager: { id: 13, is_superuser: false, role: role('INVOICE_MANAGER', ['MANAGE_INVOICES']) },
   // Mirrors seeded SEO_EXECUTIVE (VIEW_REMINDERS only) and SEO_MANAGER (both)
   remindersViewer: { id: 11, is_superuser: false, role: role('REMINDERS_VIEWER', ['VIEW_REMINDERS']) },
   remindersManager: { id: 12, is_superuser: false, role: role('REMINDERS_MANAGER', ['MANAGE_REMINDERS']) },
@@ -154,26 +157,42 @@ const CASES: Record<string, Case[]> = {
     ['get', '/api/v1/infrastructure/domains/1/renewal-preview', ['ops', 'super'], ['member', 'admin', 'client']],
     ['get', '/api/v1/infrastructure/servers/1/renewal-preview?period_value=1&period_unit=month', ['ops', 'super'], ['member', 'admin', 'client']],
   ],
-  'invoices and payments require invoice permissions': [
-    ['get', '/api/v1/invoices', ['admin', 'billing', 'leadsViewer', 'client'], ['member', 'finance']],
-    ['get', '/api/v1/invoices/1', ['admin', 'billing', 'client'], ['member']],
-    ['get', '/api/v1/invoices/next-number', ['admin', 'billing'], ['member', 'client']],
-    ['get', '/api/v1/invoices/analytics', ['admin', 'billing'], ['member', 'client']],
-    ['post', '/api/v1/invoices', ['admin', 'leadsViewer'], ['member', 'client', 'billing']],
-    ['put', '/api/v1/invoices/1', ['admin'], ['member', 'client', 'billing']],
-    ['patch', '/api/v1/invoices/1', ['admin'], ['member', 'client']],
-    ['delete', '/api/v1/invoices/1', ['admin'], ['member', 'client', 'billing']],
-    ['get', '/api/v1/invoices/1/secure-link', ['admin'], ['member', 'client', 'billing']],
-    ['post', '/api/v1/invoices/1/send_email', ['admin'], ['member', 'client']],
-    ['post', '/api/v1/invoices/preview', [], ['member', 'client', 'billing']],
-    ['get', '/api/v1/invoices/1/download', [], ['member']],
-    ['get', '/api/v1/invoice-payments', ['admin', 'billing'], ['member', 'client']],
-    ['get', '/api/v1/invoice-payments/1', ['admin', 'billing'], ['member', 'client']],
-    ['post', '/api/v1/invoice-payments', ['admin'], ['member', 'client', 'billing']],
-    ['patch', '/api/v1/invoice-payments/1', ['admin'], ['member', 'client']],
-    ['delete', '/api/v1/invoice-payments/1', ['admin'], ['member', 'client']],
-    ['get', '/api/v1/invoice-payments/1/secure-link', ['admin'], ['member', 'client', 'billing']],
-    ['get', '/api/v1/invoice-payments/1/receipt', [], ['member', 'client']],
+  // Release 1: reads accept MANAGE_INVOICES, VIEW_INVOICES or VIEW_LEADS; every write (create, edit, delete,
+  // preview, email, payments, secure links) needs MANAGE_INVOICES only. VIEW_LEADS is read-only.
+  'invoices and payments: reads open to invoice readers, writes need MANAGE_INVOICES': [
+    ['get', '/api/v1/invoices', ['admin', 'billing', 'leadsViewer', 'invoiceManager', 'client'], ['member', 'finance']],
+    ['get', '/api/v1/invoices/1', ['admin', 'billing', 'leadsViewer', 'invoiceManager', 'client'], ['member']],
+    ['get', '/api/v1/invoices/next-number', ['admin', 'billing', 'leadsViewer'], ['member', 'client']],
+    ['get', '/api/v1/invoices/analytics', ['admin', 'billing', 'leadsViewer'], ['member', 'client']],
+    ['get', '/api/v1/invoices/1/download', ['billing', 'leadsViewer'], ['member']],
+    ['post', '/api/v1/invoices', ['admin', 'invoiceManager', 'super'], ['member', 'client', 'billing', 'leadsViewer', 'finance']],
+    ['put', '/api/v1/invoices/1', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['patch', '/api/v1/invoices/1', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['delete', '/api/v1/invoices/1', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['get', '/api/v1/invoices/1/secure-link', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['post', '/api/v1/invoices/1/send_email', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['post', '/api/v1/invoices/preview', ['invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['get', '/api/v1/invoice-payments', ['admin', 'billing', 'leadsViewer'], ['member', 'client']],
+    ['get', '/api/v1/invoice-payments/1', ['admin', 'billing', 'leadsViewer'], ['member', 'client']],
+    ['get', '/api/v1/invoice-payments/1/receipt', ['billing', 'leadsViewer'], ['member', 'client']],
+    ['post', '/api/v1/invoice-payments', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['patch', '/api/v1/invoice-payments/1', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['delete', '/api/v1/invoice-payments/1', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['get', '/api/v1/invoice-payments/1/secure-link', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+    ['post', '/api/v1/invoice-payments/1/send_email', ['admin', 'invoiceManager'], ['member', 'client', 'billing', 'leadsViewer']],
+  ],
+  // Invoice templates and their services: reads need VIEW_INVOICES or MANAGE_INVOICES; every write MANAGE_INVOICES.
+  // VIEW_LEADS (invoice read-only) and MANAGE_SETTINGS (the old frontend route key) grant nothing here.
+  'invoice templates and services: reads VIEW_INVOICES or MANAGE_INVOICES, writes MANAGE_INVOICES': [
+    ['get', '/api/v1/invoice-templates', ['billing', 'invoiceManager', 'admin', 'super'], ['leadsViewer', 'settings', 'member', 'client', 'finance']],
+    ['get', '/api/v1/invoice-templates/1', ['billing', 'invoiceManager', 'admin'], ['leadsViewer', 'settings', 'member', 'client']],
+    ['get', '/api/v1/invoice-templates/1/services', ['billing', 'invoiceManager', 'admin'], ['leadsViewer', 'settings', 'member', 'client']],
+    ['post', '/api/v1/invoice-templates', ['invoiceManager', 'admin', 'super'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
+    ['patch', '/api/v1/invoice-templates/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
+    ['delete', '/api/v1/invoice-templates/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
+    ['post', '/api/v1/invoice-templates/1/services', ['invoiceManager', 'admin', 'super'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
+    ['patch', '/api/v1/invoice-services/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
+    ['delete', '/api/v1/invoice-services/1', ['invoiceManager', 'admin'], ['billing', 'leadsViewer', 'settings', 'member', 'client']],
   ],
   // Reminders are personal (scoped to the caller in the service); every route needs
   // VIEW_REMINDERS or MANAGE_REMINDERS, like the Reminders page and menu
@@ -230,7 +249,7 @@ describe('RBAC route matrix (HTTP, Phase 2.2)', () => {
         ServersController, DomainsController, CredentialsController, InvoicesController, InvoicePaymentsController,
         TrackingController, TrackingProfilesController, ReportsController, FinancialReportsController, SeoReportsController,
         ClientPortalController, MilestonesController, TaskFilesController, TaskReviewsController, InfrastructureSummaryController,
-        RemindersController, DashboardSummaryController,
+        RemindersController, DashboardSummaryController, InvoiceTemplatesController,
       ],
     })
       .useMocker(() => autoMock())
