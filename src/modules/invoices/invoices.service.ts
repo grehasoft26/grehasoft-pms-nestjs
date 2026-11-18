@@ -5,6 +5,7 @@ import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { MailerService } from '../../core/mailer.service';
 import { getActiveRolePermissions, isSuperAdmin } from '../../core/utils/role-access.util';
+import { LEGACY_ADVANCE_SELECT, countedLegacyAdvancePaise, legacyAdvanceWhere } from './legacy-advance';
 import {
   INITIAL_PAYMENT_NOTE,
   InvoiceMonthRange,
@@ -644,28 +645,14 @@ export class InvoicesService {
     if (inMonth) paymentWhere.payment_date = inMonth;
     if (clientScope !== null) paymentWhere.invoice = { client_id: clientScope };
 
-    const advanceWhere: any = { advance: { gt: 0 } };
-    if (inMonth) advanceWhere.issue_date = inMonth;
-    if (clientScope !== null) advanceWhere.client_id = clientScope;
-
+    // Legacy advances: the shared rule (legacy-advance.ts), also used by the Financial Year Summary
     const [payments, legacy] = await Promise.all([
       this.prisma.invoicePayment.aggregate({ where: paymentWhere, _sum: { amount: true } }),
-      this.prisma.invoice.findMany({
-        where: advanceWhere,
-        select: {
-          advance: true,
-          payments: { where: { notes: INITIAL_PAYMENT_NOTE }, select: { id: true, notes: true } },
-        },
-      }),
+      this.prisma.invoice.findMany({ where: legacyAdvanceWhere(inMonth, clientScope), select: LEGACY_ADVANCE_SELECT }),
     ]);
 
     let advancePaise = 0;
-    for (const inv of legacy || []) {
-      const advance = toPaise(inv.advance as any);
-      if (advance <= 0) continue;
-      const representedByInitialPayment = (inv.payments || []).some((p: any) => p.notes === INITIAL_PAYMENT_NOTE);
-      if (!representedByInitialPayment) advancePaise += advance;
-    }
+    for (const inv of legacy || []) advancePaise += countedLegacyAdvancePaise(inv as any);
     return toPaise(payments?._sum?.amount as any) + advancePaise;
   }
 
