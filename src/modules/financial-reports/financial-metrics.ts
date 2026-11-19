@@ -55,6 +55,23 @@ export const monthRange = (month: unknown): DateRange | null => {
 /** Current month "YYYY-MM" in Asia/Kolkata (not the server clock). */
 export const currentMonthKey = (now: Date = new Date()): string => businessDateKey(now).slice(0, 7);
 
+/** The calendar month before a valid "YYYY-MM" (January → December of the previous year). Null if the key is invalid. */
+export const previousMonthKey = (month: unknown): string | null => {
+  const range = monthRange(month);
+  if (!range) return null;
+  const prev = new Date(Date.UTC(range.gte.getUTCFullYear(), range.gte.getUTCMonth() - 1, 1));
+  return `${prev.getUTCFullYear()}-${String(prev.getUTCMonth() + 1).padStart(2, '0')}`;
+};
+
+/**
+ * Percentage change from `basePaise` to `newPaise`, rounded to one decimal, from exact integer paise:
+ * round((new − base) × 1000 / base) / 10. Null when the base is zero or negative (no meaningful percentage).
+ */
+export const percentChange = (basePaise: number, newPaise: number): number | null => {
+  if (basePaise <= 0) return null;
+  return Math.round(((newPaise - basePaise) * 1000) / basePaise) / 10;
+};
+
 /** Inclusive "YYYY-MM-DD" bounds of a range, for API output. */
 export const rangeBounds = (range: DateRange): { start_date: string; end_date: string } => ({
   start_date: range.gte.toISOString().slice(0, 10),

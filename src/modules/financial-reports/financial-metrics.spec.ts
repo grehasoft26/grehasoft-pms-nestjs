@@ -14,6 +14,8 @@ import {
   monthRange,
   paymentEntries,
   parseDay,
+  percentChange,
+  previousMonthKey,
   rangeBounds,
   revenueEntries,
   sumExpenses,
@@ -99,5 +101,23 @@ describe('financial-metrics: amounts', () => {
     expect(toRupees(collections)).toBe(0.3);
     expect(sumPaise(revenueEntries([{ total: D('1100.00'), issue_date: day('2026-04-01') }]))).toBe(110000);
     expect(toRupees(collections - 4000)).toBe(-39.7);
+  });
+});
+
+describe('financial-metrics: month comparison helpers', () => {
+  it('previousMonthKey: preceding calendar month; January → previous December; invalid → null', () => {
+    expect(previousMonthKey('2026-11')).toBe('2026-10');
+    expect(previousMonthKey('2027-01')).toBe('2026-12');
+    expect(previousMonthKey('2026-04')).toBe('2026-03');
+    for (const bad of ['2026-13', '2026-1', 'abc', '', null]) expect(previousMonthKey(bad)).toBeNull();
+  });
+
+  it('percentChange: exact paise, one decimal; null for a zero or negative base', () => {
+    expect(percentChange(100000, 150000)).toBe(50);
+    expect(percentChange(30000, 10000)).toBe(-66.7);
+    expect(percentChange(3, 4)).toBe(33.3);
+    expect(percentChange(100000, 100000)).toBe(0);
+    expect(percentChange(0, 5000)).toBeNull();
+    expect(percentChange(-5000, 5000)).toBeNull();
   });
 });

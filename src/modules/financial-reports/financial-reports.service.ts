@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { aggregateInvoiceFinancials, computeInvoiceFinancials, fiscalYearLabel } from '../invoices/invoice-status';
 import {
   LEGACY_ADVANCE_SELECT,
+  DateRange,
   PaiseEntry,
   bucketKey,
   currentMonthKey,
@@ -17,6 +18,8 @@ import {
   monthRange,
   paymentEntries,
   paymentWhere,
+  percentChange,
+  previousMonthKey,
   rangeBounds,
   revenueEntries,
   revenueInvoiceWhere,
@@ -297,60 +300,69 @@ export class FinancialReportsService {
   // -------------------------------------------------------------
   // 3. MONTH-OVER-MONTH COMPARISON REPORT
   // -------------------------------------------------------------
-  async getMonthComparisonReport(query: { month1?: string; month2?: string }) {
-    const now = new Date();
-    const currYear = now.getFullYear();
-    const currMonthStr = `${currYear}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    
-    let prevDate = new Date(Date.UTC(currYear, now.getMonth() - 1, 1));
-    const prevMonthStr = `${prevDate.getUTCFullYear()}-${String(prevDate.getUTCMonth() + 1).padStart(2, '0')}`;
-
-    const m1 = query.month1 || prevMonthStr;
-    const m2 = query.month2 || currMonthStr;
-
-    const getMonthData = async (mStr: string) => {
-      const [year, month] = mStr.split('-').map(Number);
-      const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
-      const end = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
-
-      const payments = await this.prisma.invoicePayment.findMany({
-        where: { payment_date: { gte: start, lte: end } },
-      });
-      const collections = payments.reduce((acc, p) => acc + Number(p.amount || 0), 0);
-
-      const expenses = await this.prisma.expense.findMany({
-        where: { deleted_at: null, expense_date: { gte: start, lte: end } },
-      });
-      const expensesPaid = expenses.reduce((acc, e) => acc + Number(e.amount_paid || 0), 0);
-      const expensesTotal = expenses.reduce((acc, e) => acc + Number(e.amount || 0), 0);
-      const cashFlow = collections - expensesPaid;
-
-      return {
-        month: mStr,
-        collections: Math.round(collections * 100) / 100,
-        expenses_paid: Math.round(expensesPaid * 100) / 100,
-        expenses_total: Math.round(expensesTotal * 100) / 100,
-        net_cash_flow: Math.round(cashFlow * 100) / 100,
-        expense_count: expenses.length,
-      };
-    };
-
-    const data1 = await getMonthData(m1);
-    const data2 = await getMonthData(m2);
-
-    const collectionsDiff = data2.collections - data1.collections;
-    const expensesDiff = data2.expenses_paid - data1.expenses_paid;
-    const cashFlowDiff = data2.net_cash_flow - data1.net_cash_flow;
-
+  /**
+   * Paise totals of one period on the shared rules (financial-metrics.ts): revenue by issue date; collections by payment
+   * date plus counted legacy advances on the issue date; eligible expenses (not deleted, not rejected) by expense date.
+   * Four minimal-field queries in parallel; no per-row queries.
+   */
+  private async loadPeriodFigures(range: DateRange) {
+    const [invoices, payments, legacyAdvances, expenses] = await Promise.all([
+      this.prisma.invoice.findMany({ where: revenueInvoiceWhere(range), select: { total: true, issue_date: true } }),
+      this.prisma.invoicePayment.findMany({ where: paymentWhere(range), select: { amount: true, payment_date: true } }),
+      this.prisma.invoice.findMany({ where: legacyAdvanceInvoiceWhere(range), select: LEGACY_ADVANCE_SELECT }),
+      this.prisma.expense.findMany({ where: eligibleExpenseWhere(range), select: { amount: true, amount_paid: true } }),
+    ]);
+    const expenseTotals = sumExpenses(expenses);
     return {
-      month1: data1,
-      month2: data2,
+      revenue: sumPaise(revenueEntries(invoices)),
+      collections: sumPaise([...paymentEntries(payments), ...legacyAdvanceEntries(legacyAdvances as any)]),
+      paid: expenseTotals.paid,
+      billed: expenseTotals.billed,
+      pending: expenseTotals.pending,
+      expenseCount: expenses.length,
+    };
+  }
+
+  async getMonthComparisonReport(query: { month1?: string; month2?: string }) {
+    // Strict "YYYY-MM" (400 otherwise); missing or empty values default to the previous and current month in
+    // Asia/Kolkata. Either order is allowed: the changes are always month2 − month1.
+    const pick = (value: unknown, field: string, fallback: string): string => {
+      if (value === undefined || value === null || value === '') return fallback;
+      if (!monthRange(value)) throw new BadRequestException(`${field} must be a valid month in YYYY-MM format.`);
+      return value as string;
+    };
+    const currentMonth = currentMonthKey();
+    const m2 = pick(query.month2, 'month2', currentMonth);
+    const m1 = pick(query.month1, 'month1', previousMonthKey(currentMonth)!);
+
+    // One load per distinct month, in parallel; the same month twice is loaded once
+    const f1Promise = this.loadPeriodFigures(monthRange(m1)!);
+    const [f1, f2] = await Promise.all([f1Promise, m1 === m2 ? f1Promise : this.loadPeriodFigures(monthRange(m2)!)]);
+
+    const monthData = (month: string, f: Awaited<typeof f1Promise>) => ({
+      month,
+      invoice_revenue: toRupees(f.revenue),
+      collections: toRupees(f.collections),
+      expenses_paid: toRupees(f.paid),
+      // Existing field: billed expenses (eligible only)
+      expenses_total: toRupees(f.billed),
+      pending_expenses: toRupees(f.pending),
+      net_cash_flow: toRupees(f.collections - f.paid),
+      expense_count: f.expenseCount,
+    });
+
+    // Differences in paise; percentages null when the month1 value is zero or negative
+    return {
+      month1: monthData(m1, f1),
+      month2: monthData(m2, f2),
       changes: {
-        collections_diff: Math.round(collectionsDiff * 100) / 100,
-        collections_percentage: data1.collections > 0 ? Math.round((collectionsDiff / data1.collections) * 1000) / 10 : 0,
-        expenses_diff: Math.round(expensesDiff * 100) / 100,
-        expenses_percentage: data1.expenses_paid > 0 ? Math.round((expensesDiff / data1.expenses_paid) * 1000) / 10 : 0,
-        cash_flow_diff: Math.round(cashFlowDiff * 100) / 100,
+        revenue_diff: toRupees(f2.revenue - f1.revenue),
+        revenue_percentage: percentChange(f1.revenue, f2.revenue),
+        collections_diff: toRupees(f2.collections - f1.collections),
+        collections_percentage: percentChange(f1.collections, f2.collections),
+        expenses_diff: toRupees(f2.paid - f1.paid),
+        expenses_percentage: percentChange(f1.paid, f2.paid),
+        cash_flow_diff: toRupees((f2.collections - f2.paid) - (f1.collections - f1.paid)),
       },
     };
   }
