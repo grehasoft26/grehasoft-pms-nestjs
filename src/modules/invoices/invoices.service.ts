@@ -123,7 +123,8 @@ export class InvoicesService {
     return `${prefix}/001`;
   }
 
-  private formatInvoice(i: any) {
+  /** `withPaymentExpenses`: staff invoice details (payments loaded with their linked expense) include payment_expenses_total. */
+  private formatInvoice(i: any, options: { withPaymentExpenses?: boolean } = {}) {
     if (!i) return null;
 
     const subtotal = i.subtotal ? Number(i.subtotal) : 0;
@@ -142,9 +143,30 @@ export class InvoicesService {
       created_at: p.created_at ? p.created_at.toISOString() : null,
       // Only when loaded (invoice details for staff): the expense recorded from this payment, if any
       ...(p.expense !== undefined
-        ? { linked_expense: p.expense ? { id: p.expense.id, title: p.expense.title, deleted: !!p.expense.deleted_at } : null }
+        ? {
+            linked_expense: p.expense
+              ? {
+                  id: p.expense.id,
+                  title: p.expense.title,
+                  deleted: !!p.expense.deleted_at,
+                  amount: p.expense.amount !== undefined && p.expense.amount !== null ? Number(p.expense.amount) : undefined,
+                  rejected: p.expense.approval_status === 'rejected',
+                }
+              : null,
+          }
         : {}),
     }));
+
+    // Expenses recorded with this invoice's payments (expenses.invoice_payment_id; one per payment), only when they
+    // were loaded (staff invoice details; never for client portal users): not deleted, not rejected, amount > 0,
+    // summed in paise. Shown separately: it never changes Total, Paid or Balance.
+    const expensesLoaded = (i.payments || []).some((p: any) => p.expense !== undefined);
+    const paymentExpensesPaise = (i.payments || []).reduce((sum: number, p: any) => {
+      const e = p.expense;
+      if (!e || e.deleted_at || e.approval_status === 'rejected') return sum;
+      const paise = toPaise(e.amount);
+      return paise > 0 ? sum + paise : sum;
+    }, 0);
 
     // Shared paise-based calculation (see invoice-status.ts)
     const financials = computeInvoiceFinancials({
@@ -189,6 +211,7 @@ export class InvoicesService {
       payment_status: financials.payment_status,
       is_overdue: financials.is_overdue,
       overpaid_amount: financials.overpaid_amount,
+      ...(options.withPaymentExpenses || expensesLoaded ? { payment_expenses_total: fromPaise(paymentExpensesPaise) } : {}),
       initial_payment_id: findInitialPaymentId(i),
       notes: i.notes || '',
       created_at: i.created_at ? i.created_at.toISOString() : null,
@@ -318,7 +341,7 @@ export class InvoicesService {
         payments:
           roleName === 'CLIENT'
             ? true
-            : { include: { expense: { select: { id: true, title: true, deleted_at: true } } } },
+            : { include: { expense: { select: { id: true, title: true, amount: true, approval_status: true, deleted_at: true } } } },
       },
     });
 
@@ -333,7 +356,8 @@ export class InvoicesService {
       }
     }
 
-    return this.formatInvoice(invoice);
+    // Staff only: payment_expenses_total (client portal users never receive it)
+    return this.formatInvoice(invoice, { withPaymentExpenses: roleName !== 'CLIENT' });
   }
 
   async create(user: any, body: any) {
