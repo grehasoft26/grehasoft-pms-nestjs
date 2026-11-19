@@ -43,17 +43,25 @@ describe('FinancialReportsService', () => {
   });
 
   it('should calculate dashboard data cleanly', async () => {
-    mockPrismaService.invoicePayment.findMany.mockResolvedValue([
-      { amount: 50000, payment_date: new Date() },
-    ]);
-    mockPrismaService.expense.findMany.mockResolvedValue([
-      { amount: 20000, amount_paid: 20000, outstanding_amount: 0, expense_date: new Date() },
-    ]);
+    // Fixed clock (mid-month in Asia/Kolkata) and fixed dates in that month: "this month" never depends on when the
+    // test runs (with new Date(), 00:00–05:29 IST on the 1st would put the rows in the previous month)
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    jest.setSystemTime(new Date('2026-11-19T06:00:00.000Z'));
+    try {
+      mockPrismaService.invoicePayment.findMany.mockResolvedValue([
+        { amount: 50000, payment_date: new Date('2026-11-10T00:00:00.000Z') },
+      ]);
+      mockPrismaService.expense.findMany.mockResolvedValue([
+        { amount: 20000, amount_paid: 20000, outstanding_amount: 0, expense_date: new Date('2026-11-12T00:00:00.000Z') },
+      ]);
 
-    const result = await service.getDashboardData({ id: 1 });
-    expect(result.summary.customer_collections_this_month).toBe(50000);
-    expect(result.summary.expenses_paid_this_month).toBe(20000);
-    expect(result.summary.net_cash_flow_this_month).toBe(30000);
+      const result = await service.getDashboardData({ id: 1 });
+      expect(result.summary.customer_collections_this_month).toBe(50000);
+      expect(result.summary.expenses_paid_this_month).toBe(20000);
+      expect(result.summary.net_cash_flow_this_month).toBe(30000);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('7. should calculate project margin report for a single project client', async () => {

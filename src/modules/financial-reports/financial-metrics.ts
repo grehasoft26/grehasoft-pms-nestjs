@@ -63,6 +63,25 @@ export const previousMonthKey = (month: unknown): string | null => {
   return `${prev.getUTCFullYear()}-${String(prev.getUTCMonth() + 1).padStart(2, '0')}`;
 };
 
+/** The last `n` month keys ending with `currentKey` (included), oldest first; [] if the key is invalid. */
+export const monthsBackKeys = (currentKey: string, n: number): string[] => {
+  const keys: string[] = [];
+  let key: string | null = monthRange(currentKey) ? currentKey : null;
+  while (key && keys.length < n) {
+    keys.unshift(key);
+    key = previousMonthKey(key);
+  }
+  return keys;
+};
+
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** "2026-11" → "Nov 2026" (fixed English abbreviations; no time zone or locale involved). */
+export const monthLabel = (key: string): string => {
+  const [year, month] = key.split('-').map(Number);
+  return `${MONTH_ABBR[month - 1]} ${year}`;
+};
+
 /**
  * Percentage change from `basePaise` to `newPaise`, rounded to one decimal, from exact integer paise:
  * round((new − base) × 1000 / base) / 10. Null when the base is zero or negative (no meaningful percentage).

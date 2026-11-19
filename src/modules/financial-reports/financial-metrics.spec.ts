@@ -11,7 +11,9 @@ import {
   fyRange,
   groupPaise,
   legacyAdvanceEntries,
+  monthLabel,
   monthRange,
+  monthsBackKeys,
   paymentEntries,
   parseDay,
   percentChange,
@@ -119,5 +121,23 @@ describe('financial-metrics: month comparison helpers', () => {
     expect(percentChange(100000, 100000)).toBe(0);
     expect(percentChange(0, 5000)).toBeNull();
     expect(percentChange(-5000, 5000)).toBeNull();
+  });
+});
+
+describe('financial-metrics: dashboard trend helpers', () => {
+  it('monthsBackKeys: six consecutive months ending with the given one, oldest first', () => {
+    expect(monthsBackKeys('2026-11', 6)).toEqual(['2026-06', '2026-07', '2026-08', '2026-09', '2026-10', '2026-11']);
+  });
+
+  it('monthsBackKeys: crosses the year boundary; invalid key gives []', () => {
+    expect(monthsBackKeys('2027-01', 6)).toEqual(['2026-08', '2026-09', '2026-10', '2026-11', '2026-12', '2027-01']);
+    expect(monthsBackKeys('2027-03', 3)).toEqual(['2027-01', '2027-02', '2027-03']);
+    expect(monthsBackKeys('2026-13', 6)).toEqual([]);
+  });
+
+  it('monthLabel: fixed "Mon YYYY" labels', () => {
+    expect(monthLabel('2026-11')).toBe('Nov 2026');
+    expect(monthLabel('2027-01')).toBe('Jan 2027');
+    expect(monthsBackKeys('2027-01', 6).map(monthLabel)).toEqual(['Aug 2026', 'Sep 2026', 'Oct 2026', 'Nov 2026', 'Dec 2026', 'Jan 2027']);
   });
 });

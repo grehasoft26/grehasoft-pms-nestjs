@@ -3,6 +3,7 @@ import { PrismaService } from '../../core/prisma.service';
 import { PdfService } from '../../core/pdf.service';
 import { aggregateInvoiceFinancials, computeInvoiceFinancials, fiscalYearLabel } from '../invoices/invoice-status';
 import {
+  ELIGIBLE_EXPENSE_WHERE,
   LEGACY_ADVANCE_SELECT,
   DateRange,
   PaiseEntry,
@@ -15,7 +16,9 @@ import {
   groupPaise,
   legacyAdvanceEntries,
   legacyAdvanceInvoiceWhere,
+  monthLabel,
   monthRange,
+  monthsBackKeys,
   paymentEntries,
   paymentWhere,
   percentChange,
@@ -59,144 +62,73 @@ export class FinancialReportsService {
   // 1. FINANCIAL DASHBOARD
   // -------------------------------------------------------------
   async getDashboardData(user: any) {
-    const now = new Date();
-    const currentYear = now.getFullYear();
-    const currentMonth = now.getMonth(); // 0-11
+    // Months in Asia/Kolkata: this month, last month and a six-month trend (oldest first), as date-only ranges.
+    // This month and last month are the last two trend months, so the KPI cards and the chart always agree.
+    const thisMonth = currentMonthKey();
+    const lastMonth = previousMonthKey(thisMonth)!;
+    const trendKeys = monthsBackKeys(thisMonth, 6);
+    const window: DateRange = { gte: monthRange(trendKeys[0])!.gte, lt: monthRange(thisMonth)!.lt };
 
-    const startOfCurrentMonth = new Date(Date.UTC(currentYear, currentMonth, 1, 0, 0, 0, 0));
-    const endOfCurrentMonth = new Date(Date.UTC(currentYear, currentMonth + 1, 0, 23, 59, 59, 999));
+    // Six minimal-field queries in parallel, on the shared rules (financial-metrics.ts)
+    const [revenueInvoices, payments, legacyAdvances, windowExpenses, allEligibleExpenses, allInvoices] = await Promise.all([
+      this.prisma.invoice.findMany({ where: revenueInvoiceWhere(window), select: { total: true, issue_date: true } }),
+      this.prisma.invoicePayment.findMany({ where: paymentWhere(window), select: { amount: true, payment_date: true } }),
+      this.prisma.invoice.findMany({ where: legacyAdvanceInvoiceWhere(window), select: LEGACY_ADVANCE_SELECT }),
+      this.prisma.expense.findMany({
+        where: eligibleExpenseWhere(window),
+        select: { amount: true, amount_paid: true, expense_date: true, category_id: true, category: { select: { name: true } } },
+      }),
+      // Pending Expenses: everything still owed now (all time), eligible expenses only
+      this.prisma.expense.findMany({ where: ELIGIBLE_EXPENSE_WHERE as any, select: { amount: true, amount_paid: true } }),
+      // Outstanding customer balance: unchanged calculation (same as the Invoices page), only the needed fields
+      this.prisma.invoice.findMany({ select: { total: true, advance: true, payments: { select: { amount: true } } } }),
+    ]);
 
-    const startOfLastMonth = new Date(Date.UTC(currentYear, currentMonth - 1, 1, 0, 0, 0, 0));
-    const endOfLastMonth = new Date(Date.UTC(currentYear, currentMonth, 0, 23, 59, 59, 999));
+    // Per-month paise (all six months present, zero when empty)
+    const byMonth = (entries: PaiseEntry[]) => groupPaise(entries, trendKeys, (d) => bucketKey(d, 'month'));
+    const revenue = byMonth(revenueEntries(revenueInvoices));
+    const collections = byMonth([...paymentEntries(payments), ...legacyAdvanceEntries(legacyAdvances as any)]);
+    const paid = byMonth(windowExpenses.map((e) => ({ date: e.expense_date, paise: expensePaise(e).paid })));
 
-    // Revenue / Collections from InvoicePayment (source of truth)
-    const currentMonthPayments = await this.prisma.invoicePayment.findMany({
-      where: {
-        payment_date: { gte: startOfCurrentMonth, lte: endOfCurrentMonth },
-      },
-    });
-    const currentMonthCollections = currentMonthPayments.reduce(
-      (sum, p) => sum + Number(p.amount || 0),
-      0,
-    );
-
-    const lastMonthPayments = await this.prisma.invoicePayment.findMany({
-      where: {
-        payment_date: { gte: startOfLastMonth, lte: endOfLastMonth },
-      },
-    });
-    const lastMonthCollections = lastMonthPayments.reduce(
-      (sum, p) => sum + Number(p.amount || 0),
-      0,
-    );
-
-    // Outstanding customer payments from Invoice table
-    const allInvoices = await this.prisma.invoice.findMany({
-      include: { payments: true },
-    });
-
-    // Shared paise-based calculation (same balance as the invoices API)
     const totalOutstandingRevenue = aggregateInvoiceFinancials(
-      allInvoices.map((inv) =>
-        computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments }),
-      ),
+      allInvoices.map((inv) => computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments })),
     ).total_balance;
 
-    // Expenses Paid & Pending
-    const currentMonthExpenses = await this.prisma.expense.findMany({
-      where: {
-        deleted_at: null,
-        expense_date: { gte: startOfCurrentMonth, lte: endOfCurrentMonth },
-      },
-    });
-    const currentMonthExpensesPaid = currentMonthExpenses.reduce(
-      (sum, e) => sum + Number(e.amount_paid || 0),
-      0,
-    );
-
-    const lastMonthExpenses = await this.prisma.expense.findMany({
-      where: {
-        deleted_at: null,
-        expense_date: { gte: startOfLastMonth, lte: endOfLastMonth },
-      },
-    });
-    const lastMonthExpensesPaid = lastMonthExpenses.reduce(
-      (sum, e) => sum + Number(e.amount_paid || 0),
-      0,
-    );
-
-    // All active pending expenses
-    const pendingExpensesList = await this.prisma.expense.findMany({
-      where: {
-        deleted_at: null,
-        payment_status: { in: ['pending', 'partially_paid'] },
-      },
-    });
-    const totalPendingExpenses = pendingExpensesList.reduce(
-      (sum, e) => sum + Number(e.outstanding_amount || Math.max(0, Number(e.amount) - Number(e.amount_paid))),
-      0,
-    );
-
-    // Net Cash Flow
-    const currentMonthNetCashFlow = currentMonthCollections - currentMonthExpensesPaid;
-    const lastMonthNetCashFlow = lastMonthCollections - lastMonthExpensesPaid;
-
-    // Monthly trends (Last 6 Months)
-    const monthlyTrends: any[] = [];
-    for (let i = 5; i >= 0; i--) {
-      const mDate = new Date(Date.UTC(currentYear, currentMonth - i, 1));
-      const mYear = mDate.getUTCFullYear();
-      const mMonth = mDate.getUTCMonth();
-      const mStart = new Date(Date.UTC(mYear, mMonth, 1, 0, 0, 0, 0));
-      const mEnd = new Date(Date.UTC(mYear, mMonth + 1, 0, 23, 59, 59, 999));
-      const monthLabel = mDate.toLocaleString('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' });
-
-      const mPayments = await this.prisma.invoicePayment.findMany({
-        where: { payment_date: { gte: mStart, lte: mEnd } },
-      });
-      const collections = mPayments.reduce((acc, p) => acc + Number(p.amount || 0), 0);
-
-      const mExpenses = await this.prisma.expense.findMany({
-        where: { deleted_at: null, expense_date: { gte: mStart, lte: mEnd } },
-      });
-      const expensesPaid = mExpenses.reduce((acc, e) => acc + Number(e.amount_paid || 0), 0);
-      const cashFlow = collections - expensesPaid;
-
-      monthlyTrends.push({
-        month: monthLabel,
-        collections: Math.round(collections * 100) / 100,
-        expenses: Math.round(expensesPaid * 100) / 100,
-        net_cash_flow: Math.round(cashFlow * 100) / 100,
-      });
+    // Category distribution of this month's expenses paid (same eligible rows as the trend)
+    const categoryPaise = new Map<string, number>();
+    for (const e of windowExpenses) {
+      if (bucketKey(e.expense_date, 'month') !== thisMonth) continue;
+      const name = (e as any).category?.name || 'Miscellaneous';
+      categoryPaise.set(name, (categoryPaise.get(name) || 0) + expensePaise(e).paid);
     }
+    const categoryBreakdown = Array.from(categoryPaise.entries())
+      .map(([name, paise]) => ({ category_name: name, amount: toRupees(paise) }))
+      .sort((a, b) => b.amount - a.amount);
 
-    // Category distribution for current month
-    const categoryExpensesMap = new Map<string, number>();
-    const currentExpensesDetailed = await this.prisma.expense.findMany({
-      where: { deleted_at: null, expense_date: { gte: startOfCurrentMonth, lte: endOfCurrentMonth } },
-      include: { category: true },
-    });
-    for (const exp of currentExpensesDetailed) {
-      const catName = exp.category?.name || 'Miscellaneous';
-      const prev = categoryExpensesMap.get(catName) || 0;
-      categoryExpensesMap.set(catName, prev + Number(exp.amount_paid || 0));
-    }
+    const monthlyTrends = trendKeys.map((key) => ({
+      month: monthLabel(key),
+      month_key: key,
+      invoice_revenue: toRupees(revenue.get(key)!),
+      collections: toRupees(collections.get(key)!),
+      expenses: toRupees(paid.get(key)!),
+      net_cash_flow: toRupees(collections.get(key)! - paid.get(key)!),
+    }));
 
-    const categoryBreakdown = Array.from(categoryExpensesMap.entries()).map(([name, amount]) => ({
-      category_name: name,
-      amount: Math.round(amount * 100) / 100,
-    })).sort((a, b) => b.amount - a.amount);
-
+    const at = (m: Map<string, number>, key: string) => m.get(key) ?? 0;
     return {
       summary: {
-        customer_collections_this_month: Math.round(currentMonthCollections * 100) / 100,
-        customer_collections_last_month: Math.round(lastMonthCollections * 100) / 100,
-        total_outstanding_collections: Math.round(totalOutstandingRevenue * 100) / 100,
-        expenses_paid_this_month: Math.round(currentMonthExpensesPaid * 100) / 100,
-        expenses_paid_last_month: Math.round(lastMonthExpensesPaid * 100) / 100,
-        total_pending_expenses: Math.round(totalPendingExpenses * 100) / 100,
-        net_cash_flow_this_month: Math.round(currentMonthNetCashFlow * 100) / 100,
-        net_cash_flow_last_month: Math.round(lastMonthNetCashFlow * 100) / 100,
+        invoice_revenue_this_month: toRupees(at(revenue, thisMonth)),
+        invoice_revenue_last_month: toRupees(at(revenue, lastMonth)),
+        revenue_change: toRupees(at(revenue, thisMonth) - at(revenue, lastMonth)),
+        revenue_change_percentage: percentChange(at(revenue, lastMonth), at(revenue, thisMonth)),
+        customer_collections_this_month: toRupees(at(collections, thisMonth)),
+        customer_collections_last_month: toRupees(at(collections, lastMonth)),
+        total_outstanding_collections: totalOutstandingRevenue,
+        expenses_paid_this_month: toRupees(at(paid, thisMonth)),
+        expenses_paid_last_month: toRupees(at(paid, lastMonth)),
+        total_pending_expenses: toRupees(sumExpenses(allEligibleExpenses).pending),
+        net_cash_flow_this_month: toRupees(at(collections, thisMonth) - at(paid, thisMonth)),
+        net_cash_flow_last_month: toRupees(at(collections, lastMonth) - at(paid, lastMonth)),
       },
       visualizations: {
         monthly_trends: monthlyTrends,
