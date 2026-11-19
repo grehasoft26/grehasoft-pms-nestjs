@@ -81,7 +81,7 @@ export class FinancialReportsService {
       // Pending Expenses: everything still owed now (all time), eligible expenses only
       this.prisma.expense.findMany({ where: ELIGIBLE_EXPENSE_WHERE as any, select: { amount: true, amount_paid: true } }),
       // Outstanding customer balance: unchanged calculation (same as the Invoices page), only the needed fields
-      this.prisma.invoice.findMany({ select: { total: true, advance: true, payments: { select: { amount: true } } } }),
+      this.prisma.invoice.findMany({ select: { total: true, advance: true, issue_date: true, payments: { select: { amount: true } } } }),
     ]);
 
     // Per-month paise (all six months present, zero when empty)
@@ -90,9 +90,15 @@ export class FinancialReportsService {
     const collections = byMonth([...paymentEntries(payments), ...legacyAdvanceEntries(legacyAdvances as any)]);
     const paid = byMonth(windowExpenses.map((e) => ({ date: e.expense_date, paise: expensePaise(e).paid })));
 
-    const totalOutstandingRevenue = aggregateInvoiceFinancials(
-      allInvoices.map((inv) => computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments })),
-    ).total_balance;
+    // Outstanding balances, same per-invoice rule as the Invoices page (total − advance − all payments, never below 0):
+    // all invoices (unchanged, all-time), and invoices issued in the current Asia/Kolkata month, whatever the date of
+    // their payments (a payment made after the month still reduces what is owed now)
+    const outstandingOf = (invoices: typeof allInvoices) =>
+      aggregateInvoiceFinancials(
+        invoices.map((inv) => computeInvoiceFinancials({ total: inv.total, advance: inv.advance, payments: inv.payments })),
+      ).total_balance;
+    const totalOutstandingRevenue = outstandingOf(allInvoices);
+    const outstandingThisMonth = outstandingOf(allInvoices.filter((inv) => bucketKey(inv.issue_date, 'month') === thisMonth));
 
     // Category distribution of this month's expenses paid (same eligible rows as the trend)
     const categoryPaise = new Map<string, number>();
@@ -124,6 +130,7 @@ export class FinancialReportsService {
         customer_collections_this_month: toRupees(at(collections, thisMonth)),
         customer_collections_last_month: toRupees(at(collections, lastMonth)),
         total_outstanding_collections: totalOutstandingRevenue,
+        outstanding_collections_this_month: outstandingThisMonth,
         expenses_paid_this_month: toRupees(at(paid, thisMonth)),
         expenses_paid_last_month: toRupees(at(paid, lastMonth)),
         total_pending_expenses: toRupees(sumExpenses(allEligibleExpenses).pending),

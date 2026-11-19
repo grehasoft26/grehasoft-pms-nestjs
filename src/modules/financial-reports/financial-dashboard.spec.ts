@@ -234,6 +234,46 @@ describe('Financial Dashboard', () => {
     expect(res.summary.total_outstanding_collections).toBe(1049.66); // 250 + 799.66 (overpaid invoice contributes 0)
   });
 
+  it('pending collections this month: balances of invoices issued in the current Asia/Kolkata month only', async () => {
+    at('2026-11-30T19:00:00Z'); // 1 Dec 2026, 00:30 IST: the current month is December
+    const unpaid = invoice('2026-12-01', '1000.00'); // owes 1000
+    const partial = invoice('2026-12-01', '799.99'); // 0.33 paid → owes 799.66
+    const paid = invoice('2026-12-01', '500.00'); // fully paid → 0
+    const over = invoice('2026-12-01', '100.00'); // overpaid → 0 (does not offset the others)
+    const advance = invoice('2026-12-01', '400.00', { advance: D('150.00') }); // legacy advance → owes 250
+    const lateNov = invoice('2026-11-30', '300.00'); // issued last month (IST), unpaid → excluded
+    const oldUnpaid = invoice('2026-06-15', '2000.00'); // older unpaid → excluded from this month
+    const data = {
+      invoices: [unpaid, partial, paid, over, advance, lateNov, oldUnpaid],
+      payments: [
+        payment(partial, '2026-12-01', '0.33'),
+        payment(paid, '2026-12-01', '500.00'),
+        payment(over, '2026-12-01', '150.00'),
+      ],
+      expenses: [],
+    };
+    const { svc, invoices, prisma } = await setup(data);
+    const res: any = await svc.getDashboardData({ id: 1 });
+    // No extra query: still six (counted before the comparison calls below)
+    const calls = prisma.invoice.findMany.mock.calls.length + prisma.invoicePayment.findMany.mock.calls.length + prisma.expense.findMany.mock.calls.length;
+    expect(calls).toBe(6);
+    expect(res.summary.outstanding_collections_this_month).toBe(2049.66); // 1000 + 799.66 + 0 + 0 + 250
+    // Unchanged all-time figure: also includes last month's and older unpaid invoices
+    expect(res.summary.total_outstanding_collections).toBe(4349.66); // 2049.66 + 300 + 2000
+    // Same as the Invoices page Pending Amount for the current month and for All Months
+    const admin = { id: 1, is_superuser: true, role: { name: 'SUPER_ADMIN' } };
+    expect(res.summary.outstanding_collections_this_month).toBe(((await invoices.getAnalytics(admin, { month: '2026-12' })) as any).total_balance);
+    expect(res.summary.total_outstanding_collections).toBe(((await invoices.getAnalytics(admin, {})) as any).total_balance);
+  });
+
+  it('pending collections this month: a payment made after the invoice month still reduces what is owed now', async () => {
+    const nov = invoice('2026-11-05', '1000.00');
+    const res = await dashboard({ invoices: [nov], payments: [payment(nov, '2026-12-10', '600.00')], expenses: [] });
+    // Clock: 19 Nov 2026 (beforeEach); the December payment is already recorded, so November's invoice owes 400
+    expect(res.summary.outstanding_collections_this_month).toBe(400);
+    expect(res.summary.customer_collections_this_month).toBe(0); // collections still by payment date
+  });
+
   it('keeps every old field, adds the new ones; cards equal the trend; categories sum to expenses paid; six queries', async () => {
     const inv = invoice('2026-11-02', '500.00');
     const { svc, prisma } = await setup({
@@ -244,7 +284,7 @@ describe('Financial Dashboard', () => {
     const res: any = await svc.getDashboardData({ id: 1 });
     expect(Object.keys(res.summary).sort()).toEqual([
       'customer_collections_last_month', 'customer_collections_this_month', 'expenses_paid_last_month', 'expenses_paid_this_month',
-      'invoice_revenue_last_month', 'invoice_revenue_this_month', 'net_cash_flow_last_month', 'net_cash_flow_this_month',
+      'invoice_revenue_last_month', 'invoice_revenue_this_month', 'net_cash_flow_last_month', 'net_cash_flow_this_month', 'outstanding_collections_this_month',
       'revenue_change', 'revenue_change_percentage', 'total_outstanding_collections', 'total_pending_expenses',
     ]);
     expect(Object.keys(res.visualizations.monthly_trends[0]).sort()).toEqual(['collections', 'expenses', 'invoice_revenue', 'month', 'month_key', 'net_cash_flow']);
@@ -261,7 +301,7 @@ describe('Financial Dashboard', () => {
     expect(calls).toBe(6);
     // Outstanding query fetches only the fields it needs
     const outstandingCall = prisma.invoice.findMany.mock.calls.find((c: any[]) => !c[0]?.where);
-    expect(outstandingCall[0].select).toEqual({ total: true, advance: true, payments: { select: { amount: true } } });
+    expect(outstandingCall[0].select).toEqual({ total: true, advance: true, issue_date: true, payments: { select: { amount: true } } });
   });
 
   it('reconciles with Income & Expense and Month Comparison for the same month, and pending with Income & Expense', async () => {
